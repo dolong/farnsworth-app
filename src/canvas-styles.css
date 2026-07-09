@@ -1,0 +1,510 @@
+/* canvas-styles.css — extracted subset of styles.css for the companion canvas viewer iframe.
+   Contains only the CSS variables + artboard + post-view rules needed to render
+   the canvas preview as a standalone srcdoc iframe (no parent stylesheet inheritance).
+   Keep this file in sync with the matching sections of styles.css. */
+  /* === :root variables === */
+:root {
+  /* Surfaces */
+  --bg-canvas: #0c0c0e;
+  --bg-elevated: #1e1f22;
+  --bg-card: #26282c;
+  --bg-input: #383a40;
+  --bg-hover: #34373c;
+
+  /* Borders */
+  --border-subtle: #1a1b1e;
+  --border-default: #26282c;
+  --border-strong: #3a3c42;
+
+  /* Text */
+  --text-primary: #f2f3f5;
+  --text-secondary: #dbdee1;
+  --text-muted: #80848e;
+  --text-faint: #5e636b;
+  --text-on-accent: #1a1612;
+
+  /* Accent palette — Discord-style multi-color */
+  --accent-blurple: #5865f2;      /* primary brand */
+  --accent-blurple-glow: rgba(88,101,242,.4);
+  --accent-blue: #3ab7f0;          /* Files */
+  --accent-yellow: #f0b232;        /* Bookmarks */
+  --accent-pink: #eb459e;          /* Tasks */
+  --accent-green: #3ba55c;         /* Live / success */
+  --accent-purple: #a855f7;        /* Settings / system */
+  --accent-orange: #f0883e;        /* secondary */
+  --accent-red: #f23f43;           /* danger */
+
+  /* Type */
+  --font-sans: 'Hanken Grotesk', system-ui, -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', monospace;
+
+  /* Radii */
+  --r-sm: 4px;
+  --r-md: 6px;
+  --r-lg: 8px;
+  --r-xl: 12px;
+  --r-pill: 9999px;
+
+  /* Transitions */
+  --t-fast: 90ms ease-out;
+  --t-med: 160ms ease-out;
+}
+  /* === artboard + post-view rules === */
+.artboard { position: relative; }
+.artboard--mobile { width: 360px; height: 692px; }
+.artboard--desktop { width: 720px; height: 460px; }
+
+.artboard__frame {
+  position: absolute; inset: -7px;
+  border: 1.5px solid var(--accent-blurple);
+  border-radius: 28px;
+  pointer-events: none;
+  box-shadow: 0 0 0 4px rgba(88,101,242,.1);
+}
+.artboard--desktop .artboard__frame { border-radius: 14px; }
+.artboard__corner {
+  position: absolute;
+  width: 9px; height: 9px;
+  background: #fff;
+  border: 1.5px solid var(--accent-blurple);
+  border-radius: 2px;
+  pointer-events: auto;
+  transition: transform 120ms ease, box-shadow 120ms ease;
+}
+.artboard__corner:hover {
+  transform: scale(1.4);
+  box-shadow: 0 0 0 3px rgba(88,101,242,.18);
+}
+.artboard__corner--tl { top: -11px; left: -11px; cursor: nwse-resize; }
+.artboard__corner--tr { top: -11px; right: -11px; cursor: nesw-resize; }
+.artboard__corner--bl { bottom: -11px; left: -11px; cursor: nesw-resize; }
+.artboard__corner--br { bottom: -11px; right: -11px; cursor: nwse-resize; }
+.artboard__label {
+  position: absolute; top: -33px; left: -7px;
+  display: flex; align-items: center; gap: 6px;
+  background: var(--accent-blurple); color: #fff;
+  font-size: 10.5px; font-weight: 600;
+  border-radius: 6px; padding: 3px 8px;
+  white-space: nowrap;
+}
+.artboard__label svg { width: 11px; height: 11px; }
+.artboard__size {
+  position: absolute; bottom: -34px; left: 50%;
+  transform: translateX(-50%);
+  font-family: var(--font-mono); font-size: 10.5px;
+  color: #cdd2f7;
+  background: rgba(88,101,242,.18);
+  border: 1px solid rgba(88,101,242,.4);
+  border-radius: 6px; padding: 2px 8px;
+  white-space: nowrap;
+}
+
+/* Reddit Post View mock — dark mode, Sword & Supper subreddit
+   Pulled from the live r/SwordAndSupperGame/comments/1ug9g9x page
+   via agent-browser on Jun 26 ~11:35 ET. Design tokens:
+   - page bg: rgb(14, 17, 19)  -- Reddit dark mode
+   - post card bg: rgb(14, 17, 19) same, with 16px radius
+   - title: 24px / 600 / rgb(238, 241, 243)
+   - text secondary: rgb(129, 131, 132)
+   ---------------------------------------------------------------- */
+.artboard--post { width: 480px; }
+.artboard--post .artboard__frame { border-radius: 16px; }
+
+.post-view {
+  width: 100%; height: 100%;
+  background: rgb(14, 17, 19);
+  border-radius: 12px;
+  border: 1px solid #1f2225;
+  overflow: hidden;
+  display: flex; flex-direction: column;
+  font-family: 'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  color: #d7dadc;
+  font-size: 14px;
+}
+
+/* Top nav — Reddit header */
+.post-view__nav {
+  display: flex; align-items: center; gap: 8px;
+  height: 48px; flex: 0 0 48px;
+  background: rgb(14, 17, 19);
+  border-bottom: 1px solid #2a3236;
+  padding: 0 16px;
+}
+.post-view__nav-icon {
+  position: relative;
+  width: 28px; height: 28px;
+  display: flex; align-items: center; justify-content: center;
+  color: #d7dadc;
+  flex: 0 0 auto;
+  border-radius: 6px;
+}
+.post-view__nav-icon:hover { background: rgba(255,255,255,0.06); }
+.post-view__nav-icon svg { width: 20px; height: 20px; }
+/* Red notification badge — sits inside the hamburger's top-right corner.
+   Replaces the standalone orange Snoo circle that was previously beside the
+   "reddit" wordmark; that placement read as a stray red dot. Made bigger
+   so the indicator is clearly visible. */
+.post-view__nav-badge {
+  position: absolute;
+  top: 3px; right: 3px;
+  width: 10px; height: 10px;
+  background: #ff4500;
+  border: 2px solid #1a1a1b;
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px rgba(255,69,0,0.5);
+}
+.post-view__nav-logo {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 18px; font-weight: 700;
+  color: #d7dadc;
+  letter-spacing: -0.01em;
+  padding: 0 4px;
+}
+.post-view__nav-search {
+  flex: 1; height: 36px;
+  background: #1a282d;
+  border: 1px solid #2f3942;
+  border-radius: 20px;
+  display: flex; align-items: center;
+  padding: 0 12px; gap: 8px;
+  font-size: 13px;
+  color: #818384;
+  max-width: 560px;
+}
+.post-view__nav-search svg { width: 16px; height: 16px; color: #4f7178; }
+.post-view__nav-search-input {
+  flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  color: #d7dadc; font-weight: 400;
+}
+.post-view__nav-search-input-muted { color: #4f7178; font-weight: 400; }
+.post-view__nav-ask-btn {
+  display: flex; align-items: center; gap: 4px;
+  background: transparent;
+  color: #a3aab1;
+  font-size: 12px; font-weight: 600;
+  padding: 4px 10px;
+  border-radius: 16px;
+  white-space: nowrap;
+}
+.post-view__nav-ask-btn svg { width: 14px; height: 14px; color: #ccad24; }
+.post-view__nav-actions {
+  display: flex; align-items: center; gap: 4px;
+  margin-left: auto;
+}
+.post-view__nav-btn {
+  height: 32px; padding: 0 12px;
+  border-radius: 20px;
+  font-size: 12px; font-weight: 700;
+  display: inline-flex; align-items: center; justify-content: center;
+  cursor: pointer;
+}
+.post-view__nav-btn--ghost {
+  background: transparent;
+  color: #d7dadc;
+  border: 1px solid #343536;
+}
+.post-view__nav-btn--primary {
+  background: #d7dadc;
+  color: #0e1113;
+  border: none;
+}
+.post-view__nav-more {
+  width: 32px; height: 32px;
+  display: flex; align-items: center; justify-content: center;
+  color: #d7dadc;
+  border-radius: 50%;
+}
+.post-view__nav-more:hover { background: rgba(255,255,255,0.06); }
+.post-view__nav-more svg { width: 18px; height: 18px; }
+
+/* Empty state — shown when the open folder has no `.farnsworth/config.json`
+   `live` block (e.g. Farnsworth itself, which isn't a Devvit project).
+   Replaces the hardcoded thelastdraft mock that used to show. Jul 8 ~10:50 ET. */
+.post-view--empty {
+  background: #0e1113;
+  color: #d7dadc;
+}
+.post-view__empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 48px 24px;
+  text-align: center;
+  gap: 12px;
+}
+.post-view__empty-icon {
+  color: #4f7178;
+  margin-bottom: 4px;
+}
+.post-view__empty-title {
+  font-size: 18px;
+  font-weight: 600;
+  color: #d7dadc;
+}
+.post-view__empty-text {
+  font-size: 13px;
+  color: #818384;
+  max-width: 360px;
+  line-height: 1.5;
+}
+.post-view__empty-btn {
+  margin-top: 8px;
+  padding: 8px 16px;
+  background: #d7dadc;
+  color: #0e1113;
+  border: none;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  font-family: inherit;
+}
+.post-view__empty-btn:hover { background: #e8eaed; }
+
+/* Feed body */
+.post-view__feed {
+  flex: 1; overflow: hidden;
+  display: flex; flex-direction: column;
+}
+
+/* Post card */
+.post-view__post {
+  display: flex;
+  background: rgb(14, 17, 19);
+  padding: 12px 12px 8px;
+  gap: 8px;
+}
+.post-view__content {
+  flex: 1;
+  min-width: 0;
+}
+
+/* Two-line credit bar (subreddit + author) */
+.post-view__credit {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12px;
+  color: #818384;
+}
+.post-view__credit-sub {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #d7dadc;
+  margin-bottom: 2px;
+}
+.post-view__credit-avatar {
+  width: 20px; height: 20px;
+  border-radius: 50%;
+  background: #ff4500;
+  flex: 0 0 auto;
+  overflow: hidden;
+  display: flex; align-items: center; justify-content: center;
+}
+.post-view__credit-avatar img { width: 100%; height: 100%; object-fit: cover; }
+.post-view__credit-sub-name { color: #d7dadc; font-weight: 700; }
+.post-view__credit-sub-dot { color: #4f5358; }
+.post-view__credit-sub-time { color: #818384; font-weight: 400; }
+.post-view__credit-back {
+  width: 24px; height: 24px;
+  display: flex; align-items: center; justify-content: center;
+  color: #d7dadc;
+  margin-right: 2px;
+}
+.post-view__credit-back svg { width: 18px; height: 18px; }
+.post-view__credit-more {
+  margin-left: auto;
+  color: #818384;
+  display: flex; align-items: center; justify-content: center;
+  width: 28px; height: 28px;
+  border-radius: 50%;
+}
+.post-view__credit-more:hover { background: rgba(255,255,255,0.06); }
+.post-view__credit-more svg { width: 18px; height: 18px; }
+
+.post-view__title {
+  font-size: 18px; font-weight: 600;
+  color: #d7dadc;
+  line-height: 22px;
+  margin: 8px 0 6px;
+}
+.post-view__flair {
+  display: inline-flex; align-items: center;
+  background: rgba(70, 209, 96, 0.15);
+  color: #46d160;
+  border-radius: 12px;
+  padding: 2px 10px;
+  font-size: 12px; font-weight: 700;
+  align-self: flex-start;
+  margin-bottom: 8px;
+}
+
+/* Game embed — real Sword & Supper Devvit iframe screenshot
+   captured via agent-browser on Jun 26 ~12:24 ET.
+   732×512 capture from the live post, contains:
+   - Lvl 21-40 badge + stars (top-left)
+   - Sword & Supper logo
+   - Game scene with chick character (chef hat, cape, axe)
+   - START MISSION green pill
+   - Story text + character avatar + "0 plays" badge
+   ---------------------------------------------------------------- */
+.post-view__embed {
+  position: relative;
+  width: 100%;
+  border-radius: 12px;
+  overflow: hidden;
+  background: #000;
+  margin-top: 4px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+  aspect-ratio: 732 / 512;
+  background-image: url('assets/reddit/sword-supper-embed.png');
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+}
+
+/* Live canvas iframes — Jul 2.
+   When `npm run farnsworth` is running in the backend (vibe-farnsworth-template
+   dev server on :5174), these replace the static background-image / <img>
+   tags above with a live render of splash.tsx (post) or game.tsx (mobile /
+   desktop). The background-image / <img> stay as the fallback when
+   farnsworth isn't available. */
+.post-view__embed-iframe,
+.phone__screen-iframe,
+.desktop__stage-iframe {
+  border: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  background: #000;
+}
+
+/* Action bar — pill buttons (Reddit's button-secondary style) */
+.post-view__actions {
+  display: flex; align-items: center; gap: 6px;
+  margin-top: 10px;
+}
+.post-view__pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: #1a282d;
+  border: none;
+  border-radius: 20px;
+  padding: 6px 12px;
+  font-size: 12px; font-weight: 700;
+  color: #d7dadc;
+  cursor: pointer;
+}
+.post-view__pill:hover { background: #243339; }
+.post-view__pill svg { width: 14px; height: 14px; }
+.post-view__pill--vote {
+  gap: 4px;
+  padding: 6px 8px;
+}
+.post-view__pill--vote .vote-arrow {
+  width: 18px; height: 18px;
+  display: flex; align-items: center; justify-content: center;
+  color: #4f5358;
+}
+.post-view__pill--vote .vote-arrow.is-up.is-active { color: #cc4500; }
+.post-view__pill--vote .vote-arrow.is-down.is-active { color: #7193ff; }
+.post-view__pill--vote .vote-arrow svg { width: 16px; height: 16px; }
+.post-view__pill--vote .vote-count {
+  font-size: 12px; font-weight: 700;
+  color: #d7dadc;
+  font-variant-numeric: tabular-nums;
+  padding: 0 2px;
+}
+.post-view__pill--icon {
+  width: 32px; height: 32px;
+  padding: 0;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 50%;
+  background: transparent;
+  border: none;
+  color: #818384;
+}
+.post-view__pill--icon:hover { background: rgba(255,255,255,0.06); color: #d7dadc; }
+.post-view__pill--icon svg { width: 18px; height: 18px; }
+
+.post-view__privacy {
+  margin-left: auto;
+  display: flex; align-items: center; gap: 4px;
+  font-size: 12px;
+  color: #818384;
+  padding: 6px 8px;
+}
+.post-view__privacy svg { width: 14px; height: 14px; }
+
+/* Comments section */
+.post-view__comments {
+  background: rgb(14, 17, 19);
+  padding: 12px 12px 16px;
+  border-top: 1px solid #1f2225;
+}
+.post-view__comments-header {
+  font-size: 14px; font-weight: 700;
+  color: #d7dadc;
+  margin-bottom: 4px;
+}
+.post-view__comments-empty {
+  display: flex; flex-direction: column; align-items: center;
+  padding: 8px 12px 4px;
+  text-align: center;
+}
+.post-view__comments-snoo {
+  width: 90px; height: 90px;
+  margin-bottom: 8px;
+}
+.post-view__comments-snoo img {
+  width: 100%; height: 100%; object-fit: contain;
+  /* The original Reddit snoo-wave.png mascot has bright red eyes that read
+     as a notification badge in this mock. Desaturate just the red channel
+     so the mascot looks like a neutral Snoo instead of a notifier. */
+  filter: grayscale(0.85) brightness(0.95);
+  opacity: 0.95;
+}
+.post-view__comments-empty-title {
+  font-size: 16px; font-weight: 600;
+  color: #d7dadc;
+  margin-bottom: 4px;
+}
+.post-view__comments-empty-text {
+  font-size: 13px;
+  color: #818384;
+  max-width: 280px;
+  line-height: 1.4;
+}
+
+/* Second post teaser */
+.post-view__post-teaser {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 12px;
+  background: rgb(14, 17, 19);
+  border-top: 1px solid #1f2225;
+}
+.post-view__post-teaser-avatar {
+  width: 22px; height: 22px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #ffd635, #ff4500);
+  flex: 0 0 auto;
+}
+.post-view__post-teaser-body { flex: 1; min-width: 0; }
+.post-view__post-teaser-meta {
+  font-size: 11px; color: #818384;
+  display: flex; align-items: center; gap: 4px;
+  margin-bottom: 2px;
+}
+.post-view__post-teaser-title {
+  font-size: 14px; font-weight: 600;
+  color: #d7dadc;
+  line-height: 1.3;
+  margin-bottom: 2px;
+}
+.post-view__post-teaser-snippet {
+  font-size: 12px; color: #818384;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+  /* === artboard--fullscreen variants === */
+.artboard--fullscreen { width: 1120px; height: 630px; }
+.artboard--fullscreen .artboard__frame { border-radius: 14px; }

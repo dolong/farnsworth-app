@@ -1,0 +1,30 @@
+# Node / Electron
+node_modules/
+dist/
+build/
+out/
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env / secrets
+.env
+.env.local
+.env.*.local
+
+# Test / coverage
+coverage/
+*.tmp
+
+# Farnsworth runtime cache
+.farnsworth/
+
+# IDE
+.vscode/
+.idea/
+
+# Build artifacts
+*.tsbuildinfo

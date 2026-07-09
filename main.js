@@ -1,0 +1,3429 @@
+// Farnsworth — main process
+// Electron desktop shell. SQLite-backed persistence (db.js), folder-based workspace,
+// Claude auth (manual API key + OAuth PKCE via claude.ai), real file operations.
+
+const { app, BrowserWindow, ipcMain, shell, dialog, safeStorage, Menu } = require('electron');
+const path = require('path');
+const os = require('os');
+// `fs` is fs/promises — used by 13 `await fs.xxx(...)` call sites in
+// this file (ensureDirs + config reads/writes + filesystem IPCs).
+// `fsSync` is the sync fs — used by markWorkspaceTrusted + spawnFor
+// (existsSync / readFileSync / writeFileSync / renameSync). Earlier
+// I swapped `fs = require('fs')` to get sync methods, which broke the
+// 13 await sites ("fs.mkdir is not a function" hidden behind a
+// Uncaught Exception dialog Jun 28 ~16:59 ET). Both modules now kept.
+const fs = require('fs/promises');
+const fsSync = require('fs');
+const child_process = require('child_process');
+const crypto = require('crypto');
+const db = require('./db');
+
+// keytar (native) — try to load at startup so credential IPCs can reference
+// it directly. If the native binary is missing/broken (Linux without libsecret,
+// etc.), the require throws and we fall back to per-handler lazy requires with
+// Mac `security` CLI fallback (existing pattern at lines ~1527, ~1682, ~1767).
+let keytar;
+try {
+  keytar = require('keytar');
+} catch (e) {
+  console.warn('[keytar] load failed at startup:', e?.message || e);
+}
+
+// Open external URLs via `/usr/bin open` instead of Electron's
+// `shell.openExternal`. The latter routes through NSWorkspace, which
+// trips macOS AppleEvents TCC and shows "Farnsworth would like to access
+// data from other apps" on every launch when Long is away. `/usr/bin/open`
+// goes through LaunchServices directly and stays silent.
+function openExternalSafe(url) {
+  return new Promise((resolve) => {
+    child_process.execFile('open', [url], (err) => {
+      if (err) console.error('[openExternal] failed for', url, '-', err.message);
+      resolve();
+    });
+  });
+}
+
+// Locate the `claude` binary. Bundled Resources/bin/claude is checked
+// first so Farnsworth.app is self-contained on machines that don't have
+// Claude Code CLI installed via npm. Falls back to PATH (`which`) then to
+// common install locations (Jul 7 ~21:02 ET).
+function findClaudePath() {
+  const fs = require('fs');
+  const path = require('path');
+  // 1) Bundled binary (Contents/Resources/bin/claude)
+  const bundled = path.join(process.resourcesPath || '', 'bin', 'claude');
+  try { if (fs.existsSync(bundled)) return bundled; } catch {}
+  // 2) PATH lookup via `which`
+  try {
+    const cmd = process.platform === 'win32' ? 'where claude.cmd' : 'which claude';
+    const out = require('child_process').execSync(cmd, { encoding: 'utf8', timeout: 5000 }).trim();
+    const found = out.split(/\r?\n/)[0].trim();
+    if (found) return found;
+  } catch {}
+  // 3) Common install locations
+  const candidates = [
+    '/opt/homebrew/bin/claude',
+    '/usr/local/bin/claude',
+    '/usr/bin/claude',
+    path.join(process.env.HOME || '', '.local', 'bin', 'claude'),
+    path.join(process.env.HOME || '', '.npm-global', 'bin', 'claude'),
+    path.join(process.env.HOME || '', '.claude', 'bin', 'claude'),
+    process.platform === 'win32' ? path.join(process.env.APPDATA || '', 'npm', 'claude.cmd') : null,
+    process.platform === 'win32' ? path.join(process.env.APPDATA || '', 'npm', 'claude') : null,
+  ].filter(Boolean);
+  for (const p of candidates) {
+    try { if (fs.existsSync(p)) return p; } catch {}
+  }
+  return null;
+}
+
+// Same as findClaudePath() but for nono. Bundled Resources/bin/nono first.
+function findNonoPath() {
+  const fs = require('fs');
+  const path = require('path');
+  const bundled = path.join(process.resourcesPath || '', 'bin', 'nono');
+  try { if (fs.existsSync(bundled)) return bundled; } catch {}
+  try {
+    const cmd = process.platform === 'win32' ? 'where nono.cmd' : 'which nono';
+    const out = require('child_process').execSync(cmd, { encoding: 'utf8', timeout: 5000 }).trim();
+    const found = out.split(/\r?\n/)[0].trim();
+    if (found) return found;
+  } catch {}
+  const candidates = [
+    '/opt/homebrew/bin/nono',
+    '/usr/local/bin/nono',
+    path.join(process.env.HOME || '', '.local', 'bin', 'nono'),
+  ].filter(Boolean);
+  for (const p of candidates) {
+    try { if (fs.existsSync(p)) return p; } catch {}
+  }
+  return null;
+}
+
+// Phase 2: terminal panel. node-pty for real PTYs, ws for renderer↔main bridge.
+let pty;
+try {
+  pty = require('node-pty');
+} catch (e) {
+  console.error('[terminal] node-pty not loaded:', e.message);
+}
+const WebSocket = require('ws');
+const { getRelayClient } = require('./src/relay-client');
+
+let mainWindow;
+// Track all open Farnsworth windows so the Window menu can list them and
+// "New Window" can spawn a sibling instead of stealing focus from the
+// focused one. mainWindow stays as a reference for single-window flows.
+const openWindows = [];
+const userDataPath = () => path.join(app.getPath('userData'), 'farnsworth');
+
+// Helper: send a menu action to the focused window (or the most recent
+// one if nothing is focused). Lets the native menu drive renderer state
+// without each menu item needing a renderer-side handler.
+function sendMenuAction(type, payload) {
+  const target = BrowserWindow.getFocusedWindow() || mainWindow || openWindows[0];
+  if (!target || target.isDestroyed()) return;
+  target.webContents.send('menu:action', { type, payload });
+}
+
+// ---- OAuth config (Claude Code SDK OAuth — production flow) ----
+// Source: production OAuth CLIENT_ID extracted from the installed claude binary
+// at /opt/homebrew/bin/claude, cross-checked against the decompiled bundle.
+// The `https://claude.ai/oauth/claude-code-client-metadata` URL is the OAuth
+// client-metadata *endpoint* (RFC 7591), NOT the client_id — the server's
+// UUID validator rejects it. Production client_id is the UUID below.
+//
+// Endpoints verified from github.com/ben-vargas/claude-code-sdk_oauth gist
+// (170 lines of production OAuth code that writes ~/.claude/.credentials.json
+// in the shape Claude Code SDK reads):
+//   - Auth URL:        https://claude.ai/oauth/authorize
+//   - Redirect URI:    https://console.anthropic.com/oauth/code/callback
+//   - Token URL:       https://console.anthropic.com/v1/oauth/token
+//   - Token Content-Type: application/json (NOT form-urlencoded)
+//   - After authorize: console.anthropic.com/oauth/code/callback page shows
+//     code as `CODE#STATE` — user copies the full string and we split on '#'
+//
+// This flow does NOT go through the broken mutationFn at /v1/oauth/{org}/authorize.
+// That endpoint is only required for the localhost loopback flow, where the page
+// auto-POSTs the user's consent. With a console.anthropic.com redirect, the page
+// just renders the auth code on the console page and the user copies it.
+const OAUTH_AUTH_URL = 'https://claude.ai/oauth/authorize';
+const OAUTH_TOKEN_URL = 'https://console.anthropic.com/v1/oauth/token';
+const OAUTH_REDIRECT_URI = 'https://console.anthropic.com/oauth/code/callback';
+const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
+// Scope set from the gist (org:create_api_key gives a real API key from the
+// access_token, plus the basic Claude Code scopes for inference + sessions).
+// Anthropic console OAuth's known working set — same as Claude Code CLI's.
+const OAUTH_SCOPES = 'org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload';
+
+async function ensureDirs() {
+  await fs.mkdir(userDataPath(), { recursive: true });
+}
+
+// ============================================================
+// Native macOS menu bar — File / Edit / View / Window / Help
+// ============================================================
+// Built on app ready and rebuilt whenever the recent-folders list
+// changes (Open Recent submenu needs to refresh). Each menu item's
+// click sends a 'menu:action' IPC to the focused window so the
+// renderer can react (open folder, switch tabs, etc.) without each
+// item needing its own dedicated IPC handler.
+// Resolution-preset helpers for the View → Resolution submenu.
+// resizeWindowTo(w, h) resizes the focused window (or mainWindow) to
+// w×h, clamped to the primary display's work area, and re-centers it.
+// resizeWindowToFullScreen() sizes to the actual screen dimensions.
+// Both bail out if no window exists.
+function resizeWindowTo(w, h) {
+  const win = BrowserWindow.getFocusedWindow() || mainWindow;
+  if (!win) return;
+  const display = require('electron').screen.getPrimaryDisplay();
+  const wa = display.workAreaSize; // { width, height }
+  const safeW = Math.min(w, wa.width);
+  const safeH = Math.min(h, wa.height);
+  // Compute the new position so the window stays centered on the display.
+  const x = Math.round(display.workArea.x + (wa.width - safeW) / 2);
+  const y = Math.round(display.workArea.y + (wa.height - safeH) / 2);
+  win.unmaximize(); // make sure the actual size takes effect
+  win.setBounds({ x, y, width: safeW, height: safeH });
+}
+
+function resizeWindowToFullScreen() {
+  const win = BrowserWindow.getFocusedWindow() || mainWindow;
+  if (!win) return;
+  const display = require('electron').screen.getPrimaryDisplay();
+  const wa = display.workArea;
+  win.unmaximize();
+  win.setBounds({ x: wa.x, y: wa.y, width: wa.width, height: wa.height });
+}
+
+function buildMenu() {
+  const isMac = process.platform === 'darwin';
+  let recents = [];
+  try { recents = db.getRecentFolders(10) || []; } catch {}
+
+  const recentItems = recents.length
+    ? recents.map((r) => ({
+        label: r.label || path.basename(r.path),
+        sublabel: r.path,
+        click: () => sendMenuAction('openFolder', { path: r.path }),
+      }))
+    : [{ label: 'No recent folders', enabled: false }];
+
+  const windowItems = openWindows.length
+    ? openWindows.map((w, i) => ({
+        label: `Window ${i + 1}${w.getTitle() ? ' — ' + w.getTitle() : ''}`,
+        click: () => { if (!w.isDestroyed()) w.focus(); },
+      }))
+    : [];
+
+  const template = [
+    // ---- App menu (macOS only) ----
+    ...(isMac ? [{
+      label: app.name,
+      submenu: [
+        { role: 'about' },
+        { type: 'separator' },
+        { label: 'Settings...', accelerator: 'Cmd+,', click: () => sendMenuAction('openSettings') },
+        { type: 'separator' },
+        { role: 'hide' },
+        { role: 'hideOthers' },
+        { role: 'unhideAll' },
+        { type: 'separator' },
+        { role: 'quit' },
+      ],
+    }] : []),
+
+    // ---- File ----
+    {
+      label: 'File',
+      submenu: [
+        { label: 'New Window', accelerator: 'Cmd+N', click: () => createWindow() },
+        { label: 'New File', accelerator: 'Cmd+Alt+N', click: () => sendMenuAction('newFile') },
+        { type: 'separator' },
+        {
+          label: 'Open File...',
+          accelerator: 'Cmd+O',
+          click: async () => {
+            const focused = BrowserWindow.getFocusedWindow() || mainWindow;
+            if (!focused) return;
+            const r = await dialog.showOpenDialog(focused, {
+              properties: ['openFile'],
+              title: 'Open File',
+            });
+            if (!r.canceled && r.filePaths[0]) sendMenuAction('openFile', { path: r.filePaths[0] });
+          },
+        },
+        {
+          label: 'Open Folder...',
+          accelerator: 'Cmd+Shift+O',
+          click: async () => {
+            const focused = BrowserWindow.getFocusedWindow() || mainWindow;
+            if (!focused) return;
+            const r = await dialog.showOpenDialog(focused, {
+              properties: ['openDirectory', 'createDirectory'],
+              title: 'Open Folder',
+            });
+            if (!r.canceled && r.filePaths[0]) sendMenuAction('openFolder', { path: r.filePaths[0] });
+          },
+        },
+        {
+          label: 'Open Recent',
+          submenu: [
+            ...recentItems,
+            { type: 'separator' },
+            {
+              label: 'Clear Recent',
+              click: async () => {
+                db.clearRecentFolders();
+                Menu.setApplicationMenu(buildMenu());
+              },
+            },
+          ],
+        },
+        { type: 'separator' },
+        { label: 'Close Folder', accelerator: 'Cmd+Alt+W', click: () => sendMenuAction('closeFolder') },
+        { type: 'separator' },
+        { role: 'close' },
+      ],
+    },
+
+    // ---- Edit ----
+    {
+      label: 'Edit',
+      submenu: [
+        { role: 'undo' },
+        { role: 'redo' },
+        { type: 'separator' },
+        { role: 'cut' },
+        { role: 'copy' },
+        { role: 'paste' },
+        ...(isMac
+          ? [
+              { role: 'pasteAndMatchStyle' },
+              { role: 'delete' },
+              { role: 'selectAll' },
+              { type: 'separator' },
+              {
+                label: 'Find',
+                accelerator: 'Cmd+F',
+                click: () => sendMenuAction('focusCommandPalette'),
+              },
+            ]
+          : [
+              { role: 'delete' },
+              { type: 'separator' },
+              { role: 'selectAll' },
+            ]),
+      ],
+    },
+
+    // ---- View ----
+    {
+      label: 'View',
+      submenu: [
+        { label: 'Show Files Tab', accelerator: 'Cmd+1', click: () => sendMenuAction('showTab', { tab: 'files' }) },
+        { label: 'Show Tasks Tab', accelerator: 'Cmd+2', click: () => sendMenuAction('showTab', { tab: 'tasks' }) },
+        { label: 'Show Live Tab',  accelerator: 'Cmd+3', click: () => sendMenuAction('showTab', { tab: 'live' }) },
+        { type: 'separator' },
+        { label: 'Toggle Left Panel',  accelerator: 'Cmd+Alt+B', click: () => sendMenuAction('toggleLeftPanel') },
+        { label: 'Toggle Right Panel', accelerator: 'Cmd+Alt+R', click: () => sendMenuAction('toggleRightPanel') },
+        { type: 'separator' },
+        { label: 'Focus Terminal', accelerator: 'Cmd+`', click: () => sendMenuAction('focusTerminal') },
+        { label: 'Focus Claude Code', accelerator: 'Cmd+Shift+`', click: () => sendMenuAction('focusClaudeCode') },
+        { type: 'separator' },
+        { label: 'Command Palette', accelerator: 'Cmd+K', click: () => sendMenuAction('focusCommandPalette') },
+        { label: 'Search in Files…', accelerator: 'Cmd+Shift+F', click: () => sendMenuAction('focusSearchOverlay') },
+        { label: 'Find File by Name…', accelerator: 'Cmd+Shift+P', click: () => sendMenuAction('focusFileFinder') },
+        { type: 'separator' },
+        // Resolution presets — three buckets (mobile, desktop, fullscreen)
+        // matching the pattern from the-last-draft's StoryFrame.jsx (Zoom
+        // select) and PhoneFrame.jsx (device presets). Lets Long resize
+        // the IDE window to common canvas sizes for previewing how game
+        // UIs will look at each breakpoint. Each preset recenters the
+        // window on the primary display so the change is predictable.
+        {
+          label: 'Resolution',
+          submenu: [
+            {
+              label: 'Mobile',
+              submenu: [
+                { label: 'iPhone SE 3   (375 × 667)',  click: () => resizeWindowTo(375, 667) },
+                { label: 'iPhone 14    (390 × 844)',  click: () => resizeWindowTo(390, 844) },
+                { label: 'Pixel 7      (412 × 915)',  click: () => resizeWindowTo(412, 915) },
+                { label: 'iPhone 14 +  (428 × 926)',  click: () => resizeWindowTo(428, 926) },
+              ],
+            },
+            {
+              label: 'Desktop',
+              submenu: [
+                { label: 'Compact     (1280 × 800)',  click: () => resizeWindowTo(1280, 800) },
+                { label: 'Default     (1512 × 1320)', click: () => resizeWindowTo(1512, 1320) },
+                { label: 'HD          (1920 × 1080)', click: () => resizeWindowTo(1920, 1080) },
+                { label: 'QHD         (2560 × 1440)', click: () => resizeWindowTo(2560, 1440) },
+                { label: 'Ultrawide   (3440 × 1440)', click: () => resizeWindowTo(3440, 1440) },
+              ],
+            },
+            {
+              label: 'Full Screen',
+              submenu: [
+                { label: 'Match Display', click: () => resizeWindowToFullScreen() },
+                { label: 'Toggle Maximize/Restore', click: () => {
+                  const w = BrowserWindow.getFocusedWindow() || mainWindow;
+                  if (w) {
+                    if (w.isMaximized()) w.unmaximize(); else w.maximize();
+                  }
+                }},
+              ],
+            },
+          ],
+        },
+        { type: 'separator' },
+        { role: 'reload' },
+        { role: 'toggleDevTools' },
+        { type: 'separator' },
+        { role: 'togglefullscreen' },
+      ],
+    },
+
+    // ---- Window ----
+    {
+      label: 'Window',
+      submenu: [
+        { label: 'New Window', accelerator: 'Cmd+Shift+N', click: () => createWindow() },
+        { type: 'separator' },
+        ...windowItems,
+        { type: 'separator' },
+        { role: 'minimize' },
+        { role: 'zoom' },
+        ...(isMac
+          ? [
+              { type: 'separator' },
+              { role: 'front' },
+              { type: 'separator' },
+              { role: 'window' },
+            ]
+          : [{ role: 'close' }]),
+      ],
+    },
+
+    // ---- Help ----
+    {
+      role: 'help',
+      submenu: [
+        {
+          label: 'Farnsworth on GitHub',
+          click: () => openExternalSafe('https://github.com/TheAnomalyXYZ/farnsworth'),
+        },
+      ],
+    },
+  ];
+
+  return Menu.buildFromTemplate(template);
+}
+
+function createWindow() {
+  mainWindow = new BrowserWindow({
+    width: 1512,
+    height: 1320,
+    minWidth: 1100,
+    minHeight: 800,
+    title: 'Farnsworth',
+    backgroundColor: '#1e1f22',
+    titleBarStyle: 'hiddenInset',
+    trafficLightPosition: { x: 14, y: 14 },
+    show: false,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false,
+    },
+  });
+
+  mainWindow.once('ready-to-show', () => {
+    mainWindow.show();
+    // Force focus on macOS so the menu bar reflects Farnsworth's menus
+    // immediately on launch. Without this, the window appears but stays
+    // behind whatever was last focused (Vellum, Slack, etc.), and the
+    // menu bar at the top shows the wrong app's menus. Long hit this on
+    // Jul 2 — clicking the Farnsworth window didn't bring it to focus.
+    mainWindow.focus();
+    if (process.platform === 'darwin' && app.focus) {
+      app.focus({ steal: true });
+    }
+  });
+  mainWindow.loadFile(path.join(__dirname, 'index.html'));
+
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    openExternalSafe(url);
+    return { action: 'deny' };
+  });
+
+  // ------------------------------------------------------------
+  // Close handler (Jun 28 ~16:12 ET)
+  // ------------------------------------------------------------
+  // Long hit the X (top-right traffic-light close button), the window
+  // closed, but the main process stayed alive on darwin (default
+  // Electron behaviour: app keeps running so user can reopen from Dock).
+  // The wrapper script hides the Electron dock icon, so reopening was
+  // impossible — the user saw a "stuck" state where the app was alive
+  // but no window showed. He force-quit + relaunched and the active
+  // conversation was gone because state.chatActiveId only lived in
+  // renderer memory.
+  //
+  // Two fixes:
+  //   (1) intercept close to force the renderer to flush its pending
+  //       conversation save (the 500ms debounce in saveActiveConversation
+  //       would otherwise lose data on a quick close);
+  //   (2) make window-all-closed call app.quit() unconditionally so
+  //       darwin also exits, so the next `open` launches cleanly.
+  // ------------------------------------------------------------
+  mainWindow.on('close', async (event) => {
+    if (mainWindow._closeInProgress) return;
+    event.preventDefault();
+    mainWindow._closeInProgress = true;
+    try {
+      // Ask the renderer to flush any pending save synchronously. The
+      // 500ms debounce in saveActiveConversation would otherwise lose
+      // data on a quick X-click. executeJavaScript awaits the promise,
+      // so we know the DB write has flushed before we close.
+      await mainWindow.webContents.executeJavaScript(
+        '(async () => { try { if (typeof saveActiveConversation === "function") await saveActiveConversation(); ' +
+        'if (typeof persistClaudeCodeTabs === "function") persistClaudeCodeTabs(); ' +
+        'return { ok: true }; } catch (e) { return { ok: false, err: e.message }; } })()',
+        true,
+      ).catch(() => {});
+      // 1.5s ceiling so a hung renderer can't keep the app alive
+      // indefinitely. Long had to force-quit last time; don't repeat.
+      await new Promise((r) => setTimeout(r, 250));
+    } finally {
+      app.quit();
+    }
+  });
+
+  // Track this window in openWindows so the Window menu can list it.
+  // When a window closes, remove it and rebuild the menu so the list
+  // stays accurate.
+  openWindows.push(mainWindow);
+  mainWindow.on('closed', () => {
+    const idx = openWindows.indexOf(mainWindow);
+    if (idx >= 0) openWindows.splice(idx, 1);
+    if (mainWindow && mainWindow === openWindows[0]) mainWindow = openWindows[0] || null;
+    try { Menu.setApplicationMenu(buildMenu()); } catch {}
+  });
+  // Rebuild the menu whenever a new window opens so the Window list
+  // shows the latest count and titles.
+  try { Menu.setApplicationMenu(buildMenu()); } catch {}
+}
+
+// ============================================================
+// IPC: Settings (SQLite-backed)
+// ============================================================
+ipcMain.handle('settings:get', async () => db.getAllSettings());
+
+ipcMain.handle('settings:set', async (_event, settings) => {
+  db.setAllSettings(Object.entries(settings || {}));
+  return true;
+});
+// Single-key getters/setters — preferred for new code. The bulk
+// `settings:get`/`settings:set` round-trip serialises through
+// JSON.parse which mangles scalar values when callers hand back
+// unparseable shapes. Single-key reads return the raw stored string.
+ipcMain.handle('setting:get', async (_event, key) => {
+  if (!key || typeof key !== 'string') return null;
+  return db.getSetting(key);
+});
+ipcMain.handle('setting:set', async (_event, key, value) => {
+  if (!key || typeof key !== 'string') return { ok: false, error: 'bad_key' };
+  db.setSetting(key, value);
+  return { ok: true };
+});
+
+// ============================================================
+// IPC: Dev tools (farnsworth backend, per app type)
+// ============================================================
+// Reads ~/.cache/farnsworth-<appType>.json (written by
+// `npm run farnsworth:<appType>` in the app's template repo) and confirms
+// the dev server PID is still alive. One handler serves every app type
+// (devvit, threejs, blockchain, ...) — the renderer passes the open
+// workspace's appType. Defaults to 'devvit'.
+//
+// Returns { available: true, type, url, pid, startedAt } when the dev
+// server is up, or { available: false } (or { available: false, url, pid,
+// dead: true }) when the meta file is missing or the process is dead.
+ipcMain.handle('dev:farnsworth:get', async (_event, appType = 'devvit') => {
+  const fs = require('fs');
+  const path = require('path');
+  const type = (typeof appType === 'string' && appType) ? appType : 'devvit';
+  const metaPath = path.join(require('os').homedir(), '.cache', `farnsworth-${type}.json`);
+  try {
+    const raw = await fs.promises.readFile(metaPath, 'utf8');
+    const meta = JSON.parse(raw);
+    if (!meta || !meta.pid || !meta.url) return { available: false, type };
+    try { process.kill(meta.pid, 0); }
+    catch { return { available: false, type, url: meta.url, pid: meta.pid, dead: true }; }
+    return { available: true, type, url: meta.url, pid: meta.pid, startedAt: meta.startedAt };
+  } catch {
+    return { available: false, type };
+  }
+});
+
+// Boot the farnsworth dev server for a workspace by running its
+// `npm run farnsworth:<appType>` script (which lives in the app's template
+// repo). The script kills any stale instance, boots vite in the background,
+// writes ~/.cache/farnsworth-<type>.json, and blocks until the server responds
+// (or times out ~30s) then exits. We wait for that exit and return the meta so
+// the renderer can immediately re-render the canvas with live iframes.
+//
+// repoRoot is the open workspace folder (state.folder). It must contain a
+// package.json defining the `farnsworth:<type>` script.
+ipcMain.handle('dev:farnsworth:boot', async (_event, appType = 'devvit', repoRoot) => {
+  const fs = require('fs');
+  const path = require('path');
+  const os = require('os');
+  const { spawn } = require('child_process');
+  const type = (typeof appType === 'string' && appType) ? appType : 'devvit';
+
+  if (!repoRoot || typeof repoRoot !== 'string') {
+    return { ok: false, error: 'no_workspace', message: 'Open a workspace folder first.' };
+  }
+  const scriptName = `farnsworth:${type}`;
+  const pkgPath = path.join(repoRoot, 'package.json');
+  try {
+    const pkg = JSON.parse(await fs.promises.readFile(pkgPath, 'utf8'));
+    if (!pkg.scripts || !pkg.scripts[scriptName]) {
+      return {
+        ok: false,
+        error: 'no_script',
+        message: `This workspace has no "${scriptName}" script in package.json.`,
+      };
+    }
+  } catch {
+    return {
+      ok: false,
+      error: 'no_package_json',
+      message: `No package.json found at ${repoRoot}.`,
+    };
+  }
+
+  // Ensure node/npm are on PATH (Apple Silicon Homebrew isn't on the default
+  // PATH inherited when the app is launched via LaunchServices/`open`).
+  const env = { ...process.env };
+  const extraPaths = ['/opt/homebrew/bin', '/usr/local/bin'];
+  env.PATH = [...extraPaths, env.PATH || ''].filter(Boolean).join(':');
+
+  // Devvit emulator: write the per-project config (current user, current
+  // subreddit, seeded users/subreddits) to a temp file and inject the
+  // emulator loader via NODE_OPTIONS so the user's scripts.dev subprocess
+  // intercepts @devvit/redis and @devvit/public-api imports automatically.
+  // Farnsworth's own devvit-emulator package lives in this app's dir.
+  if (type === 'devvit') {
+    try {
+      const fs2 = require('fs');
+      const path2 = require('path');
+      const os2 = require('os');
+      const loaderPath = path2.join(__dirname, 'devvit-emulator', 'loader.mjs');
+      if (fs2.existsSync(loaderPath)) {
+        // Seed defaults for this workspace on first boot.
+        db.devvitInitDefaultsForProject(repoRoot);
+        // Snapshot the per-project config + user library + subreddit library
+        // into a single JSON file the loader reads at boot.
+        const settings = db.devvitGetProjectSettings(repoRoot) || {};
+        const users = db.devvitListUsers();
+        const subreddits = db.devvitListSubreddits();
+        const cfg = {
+          currentUsername: settings.current_username || null,
+          currentSubredditName: settings.current_subreddit_name || null,
+          users,
+          subreddits,
+        };
+        const cacheDir = path2.join(os2.homedir(), '.cache');
+        fs2.mkdirSync(cacheDir, { recursive: true });
+        const cfgPath = path2.join(cacheDir, `farnsworth-devvit-${Buffer.from(repoRoot).toString('hex').slice(0, 16)}.json`);
+        fs2.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
+        env.DEVVIT_EMULATOR_CONFIG = cfgPath;
+        // Also expose the config to the browser-side shim via Vite's
+        // import.meta.env.VITE_* substitution. The dev-tools vite's
+        // @devvit/web/client shim (the-last-draft/dev-tools/devvit-shim.ts)
+        // reads this at module-load time to set context.username +
+        // context.subredditName from the active emulator user. Without this
+        // the iframe game would always show the shim's hardcoded 'dev-user'
+        // regardless of the cogwheel selection.
+        env.VITE_DEVVIT_EMULATOR_CONFIG_JSON = JSON.stringify(cfg);
+        const existingNodeOpts = env.NODE_OPTIONS || '';
+        env.NODE_OPTIONS = `--import "${loaderPath}"${existingNodeOpts ? ' ' + existingNodeOpts : ''}`;
+      }
+    } catch (e) {
+      console.error('[devvit-emulator] failed to inject loader:', e);
+    }
+  }
+
+  return await new Promise((resolve) => {
+    let settled = false;
+    let stderr = '';
+    const child = spawn('npm', ['run', scriptName], {
+      cwd: repoRoot,
+      env,
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+    child.stderr.on('data', (d) => { stderr += d.toString().slice(0, 4000); });
+
+    // Safety timeout — the script itself polls up to ~30s, so give it 45s.
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      resolve({ ok: false, error: 'timeout', message: 'Dev server did not come up within 45s.' });
+    }, 45000);
+
+    child.on('error', (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ ok: false, error: 'spawn_failed', message: err.message });
+    });
+
+    child.on('exit', async (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (code !== 0) {
+        resolve({ ok: false, error: 'script_failed', code, message: stderr.trim() || `Script exited ${code}.` });
+        return;
+      }
+      // Script exited 0 → server is up and meta written. Read it back.
+      const metaPath = path.join(os.homedir(), '.cache', `farnsworth-${type}.json`);
+      try {
+        const meta = JSON.parse(await fs.promises.readFile(metaPath, 'utf8'));
+        resolve({ ok: true, type, url: meta.url, pid: meta.pid, startedAt: meta.startedAt });
+      } catch {
+        resolve({ ok: true, type, url: `http://localhost:5174` });
+      }
+    });
+  });
+});
+
+// Stop the farnsworth dev server (kills the vite process) and clears its meta
+// so the canvas falls back to static images. Best-effort.
+ipcMain.handle('dev:farnsworth:stop', async (_event, appType = 'devvit') => {
+  const fs = require('fs');
+  const path = require('path');
+  const os = require('os');
+  const { execFile } = require('child_process');
+  const type = (typeof appType === 'string' && appType) ? appType : 'devvit';
+  const metaPath = path.join(os.homedir(), '.cache', `farnsworth-${type}.json`);
+
+  // Kill by pid from meta if present.
+  try {
+    const meta = JSON.parse(await fs.promises.readFile(metaPath, 'utf8'));
+    if (meta && meta.pid) { try { process.kill(meta.pid, 'SIGKILL'); } catch {} }
+  } catch {}
+
+  // Belt-and-suspenders: kill any lingering devtools vite process.
+  await new Promise((resolve) => {
+    execFile('pkill', ['-f', 'vite.devtools.config.ts'], () => resolve());
+  });
+
+  // Clear the meta so get/re-detect reports unavailable.
+  try { await fs.promises.unlink(metaPath); } catch {}
+  return { ok: true, type };
+});
+
+// ============================================================
+// IPC: Recent folders
+// ============================================================
+ipcMain.handle('recent:get', async () => db.getRecentFolders(10));
+ipcMain.handle('recent:add', async (_event, folderPath) => {
+  db.addRecentFolder(folderPath, path.basename(folderPath));
+  // Rebuild the menu so the Open Recent submenu picks up the new entry.
+  try { Menu.setApplicationMenu(buildMenu()); } catch {}
+  return db.getRecentFolders(10);
+});
+ipcMain.handle('recent:clear', async () => {
+  db.clearRecentFolders();
+  try { Menu.setApplicationMenu(buildMenu()); } catch {}
+  return [];
+});
+
+// ============================================================
+// IPC: Folder picker
+// ============================================================
+ipcMain.handle('dialog:openFolder', async () => {
+  const focused = BrowserWindow.getFocusedWindow() || mainWindow;
+  const result = await dialog.showOpenDialog(focused, {
+    properties: ['openDirectory'],
+    title: 'Open Folder',
+  });
+  if (result.canceled || !result.filePaths.length) return null;
+  return result.filePaths[0];
+});
+
+// ============================================================
+// IPC: Workspace config (per-folder .farnsworth/config.json)
+// ============================================================
+ipcMain.handle('workspace:loadConfig', async (_event, folderPath) => {
+  try {
+    const configPath = path.join(folderPath, '.farnsworth', 'config.json');
+    const raw = await fs.readFile(configPath, 'utf8');
+    return { ok: true, config: JSON.parse(raw) };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+ipcMain.handle('workspace:saveConfig', async (_event, folderPath, config) => {
+  try {
+    const configDir = path.join(folderPath, '.farnsworth');
+    await fs.mkdir(configDir, { recursive: true });
+    await fs.writeFile(path.join(configDir, 'config.json'), JSON.stringify(config, null, 2), 'utf8');
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+// ============================================================
+// IPC: Devvit emulator — user library + per-project settings
+// ============================================================
+// The user/subreddit library is global (workspaces table-agnostic);
+// per-project settings live in devvit_project_settings keyed by
+// workspace_path. The renderer calls these from the cogwheel popover
+// and from the canvas-overlay-bar user dropdown.
+ipcMain.handle('devvit:list-users', async () => db.devvitListUsers());
+ipcMain.handle('devvit:upsert-user', async (_event, user) => db.devvitUpsertUser(user));
+ipcMain.handle('devvit:delete-user', async (_event, id) => db.devvitDeleteUser(id));
+ipcMain.handle('devvit:list-subreddits', async () => db.devvitListSubreddits());
+ipcMain.handle('devvit:upsert-subreddit', async (_event, sub) => db.devvitUpsertSubreddit(sub));
+ipcMain.handle('devvit:delete-subreddit', async (_event, id) => db.devvitDeleteSubreddit(id));
+ipcMain.handle('devvit:get-project-settings', async (_event, workspacePath) => {
+  db.devvitInitDefaultsForProject(workspacePath);
+  return db.devvitGetProjectSettings(workspacePath);
+});
+ipcMain.handle('devvit:set-project-settings', async (_event, workspacePath, currentUserId, currentSubredditId) => {
+  const res = db.devvitSetProjectSettings(workspacePath, currentUserId, currentSubredditId);
+  // Also rewrite the on-disk config the loader reads on next boot so the
+  // next subprocess picks up the change. (For mid-session switching the
+  // subprocess reloads via the watcher below — see devvit-emulator/loader.mjs.)
+  try {
+    const os2 = require('os');
+    const fs2 = require('fs');
+    const path2 = require('path');
+    const settings = db.devvitGetProjectSettings(workspacePath) || {};
+    const users = db.devvitListUsers();
+    const subreddits = db.devvitListSubreddits();
+    const cfg = {
+      currentUsername: settings.current_username || null,
+      currentSubredditName: settings.current_subreddit_name || null,
+      users,
+      subreddits,
+    };
+    const cacheDir = path2.join(os2.homedir(), '.cache');
+    fs2.mkdirSync(cacheDir, { recursive: true });
+    const cfgPath = path2.join(cacheDir, `farnsworth-devvit-${Buffer.from(workspacePath).toString('hex').slice(0, 16)}.json`);
+    fs2.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
+  } catch (e) {
+    console.error('[devvit-emulator] failed to rewrite config file:', e);
+  }
+  return res;
+});
+
+// ============================================================
+// IPC: Memory system (Tier 1, Jul 5 2026)
+//
+// Surface mirrors Vellum's 6-layer pipeline in compressed form:
+// bootstrap = always-loaded essentials + recent concepts
+// recall    = LIKE-based concept+essential+buffer search (Tier 2: vec)
+// remember  = append raw fact to buffer + archive (immutable daily log)
+// get/set   = CRUD on concepts + essentials
+// consolidate = flip buffer rows to consolidated (Tier 2: merge into concept)
+// archive   = read daily log (for debugging + future community-memory)
+// ============================================================
+ipcMain.handle('memory:bootstrap', async () => db.memoryBootstrap());
+ipcMain.handle('memory:recall', async (_event, query, limit) => await db.memoryRecall(query, limit));
+ipcMain.handle('memory:remember', async (_event, content, opts) => {
+  const ctx = opts?.context || null;
+  const src = opts?.source || 'chat';
+  const kind = opts?.kind || 'fact';
+  const bufferRes = db.memoryBufferAppend(content, ctx, src);
+  if (kind !== 'fact') {
+    // Non-fact kinds (correction/commitment/plan/note) also go to the
+    // immutable daily log so they survive across conversations.
+    db.memoryArchiveAppend(kind, content, ctx ? { context: ctx, source: src } : { source: src });
+  } else {
+    db.memoryArchiveAppend('fact', content, ctx ? { context: ctx, source: src } : { source: src });
+  }
+  return bufferRes;
+});
+ipcMain.handle('memory:get', async (_event, slug) => db.memoryGetConcept(slug));
+ipcMain.handle('memory:set', async (_event, concept) => {
+  const res = db.memoryUpsertConcept(concept);
+  // Tier 2: re-embed so memory_vec stays in sync. Fire-and-forget —
+  // the sync upsert is the primary write; embedding catches up async.
+  if (concept?.slug) db.memoryConceptEmbed(concept.slug).catch((e) => console.warn('[memory tier2] embed failed:', e.message));
+  return res;
+});
+ipcMain.handle('memory:delete', async (_event, slug) => {
+  const res = db.memoryDeleteConcept(slug);
+  db.memoryConceptForget(slug);
+  return res;
+});
+ipcMain.handle('memory:list', async (_event, limit) => db.memoryListConcepts(limit));
+ipcMain.handle('memory:essential-get', async (_event, key) => db.memoryGetEssential(key));
+ipcMain.handle('memory:essential-set', async (_event, key, value, source, confidence) => db.memorySetEssential(key, value, source, confidence));
+ipcMain.handle('memory:essential-delete', async (_event, key) => db.memoryDeleteEssential(key));
+ipcMain.handle('memory:essentials', async () => db.memoryListEssentials());
+ipcMain.handle('memory:consolidate', async (_event, bufferIds) => db.memoryConsolidate(bufferIds));
+ipcMain.handle('memory:archive', async (_event, opts) => db.memoryArchiveList(opts));
+ipcMain.handle('memory:buffer', async (_event, onlyUnconsolidated, limit) => db.memoryBufferList(onlyUnconsolidated, limit));
+
+// ============================================================
+// IPC: Memory Tier 2 — codebase indexer (sqlite-vec)
+// ============================================================
+
+// Code index stats for the Settings panel.
+ipcMain.handle('memory:code-stats', async (_event, workspacePath) => db.memoryCodeStats(workspacePath));
+
+// Search the FTS5 keyword index for a workspace. Returns ranked chunks
+// matching the query string. Tier 2 ships FTS5-only (sqlite-vec is loaded
+// but embeddings stay disabled until onnxruntime BFCArena is fixed
+// upstream). Positional args: workspacePath, query, k.
+ipcMain.handle('memory:code-search', async (_event, workspacePath, query, k) => {
+  if (!workspacePath || !query) return { ok: false, error: 'missing_args' };
+  return db.memoryCodeFtsSearch(query, k || 12, workspacePath);
+});
+
+// Manually upsert a single file (used by the renderer when it wants to
+// force-index a file without waiting for the watcher).
+ipcMain.handle('memory:code-index-file', async (_event, workspacePath, filePath, content) => {
+  return await db.memoryCodeUpsertFile(workspacePath, filePath, content);
+});
+
+// Manually remove a file from the index (called by the watcher on unlink).
+ipcMain.handle('memory:code-remove-file', async (_event, workspacePath, filePath) => {
+  return db.memoryCodeRemoveFile(workspacePath, filePath);
+});
+
+// Re-embed a concept after upsert (called after memory:set so the vec
+// table stays in sync with memory_concepts).
+ipcMain.handle('memory:concept-embed', async (_event, slug) => {
+  return await db.memoryConceptEmbed(slug);
+});
+
+// Forget a concept's embedding (called after memory:delete).
+ipcMain.handle('memory:concept-forget', async (_event, slug) => {
+  return db.memoryConceptForget(slug);
+});
+
+// Code file watcher — singleton. Starts a chokidar watcher on the given
+// folder; on add/change it calls memoryCodeUpsertFile, on unlink it
+// calls memoryCodeRemoveFile. Filtering by extension + ignored dirs is
+// done in the watcher setup.
+let codeWatcher = null;
+let watchedFolder = null;
+
+const CODE_FILE_EXTS = new Set([
+  '.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs',
+  '.py', '.rb', '.go', '.rs', '.java', '.kt',
+  '.md', '.mdx', '.txt', '.json', '.yaml', '.yml', '.toml',
+  '.html', '.css', '.scss', '.sass', '.vue', '.svelte',
+  '.sql', '.sh', '.bash', '.zsh',
+]);
+const CODE_FILE_IGNORED = /(^|[\/\\])(\.git|node_modules|\.DS_Store|dist|build|out|\.next|\.cache|coverage|__snapshots__|target|vendor|\.venv|venv|\.env|\.turbo|\.parcel-cache|\.idea|\.vscode)([\/\\]|$)/;
+
+function stopCodeWatcher() {
+  if (codeWatcher) {
+    try { codeWatcher.close(); } catch (_) {}
+    codeWatcher = null;
+    watchedFolder = null;
+    console.log('[memory tier2] code watcher stopped');
+  }
+}
+
+ipcMain.handle('memory:code-watch', async (_event, workspacePath) => {
+  if (!workspacePath || typeof workspacePath !== 'string') {
+    return { ok: false, error: 'missing_workspace_path' };
+  }
+  // Already watching this folder — no-op.
+  if (watchedFolder === workspacePath && codeWatcher) {
+    return { ok: true, already_watching: true };
+  }
+  stopCodeWatcher();
+  const chokidar = await import('chokidar');
+  console.log('[memory tier2] starting watcher on', workspacePath);
+  codeWatcher = chokidar.watch(workspacePath, {
+    ignored: (path, stats) => {
+      // Always ignore known-bad dirs (any depth)
+      if (CODE_FILE_IGNORED.test(path)) return true;
+      // For files (stats available): require a known code extension
+      if (stats && stats.isFile()) {
+        const base = path.split('/').pop();
+        const ext = '.' + (base.split('.').pop() || '').toLowerCase();
+        return !CODE_FILE_EXTS.has(ext);
+      }
+      // For directories and unknown: don't ignore (let chokidar recurse)
+      return false;
+    },
+    persistent: true,
+    ignoreInitial: false,
+    awaitWriteFinish: { stabilityThreshold: 500, pollInterval: 100 },
+  });
+  watchedFolder = workspacePath;
+
+  codeWatcher.on('add', async (filePath) => {
+    console.log('[memory tier2] add:', filePath);
+    try {
+      const content = await fs.readFile(filePath, 'utf8');
+      const res = await db.memoryCodeUpsertFile(workspacePath, filePath, content);
+      console.log('[memory tier2] indexed', filePath, '→', res?.chunk_count || 0, 'chunks');
+    } catch (e) {
+      console.warn('[memory tier2] add failed:', filePath, e.message);
+    }
+  });
+  codeWatcher.on('change', async (filePath) => {
+    try {
+      const content = await fs.readFile(filePath, 'utf8');
+      const res = await db.memoryCodeUpsertFile(workspacePath, filePath, content);
+      if (res?.ok && !res.skipped) {
+        console.log('[memory tier2] re-indexed', filePath, '→', res.chunk_count, 'chunks');
+      }
+    } catch (e) {
+      console.warn('[memory tier2] change failed:', filePath, e.message);
+    }
+  });
+  codeWatcher.on('unlink', (filePath) => {
+    try {
+      db.memoryCodeRemoveFile(workspacePath, filePath);
+    } catch (e) {
+      console.warn('[memory tier2] unlink failed:', filePath, e.message);
+    }
+  });
+  codeWatcher.on('ready', () => {
+    console.log('[memory tier2] code watcher ready on', workspacePath);
+  });
+  codeWatcher.on('error', (err) => {
+    console.error('[memory tier2] watcher error:', err.message);
+  });
+
+  return { ok: true, watching: workspacePath };
+});
+
+ipcMain.handle('memory:code-unwatch', async () => {
+  stopCodeWatcher();
+  return { ok: true };
+});
+
+// ============================================================================
+// UI folder watcher — pushes add/change/unlink events to the renderer so the
+// Files panel can refresh automatically when the agent (or anything outside
+// the editor) modifies a file. Separate from the memory code watcher (which
+// only cares about code extensions + writes to memory_code_chunks). The UI
+// watcher emits all file types and emits raw events to the renderer; debouncing
+// + readFolder() happens renderer-side so we can also scroll/highlight.
+// ============================================================================
+let uiWatcher = null;
+let uiWatchedFolder = null;
+
+function stopUiWatcher() {
+  if (uiWatcher) {
+    try { uiWatcher.close(); } catch (_) {}
+    uiWatcher = null;
+    uiWatchedFolder = null;
+    console.log('[fs watch] UI watcher stopped');
+  }
+}
+
+ipcMain.handle('fs:watchFolder', async (event, folderPath) => {
+  if (!folderPath || typeof folderPath !== 'string') {
+    return { ok: false, error: 'missing_folder_path' };
+  }
+  if (uiWatchedFolder === folderPath && uiWatcher) {
+    return { ok: true, already_watching: true };
+  }
+  stopUiWatcher();
+  const chokidar = await import('chokidar');
+  console.log('[fs watch] starting UI watcher on', folderPath);
+  // Same ignore set as the memory watcher minus the code-extension filter
+  // (the Files panel shows everything, including images / configs).
+  uiWatcher = chokidar.watch(folderPath, {
+    ignored: (path) => CODE_FILE_IGNORED.test(path),
+    persistent: true,
+    ignoreInitial: true,  // don't emit add events for existing files
+    awaitWriteFinish: { stabilityThreshold: 250, pollInterval: 50 },
+    depth: 99,
+  });
+  uiWatchedFolder = folderPath;
+
+  const send = (type, path) => {
+    try {
+      event.sender.send('fs:folderEvent', { type, path, folder: folderPath });
+    } catch (e) {
+      // Window may have closed mid-watch — silent.
+    }
+  };
+  uiWatcher.on('add', (filePath) => send('add', filePath));
+  uiWatcher.on('change', (filePath) => send('change', filePath));
+  uiWatcher.on('unlink', (filePath) => send('unlink', filePath));
+  uiWatcher.on('ready', () => console.log('[fs watch] UI watcher ready on', folderPath));
+  uiWatcher.on('error', (err) => console.error('[fs watch] UI watcher error:', err.message));
+
+  return { ok: true, watching: folderPath };
+});
+
+ipcMain.handle('fs:unwatchFolder', async () => {
+  stopUiWatcher();
+  return { ok: true };
+});
+
+// ============================================================================
+// Unsaved-changes confirm dialog. Used by the renderer when closing a
+// dirty tab or switching folders, and by main's before-quit handler when
+// the user tries to quit with dirty buffers open. Three buttons: Save,
+// Don't Save, Cancel.
+// ============================================================================
+ipcMain.handle('dialog:confirmDiscard', async (_event, opts) => {
+  const { fileName, count } = opts || {};
+  const buttons = ['Save', "Don't Save", 'Cancel'];
+  const detail = count && count > 1
+    ? `${count} files have unsaved changes. Save them before closing?`
+    : `${fileName || 'This file'} has unsaved changes. Save before closing?`;
+  try {
+    const result = await dialog.showMessageBox({
+      type: 'warning',
+      buttons,
+      defaultId: 0,
+      cancelId: 2,
+      title: 'Unsaved changes',
+      message: 'Unsaved changes',
+      detail,
+    });
+    return { choice: result.response };  // 0=Save, 1=Don't Save, 2=Cancel
+  } catch (e) {
+    return { choice: 2, error: e.message };  // default to Cancel on error
+  }
+});
+
+// Cleanup on app quit
+app.on('before-quit', () => {
+  try { stopUiWatcher(); } catch (_) {}
+});
+
+// Memory worker cleanup on app quit
+app.on('before-quit', () => {
+  try { stopCodeWatcher(); } catch (_) {}
+  try { db.closeEmbedWorker(); } catch (_) {}
+});
+
+// ============================================================
+// IPC: File operations
+// ============================================================
+ipcMain.handle('fs:readDir', async (_event, folderPath, depth = 2) => {
+  try {
+    const entries = await readDirRecursive(folderPath, depth);
+    return { ok: true, entries };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+async function readDirRecursive(dir, depth, base = dir) {
+  const out = [];
+  let items;
+  try {
+    items = await fs.readdir(dir, { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  items.sort((a, b) => {
+    if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
+    return a.name.localeCompare(b.name);
+  });
+  for (const item of items) {
+    if (['node_modules', '.git', 'dist', 'build', '.next', '.cache'].includes(item.name)) continue;
+    if (item.name.startsWith('.') && item.name !== '.farnsworth') continue;
+    const full = path.join(dir, item.name);
+    const rel = path.relative(base, full);
+    if (item.isDirectory()) {
+      out.push({ path: rel, type: 'dir', name: item.name });
+      if (depth > 1) {
+        const children = await readDirRecursive(full, depth - 1, base);
+        children.forEach(c => out.push(c));
+      }
+    } else {
+      const ext = path.extname(item.name).slice(1);
+      let size = 0;
+      try { size = (await fs.stat(full)).size; } catch {}
+      out.push({ path: rel, type: 'file', name: item.name, ext, size });
+    }
+  }
+  return out;
+}
+
+ipcMain.handle('fs:readFile', async (_event, folderPath, filePath) => {
+  try {
+    const full = path.join(folderPath, filePath);
+    const content = await fs.readFile(full, 'utf8');
+    return { ok: true, content };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+ipcMain.handle('fs:writeFile', async (_event, folderPath, filePath, content) => {
+  try {
+    const full = path.join(folderPath, filePath);
+    await fs.mkdir(path.dirname(full), { recursive: true });
+    await fs.writeFile(full, content, 'utf8');
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+// Reveal a file (or folder) in Finder. Wraps `/usr/bin/open -R <path>`
+// which goes through LaunchServices directly and does NOT trip the
+// macOS AppleEvents TCC prompt that `shell.showItemInFolder()` does
+// on first invocation. Returns {ok} on success, {ok: false, error} on
+// failure (e.g. missing workspace, missing file, path doesn't exist).
+//
+// Args:
+//   folderPath — workspace root (must be set; we resolve relative paths
+//                against it for safety)
+//   filePath   — file path relative to the workspace. Empty string
+//                reveals the workspace folder itself.
+ipcMain.handle('fs:showInFinder', async (_event, folderPath, filePath) => {
+  if (!folderPath) return { ok: false, error: 'missing_folder' };
+  const target = filePath ? path.join(folderPath, filePath) : folderPath;
+  try {
+    await fs.access(target);
+  } catch (err) {
+    return { ok: false, error: 'not_found' };
+  }
+  return new Promise((resolve) => {
+    child_process.execFile('open', ['-R', target], (err) => {
+      if (err) {
+        console.error('[fs:showInFinder] open -R failed for', target, '-', err.message);
+        return resolve({ ok: false, error: err.message });
+      }
+      resolve({ ok: true, target });
+    });
+  });
+});
+
+// Rename a file or folder within the workspace. The new path is also
+// resolved against the workspace root so a user can't escape via "../".
+ipcMain.handle('fs:rename', async (_event, folderPath, oldRelPath, newRelPath) => {
+  if (!folderPath || !oldRelPath || !newRelPath) {
+    return { ok: false, error: 'missing_args' };
+  }
+  const oldFull = path.resolve(folderPath, oldRelPath);
+  const newFull = path.resolve(folderPath, newRelPath);
+  const rootResolved = path.resolve(folderPath);
+  if (!oldFull.startsWith(rootResolved + path.sep) && oldFull !== rootResolved) {
+    return { ok: false, error: 'old_outside_workspace' };
+  }
+  if (!newFull.startsWith(rootResolved + path.sep) && newFull !== rootResolved) {
+    return { ok: false, error: 'new_outside_workspace' };
+  }
+  try {
+    await fs.access(oldFull);
+  } catch {
+    return { ok: false, error: 'source_not_found' };
+  }
+  try {
+    await fs.access(newFull);
+    return { ok: false, error: 'target_exists' };
+  } catch {
+    // good — target doesn't exist
+  }
+  try {
+    await fs.mkdir(path.dirname(newFull), { recursive: true });
+    await fs.rename(oldFull, newFull);
+    return { ok: true, oldPath: oldRelPath, newPath: newRelPath };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+// Delete a file or folder (recursive for folders) within the workspace.
+ipcMain.handle('fs:delete', async (_event, folderPath, relPath) => {
+  if (!folderPath || !relPath) return { ok: false, error: 'missing_args' };
+  const full = path.resolve(folderPath, relPath);
+  const rootResolved = path.resolve(folderPath);
+  if (!full.startsWith(rootResolved + path.sep) && full !== rootResolved) {
+    return { ok: false, error: 'outside_workspace' };
+  }
+  try {
+    await fs.access(full);
+  } catch {
+    return { ok: false, error: 'not_found' };
+  }
+  try {
+    const stat = await fs.lstat(full);
+    if (stat.isDirectory()) {
+      await fs.rm(full, { recursive: true, force: true });
+    } else {
+      await fs.unlink(full);
+    }
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+// Search file CONTENTS across the workspace (Cmd+Shift+F / "Search in Files").
+// Returns matches grouped by file. Uses ripgrep via /usr/bin/grep -rn as a
+// fallback so we don't need a new dependency. Skips node_modules, .git,
+// .farnsworth, dist, build, coverage by default. Caps results at 500 to
+// keep the renderer's overlay responsive.
+//
+// Args:
+//   folderPath — workspace root
+//   query      — substring to search (regex if opts.regex)
+//   opts       — { regex?: bool, caseSensitive?: bool, includeGlobs?: string[], maxResults?: number }
+ipcMain.handle('fs:grepWorkspace', async (_event, folderPath, query, opts = {}) => {
+  if (!folderPath || !query) return { ok: false, error: 'missing_args' };
+  const maxResults = opts.maxResults || 500;
+  const caseFlag = opts.caseSensitive ? '' : '-i';
+  const excludeDirs = ['--exclude-dir=node_modules', '--exclude-dir=.git', '--exclude-dir=.farnsworth', '--exclude-dir=dist', '--exclude-dir=build', '--exclude-dir=coverage'];
+  const includeArgs = (opts.includeGlobs || []).flatMap(g => ['--include', g]);
+  const useRegex = opts.regex ? '-E' : '-F';
+  // -n line numbers, -H file paths, --null prints path\0line\0text for safe parsing of any content
+  const args = ['-rnH', '--null', caseFlag, useRegex, ...excludeDirs, ...includeArgs, '-e', query, folderPath];
+  try {
+    const { stdout } = await new Promise((resolve, reject) => {
+      child_process.execFile('/usr/bin/grep', args, { maxBuffer: 8 * 1024 * 1024, timeout: 15000 }, (err, stdout, stderr) => {
+        // grep exit code 1 = no matches (not an error)
+        if (err && err.code === 1) return resolve({ stdout: '' });
+        if (err) return reject(err);
+        resolve({ stdout, stderr });
+      });
+    });
+    if (!stdout) return { ok: true, matches: [], files: 0 };
+    // Parse records. GNU grep with --null produces: path\0line:content\n
+    // (one NUL after the file name, then "line:content" up to the newline).
+    // Split on newline first to get records, then split each on \0 to peel
+    // the path off, then split the remainder on ":" once to get line + text.
+    const records = stdout.split('\n').filter(Boolean);
+    const matches = [];
+    const files = new Set();
+    for (const rec of records) {
+      if (matches.length >= maxResults) break;
+      const nullIdx = rec.indexOf('\0');
+      if (nullIdx < 0) continue;
+      const fullPath = rec.slice(0, nullIdx);
+      const rest = rec.slice(nullIdx + 1);
+      const colonIdx = rest.indexOf(':');
+      const lineNum = colonIdx >= 0 ? rest.slice(0, colonIdx) : '0';
+      const lineText = colonIdx >= 0 ? rest.slice(colonIdx + 1) : rest;
+      const rel = fullPath.startsWith(folderPath) ? fullPath.slice(folderPath.length + 1) : fullPath;
+      files.add(rel);
+      matches.push({ file_path: rel, line_number: parseInt(lineNum, 10), line_text: lineText });
+    }
+    return { ok: true, matches, files: files.size };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+// Flat file list for the Quick Open overlay (Cmd+Shift+P). Returns every
+// file path under the workspace, relative to folderPath. Skips the usual
+// noise (node_modules, .git, dist, build, .farnsworth, coverage) and any
+// hidden file/dir. Caps at 20k entries to keep the renderer responsive
+// for huge repos.
+//
+// Args:
+//   folderPath — workspace root
+//   opts       — { maxDepth?: number, includeHidden?: bool, maxEntries?: number }
+ipcMain.handle('fs:listFiles', async (_event, folderPath, opts = {}) => {
+  if (!folderPath) return { ok: false, error: 'missing_args' };
+  const maxDepth = opts.maxDepth || 8;
+  const maxEntries = opts.maxEntries || 20000;
+  const skipDirs = new Set(['node_modules', '.git', '.farnsworth', 'dist', 'build', 'coverage', '.next', '.cache', '.DS_Store']);
+  const files = [];
+  let truncated = false;
+  async function walk(dir, depth) {
+    if (depth > maxDepth || files.length >= maxEntries) { truncated = true; return; }
+    let entries;
+    try { entries = await fs.readdir(dir, { withFileTypes: true }); }
+    catch { return; }
+    for (const ent of entries) {
+      if (files.length >= maxEntries) { truncated = true; return; }
+      if (ent.name.startsWith('.') && ent.name !== '.env' && !opts.includeHidden) continue;
+      if (skipDirs.has(ent.name)) continue;
+      const full = path.join(dir, ent.name);
+      const rel = full.startsWith(folderPath) ? full.slice(folderPath.length + 1) : full;
+      if (ent.isDirectory()) {
+        await walk(full, depth + 1);
+      } else if (ent.isFile()) {
+        files.push(rel);
+      }
+    }
+  }
+  try {
+    await walk(folderPath, 0);
+    return { ok: true, files, count: files.length, truncated };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+// ============================================================
+// IPC: Auth — manual API key (anthropic-console provider)
+// ============================================================
+ipcMain.handle('auth:setApiKey', async (_event, key) => {
+  try {
+    if (!safeStorage.isEncryptionAvailable()) {
+      return { ok: false, error: 'Encryption not available on this system' };
+    }
+    db.setAuthToken('anthropic-console', key, null, null, { source: 'api_key' });
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+ipcMain.handle('auth:hasApiKey', async () => {
+  const t = db.getAuthToken('anthropic-console');
+  return { ok: true, hasKey: !!(t && t.accessToken) };
+});
+
+ipcMain.handle('auth:clearApiKey', async () => {
+  db.deleteAuthToken('anthropic-console');
+  return { ok: true };
+});
+
+// ============================================================
+// IPC: Auth — Claude.ai OAuth (PKCE)
+// ============================================================
+//
+// Flow (Jun 25 ~17:35 ET rewrite to use loopback redirect):
+//   1. User clicks "Sign in with Claude.ai" in Settings → AI
+//   2. Renderer calls auth:oauthStart → main generates PKCE + spins up localhost HTTP server
+//   3. Main opens browser to claude.com with redirect_uri=http://localhost:PORT/callback
+//   4. User logs in and approves on claude.ai
+//   5. Anthropic redirects browser to our localhost server with ?code=...&state=...
+//   6. Our server captures the code, closes itself, auto-exchanges code for token
+//   7. Token stored encrypted in SQLite, success page shown to user
+//
+// Why loopback: Claude Code CLI uses `http://localhost:PORT/callback` (confirmed via strings dump of
+// `/opt/homebrew/bin/claude` Jun 25 ~17:35 ET). Anthropic's OAuth server validates the redirect_uri
+// against what's registered for the client_id, and `https://platform.claude.com/oauth/code/callback`
+// is NOT registered for `9d1c250a-e61b-44d9-88ed-5944d1962f5e` — server returns
+// "Invalid request format" at authorization. The code-paste path (auth:oauthComplete) is kept as a
+// fallback if loopback fails.
+//
+// Tokens are refreshed automatically via auth:oauthRefresh (called when access token nears expiry)
+
+const OAUTH_LOOPBACK_PORTS = [8080, 8081, 8082, 8083, 8084, 8085, 8086, 8087, 8088, 8089];
+
+async function pickFreePort() {
+  const net = require('net');
+  for (const port of OAUTH_LOOPBACK_PORTS) {
+    const ok = await new Promise((resolve) => {
+      const tester = net.createServer()
+        .once('error', () => resolve(false))
+        .once('listening', () => tester.close(() => resolve(true)))
+        .listen(port, '127.0.0.1');
+    });
+    if (ok) return port;
+  }
+  throw new Error('No free loopback port in ' + OAUTH_LOOPBACK_PORTS.join(','));
+}
+
+function startOAuthCallbackServer(port, expectedState, onCode) {
+  const http = require('http');
+  return new Promise((resolve, reject) => {
+    const server = http.createServer((req, res) => {
+      const url = new URL(req.url, `http://localhost:${port}`);
+      if (url.pathname !== '/callback') {
+        res.writeHead(404).end('Not found');
+        return;
+      }
+      const code = url.searchParams.get('code');
+      const state = url.searchParams.get('state');
+      const error = url.searchParams.get('error');
+      const errorDesc = url.searchParams.get('error_description');
+
+      if (error) {
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end(`<html><body style="font-family:-apple-system,sans-serif;padding:40px;background:#1e1f22;color:#fff;">
+          <h2>Sign-in failed</h2>
+          <p>${error}: ${errorDesc || 'unknown error'}</p>
+          <p style="color:#888">You can close this window.</p>
+        </body></html>`);
+        server.close();
+        reject(new Error(`${error}: ${errorDesc || ''}`));
+        return;
+      }
+
+      if (state !== expectedState) {
+        res.writeHead(400, { 'Content-Type': 'text/html' });
+        res.end(`<html><body><h2>State mismatch</h2></body></html>`);
+        server.close();
+        reject(new Error('OAuth state mismatch'));
+        return;
+      }
+
+      if (!code) {
+        res.writeHead(400).end('Missing code');
+        server.close();
+        reject(new Error('Missing code in callback'));
+        return;
+      }
+
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end(`<html><body style="font-family:-apple-system,sans-serif;padding:40px;background:#1e1f22;color:#fff;">
+        <h2>Signed in to Farnsworth</h2>
+        <p>You can close this window and return to Farnsworth.</p>
+        <script>setTimeout(() => window.close(), 1500);</script>
+      </body></html>`);
+      server.close();
+      onCode(code, state);
+      resolve({ code, state });
+    });
+
+    server.listen(port, '127.0.0.1', () => {});
+    server.on('error', reject);
+  });
+}
+
+ipcMain.handle('auth:oauthStart', async () => {
+  try {
+    const codeVerifier = crypto.randomBytes(32).toString('base64url');
+    const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url');
+    const state = crypto.randomBytes(16).toString('base64url');
+
+    const redirectUri = OAUTH_REDIRECT_URI;
+
+    db.putOAuthState(state, codeVerifier, redirectUri);
+
+    const authUrl = new URL(OAUTH_AUTH_URL);
+    authUrl.searchParams.set('code', 'true');
+    authUrl.searchParams.set('response_type', 'code');
+    authUrl.searchParams.set('client_id', OAUTH_CLIENT_ID);
+    authUrl.searchParams.set('redirect_uri', redirectUri);
+    authUrl.searchParams.set('code_challenge', codeChallenge);
+    authUrl.searchParams.set('code_challenge_method', 'S256');
+    authUrl.searchParams.set('scope', OAUTH_SCOPES);
+    authUrl.searchParams.set('state', state);
+
+    await openExternalSafe(authUrl.toString());
+
+    return {
+      ok: true,
+      authUrl: authUrl.toString(),
+      state,
+      instructions: `Browser opened. After approving on claude.ai, the platform.claude.com/oauth/code/callback page will show a code in the format <48chars>#<fragment>. Copy just the 48 characters before the # and paste into Farnsworth to finish sign-in.`,
+    };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+ipcMain.handle('auth:oauthWaitForCallback', async (_event, state) => {
+  try {
+    const oauthState = db.getOAuthState(state);
+    if (!oauthState) {
+      return { ok: false, error: 'OAuth session not found or expired.' };
+    }
+    const m = oauthState.redirect_uri.match(/localhost:(\d+)/);
+    if (!m) {
+      return { ok: false, error: 'OAuth state has no loopback port — must use auth:oauthComplete manually.' };
+    }
+    const port = parseInt(m[1], 10);
+
+    const { code } = await startOAuthCallbackServer(port, state, () => {});
+
+    const tokenRes = await fetch(OAUTH_TOKEN_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'anthropic-beta': 'oauth-2025-04-20,claude-code-20250219',
+      },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        client_id: OAUTH_CLIENT_ID,
+        code,
+        state,
+        code_verifier: oauthState.code_verifier,
+        redirect_uri: oauthState.redirect_uri,
+      }).toString(),
+    });
+
+    if (!tokenRes.ok) {
+      const text = await tokenRes.text();
+      db.cleanupOAuthState();
+      return { ok: false, error: `Token exchange failed (${tokenRes.status}): ${text}` };
+    }
+
+    const tokenData = await tokenRes.json();
+    const accessToken = tokenData.access_token;
+    const refreshToken = tokenData.refresh_token;
+    const expiresIn = tokenData.expires_in || 3600;
+    const expiresAt = new Date(Date.now() + expiresIn * 1000).toISOString();
+
+    if (!accessToken) {
+      db.cleanupOAuthState();
+      return { ok: false, error: 'No access_token in response: ' + JSON.stringify(tokenData) };
+    }
+
+    let accountInfo = null;
+    try {
+      const rolesRes = await fetch('https://api.anthropic.com/api/oauth/claude_cli/roles', {
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          'anthropic-beta': 'oauth-2025-04-20,claude-code-20250219',
+        },
+      });
+      if (rolesRes.ok) {
+        const roles = await rolesRes.json();
+        accountInfo = { source: 'oauth', scopes: tokenData.scope, roles };
+      }
+    } catch {}
+
+    if (!accountInfo) accountInfo = { source: 'oauth', scopes: tokenData.scope };
+
+    db.cleanupOAuthState();
+    db.setAuthToken('anthropic-claudeai', accessToken, refreshToken, expiresAt, accountInfo);
+
+    return { ok: true, provider: 'anthropic-claudeai', expiresAt, accountInfo };
+  } catch (err) {
+    db.cleanupOAuthState();
+    return { ok: false, error: err.message };
+  }
+});
+
+ipcMain.handle('auth:oauthComplete', async (_event, codeWithState, state) => {
+  try {
+    db.cleanupOAuthState();
+    const oauthState = db.consumeOAuthState(state);
+    if (!oauthState) {
+      return { ok: false, error: 'OAuth session expired or invalid state. Please start over.' };
+    }
+
+    // User pastes either just the code, or `CODE#STATE` (the format the
+    // console.anthropic.com/oauth/code/callback page displays).
+    // If state was provided in the paste, use it (it's the same value we sent
+    // in the authorize URL -- the page echoes it back so the user can paste it).
+    // Otherwise fall back to the state we generated server-side.
+    const [code, pastedState] = String(codeWithState).split('#');
+    const exchangeState = pastedState || state;
+
+    // Exchange code for token. JSON body (per ben-vargas gist), not form-urlencoded.
+    const tokenRes = await fetch(OAUTH_TOKEN_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'anthropic-beta': 'oauth-2025-04-20,claude-code-20250219',
+      },
+      body: JSON.stringify({
+        grant_type: 'authorization_code',
+        client_id: OAUTH_CLIENT_ID,
+        code,
+        state: exchangeState,
+        code_verifier: oauthState.code_verifier,
+        redirect_uri: oauthState.redirect_uri,
+      }),
+    });
+
+    if (!tokenRes.ok) {
+      const text = await tokenRes.text();
+      return { ok: false, error: `Token exchange failed (${tokenRes.status}): ${text}` };
+    }
+
+    const tokenData = await tokenRes.json();
+    const accessToken = tokenData.access_token;
+    const refreshToken = tokenData.refresh_token;
+    const expiresIn = tokenData.expires_in || 3600;
+    const expiresAt = new Date(Date.now() + expiresIn * 1000).toISOString();
+
+    if (!accessToken) {
+      return { ok: false, error: 'No access_token in response: ' + JSON.stringify(tokenData) };
+    }
+
+    // Try to fetch account info (email + tier) by hitting /v1/oauth/claude_cli/roles or similar
+    let accountInfo = null;
+    try {
+      const rolesRes = await fetch('https://api.anthropic.com/api/oauth/claude_cli/roles', {
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          'anthropic-beta': 'oauth-2025-04-20,claude-code-20250219',
+        },
+      });
+      if (rolesRes.ok) {
+        const roles = await rolesRes.json();
+        accountInfo = {
+          source: 'oauth',
+          scopes: tokenData.scope,
+          roles: roles,
+        };
+      }
+    } catch {}
+
+    if (!accountInfo) {
+      accountInfo = { source: 'oauth', scopes: tokenData.scope };
+    }
+
+    db.setAuthToken('anthropic-claudeai', accessToken, refreshToken, expiresAt, accountInfo);
+
+    return {
+      ok: true,
+      provider: 'anthropic-claudeai',
+      expiresAt,
+      accountInfo,
+    };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+ipcMain.handle('auth:oauthRefresh', async () => {
+  try {
+    const t = db.getAuthToken('anthropic-claudeai');
+    if (!t || !t.refreshToken) {
+      return { ok: false, error: 'No refresh token available' };
+    }
+    const tokenRes = await fetch(OAUTH_TOKEN_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'anthropic-beta': 'oauth-2025-04-20,claude-code-20250219',
+      },
+      body: new URLSearchParams({
+        grant_type: 'refresh_token',
+        client_id: OAUTH_CLIENT_ID,
+        refresh_token: t.refreshToken,
+      }).toString(),
+    });
+    if (!tokenRes.ok) {
+      const text = await tokenRes.text();
+      return { ok: false, error: `Refresh failed (${tokenRes.status}): ${text}` };
+    }
+    const tokenData = await tokenRes.json();
+    const accessToken = tokenData.access_token;
+    const refreshToken = tokenData.refresh_token || t.refreshToken;
+    const expiresIn = tokenData.expires_in || 3600;
+    const expiresAt = new Date(Date.now() + expiresIn * 1000).toISOString();
+    db.setAuthToken('anthropic-claudeai', accessToken, refreshToken, expiresAt, t.accountInfo);
+    return { ok: true, expiresAt };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+ipcMain.handle('auth:oauthStatus', async () => {
+  const t = db.getAuthToken('anthropic-claudeai');
+  if (!t) return { ok: true, connected: false };
+  const now = new Date();
+  const expiresAt = t.expiresAt ? new Date(t.expiresAt) : null;
+  const expiresInSec = expiresAt ? Math.floor((expiresAt - now) / 1000) : null;
+  return {
+    ok: true,
+    connected: true,
+    expiresAt: t.expiresAt,
+    expiresInSec,
+    accountInfo: t.accountInfo,
+  };
+});
+
+ipcMain.handle('auth:oauthDisconnect', async () => {
+  db.deleteAuthToken('anthropic-claudeai');
+  return { ok: true };
+});
+
+// Import OAuth tokens from Claude Code CLI's macOS Keychain entry. This is a
+// workaround for when claude.ai/v1/oauth/{org}/authorize mutationFn is broken
+// (returns 400 "Invalid request format" for every body shape, including the
+// exact body the page itself sends). The Keychain entry "Claude Code-credentials"
+// contains a JSON blob with accessToken, refreshToken, expiresAt, scopes
+// written by Claude Code CLI on successful login.
+// Read Claude Code CLI's OAuth credentials from the OS credential store.
+// Cross-platform via keytar — Mac Keychain / Windows Credential Manager /
+// Linux libsecret. Falls back to shelling `security` on Mac if keytar's
+// native binary isn't loaded (e.g. running outside an Electron-rebuilt env).
+//
+// The blob Claude Code CLI writes is the same on every platform:
+//   { "claudeAiOauth": { accessToken, refreshToken, expiresAt, scopes, ... } }
+ipcMain.handle('auth:importFromKeychain', async () => {
+  let blob = null;
+  let source = 'keytar';
+
+  // 1) Try keytar (cross-platform — preferred path)
+  try {
+    const keytar = require('keytar');
+    const pw = await keytar.getPassword('Claude Code-credentials');
+    if (pw) blob = pw;
+  } catch (e) {
+    // keytar native binary missing or load failed — fall through to Mac shell
+    console.warn('[auth] keytar read failed: ' + (e?.message || e) + ' — trying Mac security CLI fallback');
+  }
+
+  // 2) Mac shell fallback — same entry the CLI writes to Keychain
+  if (!blob && process.platform === 'darwin') {
+    try {
+      const { execSync } = require('child_process');
+      blob = execSync(
+        'security find-generic-password -s "Claude Code-credentials" -w',
+        { encoding: 'utf8', timeout: 5000 }
+      ).trim();
+      source = 'security-cli';
+    } catch (e) {
+      // ignore — fall through to "not found" error
+    }
+  }
+
+  if (!blob) {
+    return {
+      ok: false,
+      error: 'no_credentials',
+      message: 'No Claude Code credentials found in the OS credential store. Sign in once via Claude Code CLI first (run `claude auth login` in Terminal), then click Import again.',
+    };
+  }
+
+  let creds;
+  try {
+    creds = JSON.parse(blob);
+  } catch (e) {
+    return { ok: false, error: 'parse_failed', message: 'Credential store blob is not valid JSON: ' + e.message };
+  }
+  const oauth = creds.claudeAiOauth || creds;
+  const accessToken = oauth.accessToken || oauth.access_token;
+  const refreshToken = oauth.refreshToken || oauth.refresh_token;
+  const expiresAt = oauth.expiresAt
+    ? new Date(oauth.expiresAt).toISOString()
+    : new Date(Date.now() + 3600 * 1000).toISOString();
+  if (!accessToken) {
+    return { ok: false, error: 'no_access_token', message: 'No accessToken in credential blob: ' + JSON.stringify(creds).slice(0, 200) };
+  }
+  const accountInfo = {
+    source: 'oauth',
+    scopes: oauth.scopes,
+    subscriptionType: oauth.subscriptionType,
+    rateLimitTier: oauth.rateLimitTier,
+    importedFrom: 'claude-code-cli-' + source,
+  };
+  db.setAuthToken('anthropic-claudeai', accessToken, refreshToken, expiresAt, accountInfo);
+  return {
+    ok: true,
+    expiresAt,
+    accountInfo,
+    scopes: oauth.scopes,
+    expiresInSec: Math.floor((new Date(expiresAt) - new Date()) / 1000),
+    source,
+  };
+});
+
+// Spawn `claude login` as a child process. The CLI opens the browser to
+// claude.ai/oauth/authorize, captures the local-loopback callback itself,
+// exchanges the code for tokens, and writes them to the OS credential store.
+// After the child exits (success or failure), we read the freshly-written
+// credential store entry via the same keychain-import path as the manual
+// Import button.
+//
+// Cross-platform: uses `which`/`where` first, then common install paths.
+ipcMain.handle('auth:runClaudeLogin', async () => {
+  const fs = require('fs');
+  const path = require('path');
+  const { spawn } = require('child_process');
+
+  // 1) Find the `claude` binary (bundled Resources/bin/claude first, Jul 7 ~21:02 ET).
+  const claudePath = findClaudePath();
+  if (!claudePath) {
+    return {
+      ok: false,
+      error: 'claude_not_found',
+      message: 'Claude Code CLI not found. Install with: npm i -g @anthropic-ai/claude-code — then click this button again.',
+    };
+  }
+
+  // 2) Spawn `claude login`. stdio: 'ignore' keeps the main-process terminal
+  // quiet; the user sees the browser open as the visible signal. The CLI
+  // captures its own local-loopback callback, so we just wait for exit.
+  return await new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(claudePath, ['login'], { stdio: 'ignore', detached: false });
+    } catch (e) {
+      return resolve({ ok: false, error: 'spawn_failed', message: 'Failed to spawn `claude login`: ' + e.message });
+    }
+
+    // 5-minute cap — covers the typical browser-authorize flow plus margin.
+    const timeout = setTimeout(() => {
+      try { child.kill('SIGTERM'); } catch {}
+      resolve({ ok: false, error: 'timeout', message: '`claude login` timed out after 5 minutes. Try again or run `claude login` in a terminal yourself.' });
+    }, 5 * 60 * 1000);
+
+    child.on('exit', async (code) => {
+      clearTimeout(timeout);
+      if (code !== 0) {
+        return resolve({ ok: false, error: 'claude_login_failed', message: '`claude login` exited with code ' + code + '. Try again or run `claude login` in a terminal.' });
+      }
+      // claude login wrote a fresh entry to the OS credential store.
+      // Re-read it via the same path as auth:importFromKeychain so the
+      // renderer doesn't need to call two IPCs in sequence.
+      const result = await importFromKeychainCore();
+      if (result.ok) result.claudeLoginRan = true;
+      resolve(result);
+    });
+
+    child.on('error', (err) => {
+      clearTimeout(timeout);
+      resolve({ ok: false, error: 'spawn_failed', message: '`claude login` child error: ' + err.message });
+    });
+  });
+});
+
+// Reusable: read Claude Code CLI's OAuth blob from the OS credential store
+// and write to auth_tokens. Called by both auth:importFromKeychain (manual
+// button) AND auth:runClaudeLogin (after the child process exits) so the
+// read/parse/persist logic lives in one place.
+async function importFromKeychainCore() {
+  let blob = null;
+  let source = 'keytar';
+
+  // 1) Try keytar (cross-platform — preferred path)
+  try {
+    const keytar = require('keytar');
+    const pw = await keytar.getPassword('Claude Code-credentials');
+    if (pw) blob = pw;
+  } catch (e) {
+    console.warn('[auth] keytar read failed: ' + (e?.message || e) + ' — trying Mac security CLI fallback');
+  }
+
+  // 2) Mac shell fallback — same entry the CLI writes to Keychain
+  if (!blob && process.platform === 'darwin') {
+    try {
+      const { execSync } = require('child_process');
+      blob = execSync(
+        'security find-generic-password -s "Claude Code-credentials" -w',
+        { encoding: 'utf8', timeout: 5000 }
+      ).trim();
+      source = 'security-cli';
+    } catch (e) {
+      // ignore — fall through to "not found" error
+    }
+  }
+
+  if (!blob) {
+    return {
+      ok: false,
+      error: 'no_credentials',
+      message: 'No Claude Code credentials found in the OS credential store. Sign in once via Claude Code CLI first (run `claude login` in Terminal), then click Import again.',
+    };
+  }
+
+  let creds;
+  try {
+    creds = JSON.parse(blob);
+  } catch (e) {
+    return { ok: false, error: 'parse_failed', message: 'Credential store blob is not valid JSON: ' + e.message };
+  }
+  const oauth = creds.claudeAiOauth || creds;
+  const accessToken = oauth.accessToken || oauth.access_token;
+  const refreshToken = oauth.refreshToken || oauth.refresh_token;
+  const expiresAt = oauth.expiresAt
+    ? new Date(oauth.expiresAt).toISOString()
+    : new Date(Date.now() + 3600 * 1000).toISOString();
+  if (!accessToken) {
+    return { ok: false, error: 'no_access_token', message: 'No accessToken in credential blob: ' + JSON.stringify(creds).slice(0, 200) };
+  }
+  const accountInfo = {
+    source: 'oauth',
+    scopes: oauth.scopes,
+    subscriptionType: oauth.subscriptionType,
+    rateLimitTier: oauth.rateLimitTier,
+    importedFrom: 'claude-code-cli-' + source,
+  };
+  db.setAuthToken('anthropic-claudeai', accessToken, refreshToken, expiresAt, accountInfo);
+  return {
+    ok: true,
+    expiresAt,
+    accountInfo,
+    scopes: oauth.scopes,
+    expiresInSec: Math.floor((new Date(expiresAt) - new Date()) / 1000),
+    source,
+  };
+}
+
+// Re-store Farnsworth's current auth_tokens row back to the OS credential
+// store so Claude Code CLI sees the same entry (and so a Farnsworth restart
+// on Windows/Linux doesn't need a fresh `claude auth login`).
+// Cross-platform via keytar. Mac fallback to `security` if keytar isn't loaded.
+ipcMain.handle('auth:reStoreToKeychain', async () => {
+  const t = db.getAuthToken('anthropic-claudeai');
+  if (!t || !t.accessToken || !t.refreshToken) {
+    return { ok: false, error: 'no_token', message: 'No Farnsworth auth_tokens row to re-store. Import from Claude Code CLI first.' };
+  }
+  const blob = {
+    claudeAiOauth: {
+      accessToken: t.accessToken,
+      refreshToken: t.refreshToken,
+      expiresAt: t.expiresAt ? new Date(t.expiresAt).getTime() : Date.now() + 3600 * 1000,
+      scopes: t.accountInfo?.scopes || ['user:file_upload', 'user:inference', 'user:mcp_servers', 'user:profile', 'user:sessions:claude_code'],
+      subscriptionType: t.accountInfo?.subscriptionType || 'unknown',
+      rateLimitTier: t.accountInfo?.rateLimitTier || 'unknown',
+    },
+  };
+  const payload = JSON.stringify(blob);
+
+  // 1) keytar first (cross-platform)
+  try {
+    const keytar = require('keytar');
+    await keytar.setPassword('Claude Code-credentials', 'Claude Code', payload);
+    return { ok: true, source: 'keytar' };
+  } catch (e) {
+    console.warn('[auth] keytar write failed: ' + (e?.message || e) + ' — trying Mac security CLI fallback');
+  }
+
+  // 2) Mac shell fallback
+  if (process.platform === 'darwin') {
+    try {
+      const { execSync } = require('child_process');
+      // Delete-then-add avoids "already exists" failures when overwriting.
+      try { execSync('security delete-generic-password -s "Claude Code-credentials"', { encoding: 'utf8', timeout: 5000 }); } catch {}
+      execSync(
+        'security add-generic-password -s "Claude Code-credentials" -a "Claude Code" -w ' +
+          "'" + payload.replace(/'/g, "'\\''") + "'",
+        { encoding: 'utf8', timeout: 5000, shell: true }
+      );
+      return { ok: true, source: 'security-cli' };
+    } catch (e) {
+      return { ok: false, error: 'write_failed', message: 'Mac security CLI re-store failed: ' + e.message };
+    }
+  }
+
+  return { ok: false, error: 'write_failed', message: 'keytar write failed and no Mac fallback available' };
+});
+
+// ============================================================
+// IPC: Claude Code detection (legacy)
+// ============================================================
+
+// ============================================================
+// IPC: Claude Code detection
+// ============================================================
+// On macOS, the `claude` CLI stores its OAuth tokens in the Keychain
+// (`Claude Code-credentials`), not in `~/.claude/.credentials.json` (which
+// is the Linux/Windows path). Long hit this when the left Claude Code
+// panel showed "signed in" but Settings → AI still prompted to sign in.
+// Check Keychain first, fall back to the file path for non-mac platforms.
+ipcMain.handle('auth:checkClaudeCode', async () => {
+  const { execSync } = require('child_process');
+
+  // macOS: read Keychain entry "Claude Code-credentials" (same as the
+  // working claudeCode:checkAuth handler below).
+  if (process.platform === 'darwin') {
+    try {
+      const out = execSync(
+        'security find-generic-password -s "Claude Code-credentials" -w',
+        { encoding: 'utf8', timeout: 5000 }
+      ).trim();
+      if (out && out.startsWith('{')) {
+        const blob = JSON.parse(out);
+        const oauth = blob.claudeAiOauth || blob;
+        if (oauth.accessToken) {
+          return {
+            ok: true,
+            hasAuth: true,
+            source: 'keychain',
+            subscriptionType: oauth.subscriptionType || null,
+            expiresAt: oauth.expiresAt || null,
+          };
+        }
+      }
+      return { ok: true, hasAuth: false, source: 'keychain_empty' };
+    } catch {
+      // Keychain lookup failed (no entry, denied, etc.) — fall through
+      // to file-path check in case Long has both.
+    }
+  }
+
+  // Linux / Windows: read ~/.claude/.credentials.json.
+  try {
+    const credPath = path.join(os.homedir(), '.claude', '.credentials.json');
+    const raw = await fs.readFile(credPath, 'utf8');
+    const creds = JSON.parse(raw);
+    return {
+      ok: true,
+      hasAuth: !!(creds.claudeAiOauth || creds.accessToken),
+      source: 'file',
+    };
+  } catch {
+    return { ok: true, hasAuth: false, source: 'none' };
+  }
+});
+
+// ============================================================
+// ============================================================
+// Agent Tools (Phase 4)
+// ============================================================
+//
+// Tools the renderer can pass to inference:send so Claude can read/write files,
+// list the workspace, and run shell commands. Each tool delegates to the
+// existing fs:* IPC handlers — same validation, same paths.
+
+const AGENT_TOOLS = [
+  {
+    name: 'read_file',
+    description: 'Read the contents of a file in the workspace. Path is relative to the workspace folder.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Workspace-relative path (e.g. "src/app.js" or "README.md")' }
+      },
+      required: ['path']
+    }
+  },
+  {
+    name: 'write_file',
+    description: 'Write content to a file in the workspace (overwrites existing; creates parent dirs as needed). Path is relative to the workspace folder.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Workspace-relative path' },
+        content: { type: 'string', description: 'Full file contents to write' }
+      },
+      required: ['path', 'content']
+    }
+  },
+  {
+    name: 'list_files',
+    description: 'List files and directories in the workspace. Optionally filter by glob pattern (e.g. "*.js", "src/**"). Returns paths relative to workspace folder.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        pattern: { type: 'string', description: 'Optional glob pattern to filter results' }
+      }
+    }
+  },
+  {
+    name: 'run_command',
+    description: 'Run a shell command in the workspace directory. Returns stdout, stderr, and exit code. Timeout 30s.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        command: { type: 'string', description: 'Shell command to execute (e.g. "ls -la", "node -v")' }
+      },
+      required: ['command']
+    }
+  },
+  {
+    // Renderer-side tool — Claude emits this to render an inline UI surface
+    // (step progress card, choice buttons, form, copy block, work-result
+    // receipt, etc.) inside the chat stream. The renderer intercepts this
+    // name in sendChatMessage() before the real tool loop runs, so it never
+    // reaches executeAgentTool. We still include it in AGENT_TOOLS so the
+    // model knows it exists and knows the input shapes.
+    //
+    // Surfaces are atomic when emitted except task_progress + work_result
+    // which support streaming updates via surfaceId (re-emit with the same
+    // surfaceId to flip step states or accumulate sections in place).
+    name: 'ui_show',
+    description: 'Render an inline UI surface in the chat stream. Use this to show step-by-step progress, ask the user for a choice, capture form input, show a copyable command, or emit a work-result receipt after completing work. The surface renders inline in the chat and remains until dismissed by the user or replaced by a new emit with the same surfaceId.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        surfaceId: { type: 'string', description: 'Stable id for streaming updates. Required for task_progress + work_result. Other surfaces can omit.' },
+        surfaceType: {
+          type: 'string',
+          enum: ['card', 'choice', 'confirmation', 'form', 'copy_block', 'work_result', 'credential', 'oauth_connect'],
+          description: 'The surface shape to render.'
+        },
+        data: { type: 'object', description: 'Surface-specific payload. Shape depends on surfaceType — see UI-SURFACES.md.' }
+      },
+      required: ['surfaceType', 'data']
+    }
+  }
+];
+
+function globToRegex(glob) {
+  let re = '';
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i];
+    if (c === '*') {
+      if (glob[i + 1] === '*') { re += '.*'; i++; }
+      else re += '[^/]*';
+    } else if (c === '?') {
+      re += '[^/]';
+    } else if ('.+^$()|{}[]\\'.includes(c)) {
+      re += '\\' + c;
+    } else {
+      re += c;
+    }
+  }
+  return new RegExp('^' + re + '$');
+}
+
+async function executeAgentTool(name, input) {
+  const folder = db.getSetting('currentFolder');
+  if (!folder) {
+    return { ok: false, error: 'no_folder', message: 'No workspace folder open. Open a folder first.' };
+  }
+  if (name === 'read_file') {
+    if (!input?.path || typeof input.path !== 'string') return { ok: false, error: 'bad_input', message: 'path required' };
+    if (input.path.includes('..')) return { ok: false, error: 'bad_input', message: 'path cannot contain ..' };
+    const res = await fs.readFile(path.join(folder, input.path), 'utf8');
+    return { ok: true, content: res.toString(), path: input.path };
+  }
+  if (name === 'write_file') {
+    if (!input?.path || typeof input.path !== 'string') return { ok: false, error: 'bad_input', message: 'path required' };
+    if (input.path.includes('..')) return { ok: false, error: 'bad_input', message: 'path cannot contain ..' };
+    if (typeof input.content !== 'string') return { ok: false, error: 'bad_input', message: 'content required' };
+    const full = path.join(folder, input.path);
+    await fs.mkdir(path.dirname(full), { recursive: true });
+    await fs.writeFile(full, input.content, 'utf8');
+    return { ok: true, message: `Wrote ${input.path} (${input.content.length} chars)`, path: input.path };
+  }
+  if (name === 'list_files') {
+    const entries = await readDirRecursive(folder, 4);
+    let filtered = entries.filter(e => !e.path.startsWith('.') && !e.path.includes('node_modules'));
+    if (input?.pattern) {
+      const re = globToRegex(input.pattern);
+      filtered = filtered.filter(e => re.test(e.path) || re.test(e.name));
+    }
+    return { ok: true, files: filtered.slice(0, 200).map(e => ({ path: e.path, type: e.type })) };
+  }
+  if (name === 'run_command') {
+    return await runShellCommand(input.command);
+  }
+  if (name === 'ui_show') {
+    // Renderer-side tool. The renderer's sendChatMessage() stream handler
+    // intercepts this BEFORE calling executeTool (see src/app.js), so this
+    // branch is a safety net for the case where someone calls the IPC
+    // directly. Returns ok + kind: 'surface' so callers can detect it.
+    return { ok: true, kind: 'surface', surfaceType: input?.surfaceType, data: input?.data };
+  }
+  return { ok: false, error: 'unknown_tool', message: `Unknown tool: ${name}` };
+}
+
+// ============================================================
+// IPC: Inference (call Claude API with saved OAuth token or manual API key)
+// ============================================================
+async function getValidAccessToken() {
+  // Try OAuth first
+  const oauth = db.getAuthToken('anthropic-claudeai');
+  if (oauth && oauth.accessToken) {
+    const expiresAt = oauth.expiresAt ? new Date(oauth.expiresAt).getTime() : 0;
+    const expired = expiresAt && expiresAt < Date.now() + 60_000;
+    if (expired && oauth.refreshToken) {
+      // Refresh via the same flow the oauthRefresh handler uses.
+      // 15s AbortController timeout — if claude.ai's OAuth endpoint hangs
+      // (rate limit, network, revoked refresh token), bail out so the
+      // inference call can fall through to the API-key path instead of
+      // leaving the renderer stuck on "Thinking...".
+      const refreshController = new AbortController();
+      const refreshTimeout = setTimeout(() => refreshController.abort(), 15_000);
+      try {
+        const tokenRes = await fetch(OAUTH_TOKEN_URL, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'anthropic-beta': 'oauth-2025-04-20,claude-code-20250219',
+          },
+          body: new URLSearchParams({
+            grant_type: 'refresh_token',
+            client_id: OAUTH_CLIENT_ID,
+            refresh_token: oauth.refreshToken,
+          }).toString(),
+          signal: refreshController.signal,
+        });
+        clearTimeout(refreshTimeout);
+        if (tokenRes.ok) {
+          const data = await tokenRes.json();
+          const accessToken = data.access_token;
+          const refreshToken = data.refresh_token || oauth.refreshToken;
+          const expiresAt = new Date(Date.now() + (data.expires_in || 3600) * 1000).toISOString();
+          db.setAuthToken('anthropic-claudeai', accessToken, refreshToken, expiresAt, oauth.accountInfo);
+          return { kind: 'oauth', token: accessToken, accountInfo: oauth.accountInfo };
+        }
+        // Log non-2xx so silent failures are visible. Falls through to API-key path.
+        const errText = await tokenRes.text().catch(() => '');
+        console.error('[auth] OAuth refresh returned ' + tokenRes.status + ': ' + errText.slice(0, 200));
+      } catch (e) {
+        clearTimeout(refreshTimeout);
+        console.error('[auth] OAuth refresh threw: ' + (e?.name || '') + ' ' + (e?.message || ''));
+      }
+    }
+    if (!expired) {
+      return { kind: 'oauth', token: oauth.accessToken, accountInfo: oauth.accountInfo };
+    }
+  }
+  // Fall back to manual API key
+  const consoleKey = db.getAuthToken('anthropic-console');
+  if (consoleKey && consoleKey.accessToken) {
+    return { kind: 'api_key', token: consoleKey.accessToken };
+  }
+  return null;
+}
+
+ipcMain.handle('inference:send', async (_event, opts = {}) => {
+  const messages = Array.isArray(opts.messages) ? opts.messages : [];
+  if (messages.length === 0) {
+    return { ok: false, error: 'No messages to send' };
+  }
+  const model = opts.model || 'claude-opus-4-8';
+  const maxTokens = Number.isFinite(opts.maxTokens) ? opts.maxTokens : 4096;
+  const system = typeof opts.system === 'string' ? opts.system : null;
+
+  const auth = await getValidAccessToken();
+  if (!auth) {
+    return {
+      ok: false,
+      error: 'no_auth',
+      message: 'No auth — sign in to Claude.ai or paste an API key in Settings → AI.',
+    };
+  }
+
+  const headers = {
+    'Content-Type': 'application/json',
+    'anthropic-version': '2023-06-01',
+  };
+  if (auth.kind === 'oauth') {
+    headers['Authorization'] = `Bearer ${auth.token}`;
+    headers['anthropic-beta'] = 'oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14';
+  } else {
+    headers['x-api-key'] = auth.token;
+  }
+
+  const body = { model, max_tokens: maxTokens, messages };
+  if (system) body.system = system;
+  if (Array.isArray(opts.tools) && opts.tools.length) body.tools = opts.tools;
+
+  try {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+      const errBody = await res.text();
+      let parsed = null;
+      try { parsed = JSON.parse(errBody); } catch {}
+      return {
+        ok: false,
+        status: res.status,
+        error: parsed?.error?.type || 'api_error',
+        message: parsed?.error?.message || errBody.slice(0, 500),
+      };
+    }
+
+    const data = await res.json();
+    const blocks = data.content || [];
+    const text = blocks.filter(b => b.type === 'text').map(b => b.text || '').join('');
+    const toolUses = blocks.filter(b => b.type === 'tool_use').map(b => ({
+      id: b.id,
+      name: b.name,
+      input: b.input || {},
+    }));
+    return {
+      ok: true,
+      text,
+      content: blocks,
+      toolUses,
+      model: data.model,
+      usage: data.usage,
+      stopReason: data.stop_reason,
+    };
+  } catch (e) {
+    return { ok: false, error: 'network', message: e.message };
+  }
+});
+
+ipcMain.handle('inference:toolExecute', async (_event, name, input) => {
+  try {
+    return await executeAgentTool(name, input || {});
+  } catch (err) {
+    return { ok: false, error: err.message || 'tool_failed' };
+  }
+});
+
+ipcMain.handle('inference:agentTools', async () => {
+  return { ok: true, tools: AGENT_TOOLS };
+});
+
+// ------------------------------------------------------------
+// Streaming inference — SSE from api.anthropic.com/v1/messages
+// with stream: true. Forwards events to the renderer via
+// webContents.send('inference:chunk', { requestId, type, ... }).
+// Handles text_delta streaming AND tool_use streaming (accumulate
+// partial_json per block index, JSON.parse on block_stop).
+// ------------------------------------------------------------
+ipcMain.on('inference:stream', async (event, opts = {}) => {
+  const requestId = opts.requestId || ('stream-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8));
+  const send = (payload) => {
+    if (!event.sender.isDestroyed()) event.sender.send('inference:chunk', { requestId, ...payload });
+  };
+
+  const messages = Array.isArray(opts.messages) ? opts.messages : [];
+  if (messages.length === 0) {
+    send({ type: 'error', error: 'No messages to send' });
+    return { ok: false };
+  }
+  const model = opts.model || 'claude-opus-4-8';
+  const maxTokens = Number.isFinite(opts.maxTokens) ? opts.maxTokens : 4096;
+  const system = typeof opts.system === 'string' ? opts.system : null;
+
+  const auth = await getValidAccessToken();
+  if (!auth) {
+    send({ type: 'error', error: 'no_auth', message: 'No auth — sign in to Claude.ai or paste an API key in Settings → AI.' });
+    return { ok: false };
+  }
+
+  const headers = {
+    'Content-Type': 'application/json',
+    'anthropic-version': '2023-06-01',
+    'Accept': 'text/event-stream',
+  };
+  if (auth.kind === 'oauth') {
+    headers['Authorization'] = `Bearer ${auth.token}`;
+    headers['anthropic-beta'] = 'oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14';
+  } else {
+    headers['x-api-key'] = auth.token;
+  }
+
+  const body = { model, max_tokens: maxTokens, messages, stream: true };
+  if (system) body.system = system;
+  if (Array.isArray(opts.tools) && opts.tools.length) body.tools = opts.tools;
+
+  try {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+      const errBody = await res.text();
+      let parsed = null;
+      try { parsed = JSON.parse(errBody); } catch {}
+      send({
+        type: 'error',
+        error: parsed?.error?.type || 'api_error',
+        message: parsed?.error?.message || errBody.slice(0, 500),
+        status: res.status,
+      });
+      return { ok: false };
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    const blocks = {}; // index -> { type, text, id, name, inputJson, input }
+    let stopReason = null;
+    let usage = null;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      // SSE events separated by blank line
+      const parts = buffer.split(/\r?\n\r?\n/);
+      buffer = parts.pop();
+
+      for (const part of parts) {
+        const lines = part.split(/\r?\n/);
+        let eventType = 'message';
+        let data = '';
+        for (const line of lines) {
+          if (line.startsWith('event: ')) eventType = line.slice(7).trim();
+          else if (line.startsWith('data: ')) data += line.slice(6);
+        }
+        if (!data) continue;
+        let parsed;
+        try { parsed = JSON.parse(data); } catch { continue; }
+
+        if (eventType === 'message_start') {
+          send({ type: 'message_start', message: parsed.message });
+        } else if (eventType === 'content_block_start') {
+          const idx = parsed.index;
+          blocks[idx] = parsed.content_block || { type: 'text', text: '' };
+          if (blocks[idx].type === 'tool_use') blocks[idx].inputJson = '';
+          send({ type: 'block_start', index: idx, block: blocks[idx] });
+        } else if (eventType === 'content_block_delta') {
+          const idx = parsed.index;
+          const delta = parsed.delta || {};
+          if (delta.type === 'text_delta') {
+            if (!blocks[idx]) blocks[idx] = { type: 'text', text: '' };
+            blocks[idx].text = (blocks[idx].text || '') + delta.text;
+            send({ type: 'text_delta', index: idx, text: delta.text });
+          } else if (delta.type === 'input_json_delta') {
+            if (!blocks[idx]) blocks[idx] = { type: 'tool_use', inputJson: '' };
+            blocks[idx].inputJson = (blocks[idx].inputJson || '') + (delta.partial_json || '');
+            send({ type: 'tool_use_delta', index: idx, partialJson: delta.partial_json || '' });
+          }
+        } else if (eventType === 'content_block_stop') {
+          const idx = parsed.index;
+          if (blocks[idx]?.type === 'tool_use' && blocks[idx].inputJson) {
+            try { blocks[idx].input = JSON.parse(blocks[idx].inputJson); } catch { blocks[idx].input = {}; }
+          }
+          send({ type: 'block_stop', index: idx });
+        } else if (eventType === 'message_delta') {
+          stopReason = parsed.delta?.stop_reason || stopReason;
+          if (parsed.usage) usage = { ...(usage || {}), ...parsed.usage };
+          send({ type: 'message_delta', stopReason, usage });
+        } else if (eventType === 'message_stop') {
+          // end of message
+        }
+      }
+    }
+
+    const blockArr = Object.keys(blocks).sort((a, b) => +a - +b).map(k => blocks[k]);
+    const text = blockArr.filter(b => b.type === 'text').map(b => b.text || '').join('');
+    const toolUses = blockArr.filter(b => b.type === 'tool_use').map(b => ({
+      id: b.id, name: b.name, input: b.input || {},
+    }));
+    const result = { ok: true, text, content: blockArr, toolUses, stopReason, usage };
+    send({ type: 'done', result });
+    return { ok: true, requestId };
+  } catch (e) {
+    send({ type: 'error', error: 'network', message: e.message });
+    return { ok: false };
+  }
+});
+
+// ============================================================
+// IPC: Live panel — Anomaly Intelligence Reddit Games API
+//
+// Two endpoints, both proxied through main so the renderer doesn't
+// need a direct cross-origin fetch. Base URL is fixed; the game id
+// is a swappable constant in src/app.js (LIVE_DEFAULT_GAME_ID).
+// ============================================================
+const ANOMALYINT_BASE = 'https://anomalyint.vercel.app';
+
+ipcMain.handle('live:loadGame', async (_event, gameId) => {
+  if (!gameId || typeof gameId !== 'string') {
+    return { ok: false, error: 'bad_input', message: 'Missing game id' };
+  }
+  if (!/^[A-Za-z0-9_-]+$/.test(gameId) || gameId.length > 128) {
+    return { ok: false, error: 'bad_input', message: 'Game id has invalid characters' };
+  }
+  // Read-through cache: if SQLite has a fresh row, return it instantly
+  // (with cached: true so the renderer can show "Updated Xm ago" without
+  // a fetch spinner). Otherwise fetch the API and persist.
+  const cached = db.getLiveGameCache(gameId);
+  if (cached) {
+    return { ok: true, cached: true, data: cached.data, fetched_at: cached.fetched_at };
+  }
+  return await fetchAndCacheLiveGame(gameId);
+});
+
+// Force a fresh API fetch and persist the result. The refresh icon
+// next to the "Updated" date in the Live header calls this. Bypasses the
+// cache (always hits the network) and overwrites the stored row.
+ipcMain.handle('live:refreshGame', async (_event, gameId) => {
+  if (!gameId || typeof gameId !== 'string') {
+    return { ok: false, error: 'bad_input', message: 'Missing game id' };
+  }
+  if (!/^[A-Za-z0-9_-]+$/.test(gameId) || gameId.length > 128) {
+    return { ok: false, error: 'bad_input', message: 'Game id has invalid characters' };
+  }
+  return await fetchAndCacheLiveGame(gameId);
+});
+
+async function fetchAndCacheLiveGame(gameId) {
+  // Timeout is configurable via the `live.timeout_seconds` settings key
+  // (default 15s). AbortController fires when the timer elapses; the
+  // fetch rejects with AbortError and we surface a clear timeout error
+  // so the renderer's existing error UI can take over instead of
+  // spinning forever.
+  const timeoutSeconds = Number(db.getSetting('live.timeout_seconds')) || 15;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutSeconds * 1000);
+  try {
+    const res = await fetch(`${ANOMALYINT_BASE}/api/reddit-games/${gameId}`, {
+      headers: { 'Accept': 'application/json', 'User-Agent': 'Farnsworth/1.0' },
+      signal: controller.signal,
+    });
+    if (res.status === 404) {
+      return { ok: false, status: 404, error: 'not_found', message: 'Game not found' };
+    }
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      return { ok: false, status: res.status, error: 'upstream', message: body.slice(0, 500) };
+    }
+    const data = await res.json();
+    // Persist to SQLite so the next render is instant.
+    const saved = db.saveLiveGameCache(gameId, data);
+    return { ok: true, cached: false, data, saved: saved.ok === true };
+  } catch (e) {
+    if (e && (e.name === 'AbortError' || String(e).includes('aborted'))) {
+      return { ok: false, error: 'timeout', message: `Request timed out after ${timeoutSeconds}s. Check the API URL or increase the timeout in Live settings.` };
+    }
+    return { ok: false, error: 'network', message: e.message };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+ipcMain.handle('live:chat', async (_event, gameId, payload) => {
+  if (!gameId || typeof gameId !== 'string') {
+    return { ok: false, error: 'bad_input', message: 'Missing game id' };
+  }
+  if (!/^[A-Za-z0-9_-]+$/.test(gameId) || gameId.length > 128) {
+    return { ok: false, error: 'bad_input', message: 'Game id has invalid characters' };
+  }
+  if (!payload || (typeof payload.message !== 'string' && !Array.isArray(payload.messages))) {
+    return { ok: false, error: 'bad_input', message: 'Provide a "message" string or a "messages" array' };
+  }
+  // Same configurable timeout as fetchAndCacheLiveGame — AbortController
+  // fires when live.timeout_seconds elapses so the chat/tickets fetches
+  // don't hang the Live panel forever.
+  const timeoutSeconds = Number(db.getSetting('live.timeout_seconds')) || 15;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutSeconds * 1000);
+  try {
+    const res = await fetch(`${ANOMALYINT_BASE}/api/reddit-games/${gameId}/chat`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'User-Agent': 'Farnsworth/1.0',
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      return { ok: false, status: res.status, error: 'upstream', message: body.slice(0, 500) };
+    }
+    const data = await res.json();
+    return { ok: true, data };
+  } catch (e) {
+    if (e && (e.name === 'AbortError' || String(e).includes('aborted'))) {
+      return { ok: false, error: 'timeout', message: `Chat request timed out after ${timeoutSeconds}s. The API may be slow or unreachable.` };
+    }
+    return { ok: false, error: 'network', message: e.message };
+  } finally {
+    clearTimeout(timer);
+  }
+});
+
+// ============================================================================
+// IPC: Live panel — cached ticket suggestions (SQLite-backed)
+//
+// One row per game_id in live_tickets_cache. The renderer auto-fetches on
+// Live tab mount; the "Refresh" button regenerates + overwrites.
+// ============================================================================
+ipcMain.handle('live:ticketsGet', async (_event, gameId) => {
+  if (!gameId || typeof gameId !== 'string') {
+    return { ok: false, error: 'bad_input', message: 'Missing game id' };
+  }
+  const cached = db.getLiveTickets(gameId);
+  if (!cached) return { ok: true, cached: null };
+  return { ok: true, cached };
+});
+
+ipcMain.handle('live:ticketsSave', async (_event, gameId, tickets, rawReply) => {
+  if (!gameId || typeof gameId !== 'string') {
+    return { ok: false, error: 'bad_input', message: 'Missing game id' };
+  }
+  if (!Array.isArray(tickets)) {
+    return { ok: false, error: 'bad_input', message: 'tickets must be an array' };
+  }
+  return db.saveLiveTickets(gameId, tickets, rawReply);
+});
+
+ipcMain.handle('live:ticketsClear', async (_event, gameId) => {
+  if (!gameId || typeof gameId !== 'string') {
+    return { ok: false, error: 'bad_input', message: 'Missing game id' };
+  }
+  return db.clearLiveTickets(gameId);
+});
+
+// ============================================================
+// IPC: Chat history (SQLite-backed)
+// ============================================================
+ipcMain.handle('chat:list', async (_event, workspacePath) => db.getChatHistory(workspacePath, 200));
+ipcMain.handle('chat:add', async (_event, workspacePath, role, content, model, meta) => {
+  db.addChatMessage(workspacePath, role, content, model, meta);
+  return { ok: true };
+});
+ipcMain.handle('chat:clear', async (_event, workspacePath) => {
+  db.clearChatHistory(workspacePath);
+  return { ok: true };
+});
+
+// ============================================================
+// IPC: Tasks (SQLite-backed)
+// ============================================================
+ipcMain.handle('tasks:list', async (_event, workspacePath) => db.getTasks(workspacePath));
+ipcMain.handle('tasks:add', async (_event, workspacePath, status, title, detail, priority, source, assignee, fileLink) => {
+  const id = db.addTask(workspacePath, status, title, detail, priority, source, assignee, fileLink);
+  return { ok: true, id, task: db.getTasks(workspacePath).find(t => t.id === id) };
+});
+ipcMain.handle('tasks:update', async (_event, id, fields) => {
+  db.updateTask(id, fields);
+  return { ok: true };
+});
+ipcMain.handle('tasks:delete', async (_event, id) => {
+  db.deleteTask(id);
+  return { ok: true };
+});
+
+// ============================================================
+// IPC: Platform
+// ============================================================
+ipcMain.handle('app:platform', () => process.platform);
+
+// ============================================================
+// Lifecycle
+// ============================================================
+app.whenReady().then(async () => {
+  await ensureDirs();
+  db.init(userDataPath(), safeStorage);
+  await db.migrateLegacy(userDataPath());
+  // Explicitly set the activation policy to `regular` — without this,
+  // Electron can be treated as a UI element (no menu bar, no Dock
+  // activation) when launched via a non-exec wrapper script, which
+  // produces the "Farnsworth window is focused but the menu bar shows
+  // whatever was last focused" symptom Long hit on Jul 2.
+  // See [[farnsworth-app-bundle]] § wrapper script + activation policy.
+  if (process.platform === 'darwin' && app.setActivationPolicy) {
+    app.setActivationPolicy('regular');
+  }
+  // Install the native macOS menu bar before createWindow() so the
+  // first paint already has File / Edit / View / Window / Help menus.
+  Menu.setApplicationMenu(buildMenu());
+  createWindow();
+  startTerminalServer();
+  startClaudeCodeServer();
+
+  // Start the relay client (outbound WS to farnsworth-relay). No-op if
+  // RELAY_DISABLED=1 or the relay isn't reachable — Farnsworth keeps
+  // working locally, the relay just won't be in the picture.
+  try {
+    const relayClient = getRelayClient();
+    relayClient.start();
+    // Forward incoming companion chat messages to the renderer over IPC.
+    relayClient.on('chat', (msg) => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('relay:message', { type: 'chat', payload: msg });
+      }
+    });
+    relayClient.on('command', (msg) => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('relay:message', { type: 'command', payload: msg });
+      }
+    });
+    relayClient.on('canvas:subscribe', (msg) => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('relay:message', { type: 'canvas:subscribe', payload: msg });
+      }
+    });
+    relayClient.on('canvas:state', (msg) => {
+      // canvas:state from companion (e.g. cursor/selection) — forward to renderer
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('relay:message', { type: 'canvas:state', payload: msg });
+      }
+    });
+    relayClient.onStatus((status) => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('relay:status', { status });
+      }
+    });
+  } catch (e) {
+    console.warn('[main] relay-client init failed (non-fatal):', e.message);
+  }
+  // NOTE: app.dock.hide() was previously called here, but it makes the
+  // app behave like a UI element (no menu bar, can't be activated) when
+  // the wrapper bash script is the parent process — which is exactly
+  // how Farnsworth.app launches (the bash launcher spawns Electron as
+  // a child). The Farnsworth.app bundle's icon is already shown in the
+  // Dock via LaunchServices, so hiding Electron's Dock icon doesn't
+  // change the visual outcome but does break focus/activation. Keep
+  // the Dock icon visible so Dock clicks can activate the window.
+  app.on('activate', () => {
+    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  });
+});
+
+app.on('window-all-closed', () => {
+  db.close();
+  // Always quit on close. The default darwin behaviour (keep alive,
+  // reopen from Dock) doesn't apply to Farnsworth because we hide the
+  // Electron dock icon (the wrapper script owns it). Long hit this on
+  // Jun 28 ~16:12 ET: closed the window, the process stayed alive,
+  // `open /Applications/Farnsworth.app` did nothing (single-instance
+  // lock + already-running process), so the app looked stuck. Quitting
+  // unconditionally means the next `open` always launches fresh.
+  app.quit();
+});
+// ============================================================
+// IPC: Terminal panel (Phase 2)
+// ============================================================
+//
+// Each WebSocket connection maps 1:1 to a node-pty process. The renderer
+// (xterm.js + addon-fit) connects to ws://localhost:<TERMINAL_WS_PORT>, sends
+// JSON messages of the form { type: 'data'|'resize'|'close', ... }, and
+// receives the same shape back. PTY env inherits from the Electron process;
+// TERM is forced to xterm-256color so apps render colors correctly.
+
+const TERMINAL_WS_PORT = 9223;
+let terminalWss = null;
+
+function startTerminalServer() {
+  if (!pty) {
+    console.error('[terminal] node-pty unavailable; terminal panel disabled');
+    return;
+  }
+  if (terminalWss) return;
+  terminalWss = new WebSocket.Server({ port: TERMINAL_WS_PORT });
+  terminalWss.on('connection', (ws) => {
+    const shell = (process.env.SHELL) || '/bin/zsh';
+    // The renderer sends the workspace cwd on the first WS message via
+    // {type:'init', cwd}. Spawning is deferred until that arrives (with a
+    // 2s fallback to the currentFolder setting / homedir) so the shell
+    // starts in the project folder, not in ~ or /.
+    const tabId = 'tty-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6);
+    let initialized = false;
+    let term = null;
+    const spawnPty = (initCwd) => {
+      const cwd = initCwd
+        || (db.getSetting && db.getSetting('currentFolder'))
+        || os.homedir();
+      // Prepend homebrew to PATH so `npm`, `node`, `claude`, etc. resolve.
+      // Electron's process.env.PATH from a `open`-launched bundle does NOT
+      // include /opt/homebrew/bin (LaunchServices doesn't load shell rc
+      // files), which is why `npm run dev` was giving "command not found".
+      const pathWithBrew = (process.env.PATH || '')
+        + ':/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin';
+      try {
+        term = pty.spawn(shell, [], {
+          name: 'xterm-256color',
+          cols: 80,
+          rows: 24,
+          cwd,
+          env: {
+            ...process.env,
+            TERM: 'xterm-256color',
+            PATH: pathWithBrew,
+          },
+        });
+      } catch (e) {
+        ws.send(JSON.stringify({ type: 'error', message: 'pty.spawn failed: ' + e.message }));
+        ws.close();
+        return;
+      }
+      const send = (obj) => {
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+      };
+      const entry = { pty: term, lastActivity: Date.now(), tabId };
+      terminalPtys.set(ws, entry);
+      // Tell the renderer what its tabId is so the close handler can target it.
+      send({ type: 'ready', tabId });
+      term.onData((data) => {
+        entry.lastActivity = Date.now();
+        send({ type: 'data', data });
+      });
+      term.onExit(({ exitCode, signal }) => {
+        send({ type: 'exit', exitCode, signal });
+        ws.close();
+      });
+      // Permanent message handler — init messages are ignored after spawn.
+      ws.on('message', (raw) => {
+        let msg;
+        try { msg = JSON.parse(raw.toString()); } catch { return; }
+        if (msg.type === 'data') term.write(msg.data);
+        else if (msg.type === 'resize' && Number.isFinite(msg.cols) && Number.isFinite(msg.rows)) {
+          try { term.resize(msg.cols, msg.rows); } catch {}
+        } else if (msg.type === 'close') {
+          try { term.kill(); } catch {}
+        }
+      });
+      ws.on('close', () => {
+        terminalPtys.delete(ws);
+        try { term.kill(); } catch {}
+      });
+      ws.on('error', () => {
+        terminalPtys.delete(ws);
+        try { term.kill(); } catch {}
+      });
+    };
+    // First-message init handler — fires once. Renderer sends {type:'init', cwd}
+    // right after WS open. If it never arrives (or arrives malformed), the
+    // 2s fallback spawns with currentFolder / homedir.
+    ws.once('message', (raw) => {
+      if (initialized) return;
+      let msg;
+      try { msg = JSON.parse(raw.toString()); } catch { return; }
+      if (msg.type !== 'init') return;
+      initialized = true;
+      spawnPty(typeof msg.cwd === 'string' && msg.cwd.length > 0 ? msg.cwd : null);
+    });
+    setTimeout(() => {
+      if (initialized) return;
+      initialized = true;
+      spawnPty(null); // falls back to currentFolder / homedir
+    }, 2000);
+  });
+  console.log(`[terminal] WebSocket server listening on ws://localhost:${TERMINAL_WS_PORT}`);
+}
+
+// Claude Code panel — separate WebSocket server + PTY pool that spawns the
+// `claude` binary instead of bash. Same protocol as the terminal panel
+// ({type:'data'|'resize'|'close'} ⇄ {type:'data'|'exit'|'ready'}), separate
+// port (9224) so the two panels can run independently side-by-side. The
+// renderer keeps a parallel `claudeCodeSessions` map mirroring the existing
+// `terminalSessions` structure.
+//
+// CWD = workspace folder, env inherits from Electron so Claude Code picks up
+// the same OAUTH credentials it would if launched from Terminal.app.
+const CLAUDE_CODE_WS_PORT = 9224;
+let claudeCodeWss = null;
+
+function startClaudeCodeServer() {
+  if (!pty) {
+    console.error('[claude-code] node-pty unavailable; Claude Code panel disabled');
+    return;
+  }
+  // Mark Farnsworth's working directory as trusted in Claude Code's
+  // `~/.claude.json` `projects` map so the workspace trust dialog
+  // (Long's "Accessing workspace: /Users/long" prompt from Jun 28 ~16:34 ET)
+  // is skipped on every PTY spawn. Without this, every Farnsworth restart
+  // shows the prompt even when `--resume <sessionId>` loads the right
+  // JSONL — the trust decision lives separately from the session data.
+  // Verified Jun 28 ~16:36 ET: existing projects like
+  // `/Users/long/Documents/lastdraft/the-last-draft` already have
+  // `hasTrustDialogAccepted: true` set; we mirror that for the cwd.
+  const markWorkspaceTrusted = (cwd) => {
+    if (!cwd) return;
+    try {
+      const claudeJsonPath = path.join(os.homedir(), '.claude.json');
+      let cfg = {};
+      try { cfg = JSON.parse(fsSync.readFileSync(claudeJsonPath, 'utf8')); } catch {}
+      cfg.projects = cfg.projects || {};
+      const existing = cfg.projects[cwd] || {};
+      cfg.projects[cwd] = {
+        ...existing,
+        hasTrustDialogAccepted: true,
+      };
+      // Atomic write: tmp + rename so a concurrent claude CLI read doesn't
+      // see a partial file.
+      const tmpPath = claudeJsonPath + '.tmp';
+      fsSync.writeFileSync(tmpPath, JSON.stringify(cfg, null, 2), 'utf8');
+      fsSync.renameSync(tmpPath, claudeJsonPath);
+    } catch (e) {
+      console.warn('[claude-code] could not mark workspace trusted:', e.message);
+    }
+  };
+  // Run once at server boot for the default cwd; also called per-spawn
+  // when the cwd changes (rare — only if Long opens a folder elsewhere).
+  markWorkspaceTrusted((db.getSetting && db.getSetting('currentFolder')) || os.homedir());
+  if (claudeCodeWss) return;
+
+  // Locate the `claude` binary. Electron's main process inherits a minimal
+  // Locate the `claude` binary (bundled Resources/bin/claude first, Jul 7 ~21:02 ET).
+  const claudePath = findClaudePath();
+  if (!claudePath) {
+    console.error('[claude-code] claude binary not found on PATH or candidate paths; Claude Code panel will fail to spawn');
+  } else {
+    console.log(`[claude-code] using claude at: ${claudePath}`);
+  }
+
+  claudeCodeWss = new WebSocket.Server({ port: CLAUDE_CODE_WS_PORT });
+  claudeCodeWss.on('connection', (ws) => {
+    // [DEBUG Jul 6 ~00:05 ET] trace cwd at connection
+    const initialCwd = (db.getSetting && db.getSetting('currentFolder')) || os.homedir();
+    console.log('[claude-code] WS connect: initial cwd =', JSON.stringify(initialCwd), 'from currentFolder =', JSON.stringify(db.getSetting?.('currentFolder')));
+    // CWD priority: renderer's `state.folder` (via init message) > currentFolder setting > homedir.
+    // `cwd` is `let` (not `const`) so the init handler can update it before spawnFor runs.
+    // Long's Claude Code panel PTYs were spawning in `~` instead of the project folder
+    // because we captured `cwd` at WS-connection time from `currentFolder`, which lags
+    // behind the renderer's `state.folder` when the panel mounts before a folder is opened
+    // (verified Jul 5 ~23:55 ET via CDP: `state.folder` was null at panel mount, currentFolder
+    // later became `/Users/long/Documents/lastdraft/the-last-draft`, but the captured cwd
+    // had been frozen as homedir → sessions landed in `~/.claude/projects/-Users-long/` not
+    // `-Users-long-Documents-lastdraft-the-last-draft/`). Mirror the terminal panel's init
+    // protocol (lines 2216-2320) so the renderer can correct the cwd before spawn.
+    let cwd = (db.getSetting && db.getSetting('currentFolder')) || os.homedir();
+    const tabId = 'cc-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6);
+    let term = null;
+    let spawned = false;
+    let initialized = false;
+    const send = (obj) => {
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+    };
+
+    // First-message init handler — fires once for the renderer's
+    // `{ type: 'init', cwd }` message. Updates `cwd` so the eventual
+    // `spawnFor` (triggered by the renderer's `spawn` message) reads the
+    // renderer's actual state.folder rather than the captured-at-WS-open
+    // value. If the init message never arrives, the 2s fallback below
+    // spawns with whatever `cwd` already is (currentFolder or homedir).
+    ws.once('message', (raw) => {
+      if (initialized) return;
+      let msg;
+      try { msg = JSON.parse(raw.toString()); } catch { return; }
+      if (msg.type !== 'init') return;
+      initialized = true;
+      if (typeof msg.cwd === 'string' && msg.cwd.length > 0) {
+        cwd = msg.cwd;
+      }
+    });
+    setTimeout(() => {
+      // Mark initialized even if no init arrived — spawnFor must still
+      // be able to run when the renderer's spawn message comes later.
+      initialized = true;
+    }, 2000);
+
+    // Wait for the renderer to send `{ type: 'spawn', sessionId }` before
+    // starting the PTY. The sessionId controls whether we resume an
+    // existing Claude Code session (`claude --resume <id>`) or create a
+    // new one with a deterministic UUID (`claude --session-id <uuid>`).
+    // Long asked for this Jun 28 ~16:30 ET — without it, every restart
+    // starts a fresh claude session and re-asks the workspace trust
+    // prompt instead of continuing the prior conversation.
+    const spawnFor = (sessionId) => {
+      if (spawned) return;
+      spawned = true;
+      const claudeBin = claudePath || 'claude';
+      const args = [];
+      let useSessionId = null;
+      // Strict UUID v4 format check (8-4-4-4-12). The `claude` CLI rejects
+      // anything else with "Error: Invalid session ID. Must be a valid UUID"
+      // (verified Jun 28 ~16:33 ET after my earlier ffffffff-prefix attempt).
+      const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+      // Project dir Claude Code uses for `cwd`: encodes path segments
+      // (e.g. `/Users/long` → `-Users-long`). Long asked for session
+      // resume Jun 28 ~16:30 ET — `--resume <uuid>` loads
+      // `<projectsDir>/<uuid>.jsonl` if it exists; if not, claude exits
+      // with "No conversation found with session ID: ..." (verified Jun
+      // 28 ~16:42 ET for cc-3 which had never been used).
+      const projectsDir = path.join(os.homedir(), '.claude', 'projects',
+        '-' + cwd.split('/').filter(Boolean).join('-'));
+      const sessionJsonlExists = sessionId && typeof sessionId === 'string' && uuidRe.test(sessionId)
+        && fsSync.existsSync(path.join(projectsDir, sessionId + '.jsonl'));
+      if (sessionJsonlExists) {
+        // Resume an existing session whose JSONL we can find on disk.
+        // The renderer captured this UUID from the prior PTY's `ready`
+        // message and persisted it in the `claudeCode.tabs` settings.
+        args.push('--resume', sessionId);
+        useSessionId = sessionId;
+      } else {
+        // Either no sessionId was sent, the UUID is malformed, or the
+        // persisted session's JSONL file is missing (never-used tab or
+        // file was cleaned up). Spawn a fresh session with a known UUID
+        // so we can persist + resume it on the next restart.
+        // crypto.randomUUID() returns a v4 UUID like 03f3a2ed-d905-402f-a62f-7186bcc63fe8.
+        useSessionId = crypto.randomUUID();
+        args.push('--session-id', useSessionId);
+      }
+      // Ensure the cwd is marked as trusted in `~/.claude.json` before
+      // we spawn the PTY, so the workspace trust dialog doesn't appear.
+      markWorkspaceTrusted(cwd);
+      // Wrap claude in nono.sh for kernel-level isolation (Tier 1, Jul 5).
+      // farnsworth-claude profile extends `default` (which already blocks
+      // credentials, keychains, browser data, dangerous commands) and adds
+      // Tier 1 isolation via nono was rolled back Jul 6 ~08:15 ET because
+      // the Seatbelt sandbox blocks ~/.claude.json + macOS Keychain reads,
+      // which Claude Code requires for auth (Keychain) + workspace trust
+      // (~/.claude.json `projects[cwd].hasTrustDialogAccepted`). Under the
+      // sandbox, claude runs but reports "Not logged in · Please run /login"
+      // and ignores its own settings. Without those reads, the panel
+      // always asks for re-auth on restart. The farnsworth-claude profile
+      // is kept at v0.6.0 on disk for reference / future work but no
+      // longer wired into the spawn. See [[nono-farnsworth-claude]] §
+      // rollback note + [[claude-code-panel]] § cwd bug.
+      let spawnBin, spawnArgs;
+      const nonoBin = findNonoPath();
+      if (nonoBin) {
+        // Wrap claude in nono.sh for kernel-level isolation (Tier 1, Jul 5).
+        // farnsworth-claude v0.7.0 (Jul 7 ~22:58 ET) adds filesystem.allow
+        // + allow_file + bypass_protection for ~/.claude.json + ~/.claude/
+        // + ~/Library/Keychains so Seatbelt doesn't break Claude Code's
+        // auth (Keychain reads) + workspace trust
+        // (~/.claude.json `projects[cwd].hasTrustDialogAccepted`) reads.
+        // Without these allows, claude under the wrap reports 'Not logged
+        // in · Please run /login' and ignores its own settings. With them,
+        // smoke test (Jul 7 ~23:01 ET) shows: claude --version works,
+        // head ~/.claude.json reads, security find-generic-password
+        // returns OAuth tokens, ~/.aws/.ssh/.gnupg/.config/gh still
+        // blocked, bash -c escape still blocked at startup. See
+        // [[nono-farnsworth-claude]] § v0.7.0 + [[claude-code-panel]] §
+        // isolation via nono. markWorkspaceTrusted above handles the
+        // trust map; nono profile handles credential/keychain isolation.
+        spawnBin = nonoBin;
+        spawnArgs = ['wrap', '--profile', 'farnsworth-claude', '--', claudeBin, ...args];
+      } else {
+        // Direct spawn (no nono). Fallback if nono isn't installed.
+        // Claude Code's own permission system (workspace trust,
+        // settings.json permissions.allow, etc.) is the safety layer;
+        // markWorkspaceTrusted above handles the trust map.
+        spawnBin = claudeBin;
+        spawnArgs = args;
+      }
+      try {
+        // PATH-override rule (Jul 7 ~21:02 ET): bundled Resources/bin/
+        // first, then homebrew, then /usr/local. This makes claude +
+        // nono self-contained inside Farnsworth.app.
+        const bundledBin = path.join(process.resourcesPath || '', 'bin');
+        const newPath = [bundledBin, '/opt/homebrew/bin', '/usr/local/bin', process.env.PATH || '']
+          .filter(Boolean)
+          .join(':');
+        term = pty.spawn(spawnBin, spawnArgs, {
+          name: 'xterm-256color',
+          cols: 80,
+          rows: 24,
+          cwd,
+          env: { ...process.env, TERM: 'xterm-256color', PATH: newPath },
+        });
+      } catch (e) {
+        send({ type: 'error', message: 'claude pty.spawn failed: ' + e.message + ' — is `claude` on PATH? Run `npm i -g @anthropic-ai/claude-code` if not.' });
+        ws.close();
+        return;
+      }
+      // Auto-accept Claude Code 2.1.204's "Share X to skip this prompt"
+      // workspace dialog (Jul 7 ~23:33 ET). The prompt appears for every
+      // interactive PTY spawn even when `~/.claude.json` has
+      // `projects[cwd].hasTrustDialogAccepted=true` -- different field,
+      // different UX flow. Accepting it ('y\r') persists per-cwd in
+      // ~/.claude.json so subsequent PTY spawns in the same cwd skip it.
+      // We only auto-accept ONCE per WS connection (track via promptSeen
+      // flag) so we don't spam 'y' if the user opens a different prompt.
+      let promptSeen = false;
+      term.onData((data) => {
+        send({ type: 'data', data });
+        if (!promptSeen && /to skip this prompt/.test(data) && /\[y\/N\]/.test(data)) {
+          promptSeen = true;
+          setTimeout(() => {
+            try { term.write('y\r'); } catch {}
+          }, 150);
+        }
+      });
+      term.onExit(({ exitCode, signal }) => {
+        send({ type: 'exit', exitCode, signal });
+        ws.close();
+      });
+      send({ type: 'ready', tabId, sessionId: useSessionId });
+    };
+
+    ws.on('message', (raw) => {
+      let msg;
+      try { msg = JSON.parse(raw.toString()); } catch { return; }
+      if (msg.type === 'spawn') {
+        spawnFor(msg.sessionId);
+      } else if (term && msg.type === 'data') {
+        term.write(msg.data);
+      } else if (term && msg.type === 'resize' && Number.isFinite(msg.cols) && Number.isFinite(msg.rows)) {
+        try { term.resize(msg.cols, msg.rows); } catch {}
+      } else if (term && msg.type === 'close') {
+        try { term.kill(); } catch {}
+      }
+    });
+    ws.on('close', () => {
+      try { term && term.kill(); } catch {}
+    });
+    ws.on('error', () => {
+      try { term && term.kill(); } catch {}
+    });
+  });
+  console.log(`[claude-code] WebSocket server listening on ws://localhost:${CLAUDE_CODE_WS_PORT}`);
+}
+
+ipcMain.handle('claudeCode:getWsUrl', () => `ws://localhost:${CLAUDE_CODE_WS_PORT}`);
+ipcMain.handle('claudeCode:close', async (_event, tabId) => {
+  // The renderer tracks the WS per tab; this is a no-op marker for symmetry
+  // with terminal:close — the WS close handler in main does the actual cleanup.
+  return { ok: true, tabId };
+});
+
+// ============================================================
+// Claude Code panel tab persistence
+// ============================================================
+// Long asked (Jun 28 ~15:51 ET) for the panel to remember its open
+// tabs across restarts — when the IDE quits and relaunches, the same
+// tabs should come back without the user having to recreate them.
+// We store the tab list + active tab ID in the settings table as a
+// single JSON blob (`claudeCode.tabs`). PTYs themselves are NOT
+// persisted — on restore, each tab re-spawns a fresh `claude` child
+// process when the user activates it (lazy init pattern, mirrors how
+// terminal tabs already work).
+//
+// Shape stored at `claudeCode.tabs`:
+//   { tabs: [{ id: 'cc-1', label: 'claude', createdAt: '...', sessionId: 'uuid' }],
+//     activeId: 'cc-1' }
+// `sessionId` (Jun 28 ~16:30 ET) is the Claude Code session UUID — when
+// present, restore uses `claude --resume <sessionId>` so the prior
+// conversation continues instead of starting fresh and re-asking the
+// workspace trust prompt.
+ipcMain.handle('claudeCode:listTabs', async () => {
+  try {
+    const raw = db.getSetting('claudeCode.tabs');
+    if (!raw) return { ok: true, tabs: [], activeId: null };
+    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    return {
+      ok: true,
+      tabs: Array.isArray(parsed.tabs) ? parsed.tabs : [],
+      activeId: parsed.activeId || null,
+    };
+  } catch (e) {
+    return { ok: false, error: e.message, tabs: [], activeId: null };
+  }
+});
+
+ipcMain.handle('claudeCode:saveTabs', async (_event, state) => {
+  try {
+    if (!state || !Array.isArray(state.tabs)) {
+      return { ok: false, error: 'tabs must be an array' };
+    }
+    db.setSetting('claudeCode.tabs', {
+      tabs: state.tabs,
+      activeId: state.activeId || null,
+    });
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
+
+// Auth gate for the Claude Code panel — the renderer calls these before
+// spawning the `claude` TUI so unauthenticated users see a clean sign-in
+// card instead of a raw `claude login` prompt dumped into xterm.
+//
+// `claudeCode:checkAuth` wraps `auth:checkClaudeCode` (already exists) and
+// returns the same shape — { ok, hasAuth, source, message }.
+// `claudeCode:runLogin` wraps `auth:runClaudeLogin` which spawns `claude
+// login` as a child process and waits for the Keychain to update, then
+// auto-imports the token. Returns { ok, claudeLoginRan, ... }.
+ipcMain.handle('claudeCode:checkAuth', async () => {
+  // Lazy-require to avoid loading auth handlers at startup if unused.
+  const { ipcMain: _ignored } = require('electron');
+  // Just call the existing handler's implementation by re-invoking via the
+  // registered name. Simpler: emit the same logic inline.
+  const claudePath = findClaudePath();
+  if (!claudePath) {
+    return { ok: false, hasAuth: false, source: 'no_binary', message: 'Claude Code CLI not found. Install with: npm i -g @anthropic-ai/claude-code' };
+  }
+  // Check Keychain directly — that's where Claude Code stores OAuth tokens.
+  // `claude auth status` prints "Not logged in" if no Keychain entry, but
+  // reading Keychain directly is faster and doesn't fork a process.
+  const { execSync: exec } = require('child_process');
+  try {
+    const out = exec('security find-generic-password -s "Claude Code-credentials" -w', { encoding: 'utf8', timeout: 5000 }).trim();
+    if (out && out.startsWith('{')) {
+      const blob = JSON.parse(out);
+      const oauth = blob.claudeAiOauth || blob;
+      if (oauth.accessToken && oauth.refreshToken) {
+        return {
+          ok: true,
+          hasAuth: true,
+          source: 'keychain',
+          subscriptionType: oauth.subscriptionType || null,
+          expiresAt: oauth.expiresAt || null,
+        };
+      }
+    }
+    return { ok: true, hasAuth: false, source: 'keychain_empty', message: 'No OAuth token in Keychain' };
+  } catch (e) {
+    return { ok: false, hasAuth: false, source: 'keychain_error', message: 'Keychain lookup failed: ' + e.message };
+  }
+});
+
+ipcMain.handle('claudeCode:runLogin', async () => {
+  // Delegate to the existing auth:runClaudeLogin handler. It spawns
+  // `claude login`, waits for the Keychain to update, and returns the
+  // import result. We re-export it under the claudeCode: namespace so
+  // the panel's own IPC surface is self-contained.
+  const { ipcMain: ipc } = require('electron');
+  // Re-run the same logic by calling the handler directly via a synthetic
+  // event — simpler is to just inline-import the function. But the
+  // existing handler is registered as an anonymous async arrow, so the
+  // easiest path is to invoke the IPC by name through the handler map.
+  // Electron doesn't expose handlers by name publicly, so we re-implement
+  // the call by spawning `claude login` here and watching Keychain.
+  const { execSync, spawn } = require('child_process');
+  const claudePath = findClaudePath();
+  if (!claudePath) {
+    return { ok: false, error: 'claude_not_found', message: 'Claude Code CLI not found. Install with: npm i -g @anthropic-ai/claude-code' };
+  }
+
+  return await new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(claudePath, ['login'], { stdio: 'ignore', detached: false });
+    } catch (e) {
+      return resolve({ ok: false, error: 'spawn_failed', message: 'Failed to spawn `claude login`: ' + e.message });
+    }
+    const timeout = setTimeout(() => {
+      try { child.kill('SIGTERM'); } catch {}
+      resolve({ ok: false, error: 'timeout', message: '`claude login` timed out after 5 minutes.' });
+    }, 5 * 60 * 1000);
+    child.on('exit', async (code) => {
+      clearTimeout(timeout);
+      if (code !== 0) {
+        return resolve({ ok: false, error: 'claude_login_failed', message: '`claude login` exited with code ' + code });
+      }
+      // claude login wrote a fresh Keychain entry. Verify + return status.
+      try {
+        const out = execSync('security find-generic-password -s "Claude Code-credentials" -w', { encoding: 'utf8', timeout: 5000 }).trim();
+        if (out && out.startsWith('{')) {
+          const blob = JSON.parse(out);
+          const oauth = blob.claudeAiOauth || blob;
+          if (oauth.accessToken) {
+            return resolve({ ok: true, hasAuth: true, claudeLoginRan: true });
+          }
+        }
+      } catch {}
+      resolve({ ok: false, error: 'no_keychain_after_login', message: '`claude login` exited but no Keychain entry was written.' });
+    });
+    child.on('error', (err) => {
+      clearTimeout(timeout);
+      resolve({ ok: false, error: 'spawn_failed', message: '`claude login` child error: ' + err.message });
+    });
+  });
+});
+
+ipcMain.handle('terminal:getWsUrl', () => `ws://localhost:${TERMINAL_WS_PORT}`);
+
+// Relay IPC: renderer → main → relay
+ipcMain.handle('relay:send', async (_event, msg) => {
+  const rc = getRelayClient();
+  return rc.send(msg);
+});
+ipcMain.handle('relay:status', async () => {
+  const rc = getRelayClient();
+  return rc.status;
+});
+
+// ------------------------------------------------------------
+// Terminal PTY registry — tracks active PTYs so the agent's
+// run_command can pipe its command into the most-recently-active
+// terminal tab for visual feedback. The actual command execution
+// runs via child_process.exec so the output is captured reliably.
+// ------------------------------------------------------------
+const terminalPtys = new Map(); // ws -> { pty, lastActivity }
+
+function getActiveTerminalPty() {
+  let best = null;
+  let latest = 0;
+  for (const [ws, entry] of terminalPtys.entries()) {
+    if (ws.readyState === 1 /* OPEN */ && entry.lastActivity > latest) {
+      latest = entry.lastActivity;
+      best = entry.pty;
+    }
+  }
+  return best;
+}
+
+async function runShellCommand(command) {
+  const folder = db.getSetting('currentFolder');
+  if (!folder) return { ok: false, error: 'no_folder', message: 'No workspace folder open' };
+  if (!command || typeof command !== 'string') return { ok: false, error: 'bad_input', message: 'command required' };
+  const { exec } = require('child_process');
+  return await new Promise((resolve) => {
+    exec(command, { cwd: folder, maxBuffer: 1024 * 1024, timeout: 30000 }, (err, stdout, stderr) => {
+      // Pipe the command into the active terminal PTY for visual feedback
+      const activePty = getActiveTerminalPty();
+      if (activePty) {
+        try { activePty.write(command + '\n'); } catch {}
+      }
+      resolve({
+        ok: !err || err.code === 0,
+        stdout: stdout || '',
+        stderr: stderr || '',
+        exitCode: err ? (typeof err.code === 'number' ? err.code : 1) : 0,
+        pipedToTerminal: !!activePty,
+      });
+    });
+  });
+}
+
+ipcMain.handle('terminal:runCommand', async (_event, command) => {
+  return await runShellCommand(command);
+});
+
+// Close a specific terminal tab by id. Renderer sends the tabId (which is the
+// PTY's cwd + an increment) when the user clicks the x on a terminal pill.
+ipcMain.handle('terminal:close', async (_event, tabId) => {
+  let closed = 0;
+  for (const [ws, entry] of terminalPtys.entries()) {
+    if (entry.tabId === tabId) {
+      try { entry.pty.kill(); } catch {}
+      try { ws.close(); } catch {}
+      closed++;
+    }
+  }
+  return { ok: true, closed };
+});
+
+// ------------------------------------------------------------
+// Chat conversations — saved threads persisted in SQLite. The
+// renderer auto-saves the active conversation on every update
+// (debounced), lists them in a dropdown next to the Chat pill,
+// and can switch between them or start a new one.
+// ------------------------------------------------------------
+function getActiveWorkspacePath() {
+  return db.getSetting('currentFolder') || null;
+}
+
+ipcMain.handle('chatConv:list', async () => {
+  return db.listConversations(getActiveWorkspacePath());
+});
+
+ipcMain.handle('chatConv:load', async (_event, id) => {
+  const row = db.getConversation(id);
+  if (!row) return null;
+  try { return { ...row, messages: JSON.parse(row.messages) }; }
+  catch { return null; }
+});
+
+ipcMain.handle('chatConv:create', async (_event, { id, title, messages } = {}) => {
+  const convId = id || 'conv-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+  db.createConversation(convId, getActiveWorkspacePath(), title || 'New chat', messages || []);
+  return { id: convId };
+});
+
+ipcMain.handle('chatConv:save', async (_event, { id, title, messages } = {}) => {
+  if (!id) return { ok: false, error: 'no_id' };
+  db.saveConversation(id, title || 'Untitled', messages || []);
+  return { ok: true };
+});
+
+ipcMain.handle('chatConv:delete', async (_event, id) => {
+  if (!id) return { ok: false, error: 'no_id' };
+  db.deleteConversation(id);
+  return { ok: true };
+});
+
+// ============================================================================
+// Credential surfaces — secure secret storage via OS keychain (keytar).
+//
+// Used by the `credential` chat surface when Claude needs an API key or
+// other secret the user must enter. The renderer-side form captures the
+// value; main-side IPCs write to / read from keychain. Secret values are
+// NEVER logged or persisted to chat history.
+// ============================================================================
+
+ipcMain.handle('credential:promptSecret', async (_event, { service, account, value } = {}) => {
+  if (!service) return { ok: false, error: 'no_service' };
+  if (!value || typeof value !== 'string') return { ok: false, error: 'no_value' };
+  try {
+    await keytar.setPassword(service, account || 'farnsworth', value);
+    return { ok: true, service, account: account || 'farnsworth' };
+  } catch (e) {
+    console.warn('[credential] keytar write failed: ' + (e?.message || e));
+    return { ok: false, error: e.message || 'storage_failed' };
+  }
+});
+
+ipcMain.handle('credential:readSecret', async (_event, { service, account } = {}) => {
+  if (!service) return { ok: false, error: 'no_service' };
+  try {
+    const value = await keytar.getPassword(service, account || 'farnsworth');
+    if (value == null) return { ok: false, error: 'not_found' };
+    return { ok: true, value };
+  } catch (e) {
+    return { ok: false, error: e.message || 'read_failed' };
+  }
+});
+
+ipcMain.handle('credential:deleteSecret', async (_event, { service, account } = {}) => {
+  if (!service) return { ok: false, error: 'no_service' };
+  try {
+    const removed = await keytar.deletePassword(service, account || 'farnsworth');
+    return { ok: true, removed };
+  } catch (e) {
+    return { ok: false, error: e.message || 'delete_failed' };
+  }
+});
