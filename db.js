@@ -202,6 +202,14 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memory_sections USING fts5(
   slug UNINDEXED, heading, content, position UNINDEXED
 );
 
+-- v3.1 conversations lane (Jul 12 2026). DERIVED: chat_conversations.messages
+-- stays canonical; one FTS row per message, regenerated on every conversation
+-- save (createConversation / saveConversation) and lazily backfilled at boot.
+-- Gives past-chat recall alongside concept memory.
+CREATE VIRTUAL TABLE IF NOT EXISTS memory_conversations_fts USING fts5(
+  conv_id UNINDEXED, title, content
+);
+
 -- Buffer: raw facts learned this session, awaits consolidation.
 -- 'consolidated' flag flips to 1 when the consolidation job merges
 -- this row into a concept (or drops it).
@@ -365,6 +373,8 @@ function init(userDataPath, electronSafeStorage) {
   // v3 sections: build the derived section index on first boot after the
   // migration (idempotent — skips when rows already exist).
   try { memoryRebuildAllSections(false); } catch (e) { console.warn('[memory v3] boot rebuild failed:', e.message); }
+  try { memoryEnsureLanes(); } catch (e) { console.warn('[memory v3.1] lane ensure failed:', e.message); }
+  try { memoryRebuildAllConversationsFts(false); } catch (e) { console.warn('[memory v3.1] conversations fts backfill failed:', e.message); }
   return db;
 }
 
@@ -508,6 +518,7 @@ function createConversation(id, workspacePath, title, messages) {
     INSERT INTO chat_conversations (id, workspace_path, title, messages)
     VALUES (?, ?, ?, ?)
   `).run(id, workspacePath || null, title, JSON.stringify(messages || []));
+  memoryRebuildConversationFts(id, title, messages || []);
 }
 
 function saveConversation(id, title, messages) {
@@ -516,10 +527,21 @@ function saveConversation(id, title, messages) {
     SET title = ?, messages = ?, updated_at = CURRENT_TIMESTAMP
     WHERE id = ?
   `).run(title, JSON.stringify(messages || []), id);
+  memoryRebuildConversationFts(id, title, messages || []);
 }
 
 function deleteConversation(id) {
   db.prepare('DELETE FROM chat_conversations WHERE id = ?').run(id);
+  try { db.prepare('DELETE FROM memory_conversations_fts WHERE conv_id = ?').run(id); } catch {}
+}
+
+// All conversations regardless of workspace — the retrospective sweep's
+// candidate list (listConversations filters by workspace_path).
+function listAllConversations(limit = 100) {
+  return db.prepare(`
+    SELECT id, title, updated_at FROM chat_conversations
+    ORDER BY updated_at DESC LIMIT ?
+  `).all(limit);
 }
 
 function touchConversation(id) {
@@ -1162,12 +1184,16 @@ async function memoryRecall(query, limit = 8) {
   // in the recall shape — callers iterating keys must include 'sections'.
   const sectionHits = memorySectionsSearch(String(query), Math.max(limit, 8));
 
+  // v3.1: past-conversation hits (FTS5 bm25 over memory_conversations_fts).
+  const conversationHits = memoryConversationsSearch(String(query), Math.min(limit, 6));
+
   return {
     essentials: essentials.slice(0, 6),
     concepts: mergedConcepts,
     code: vecCode,
     buffer: bufferRows,
     sections: sectionHits,
+    conversations: conversationHits,
   };
 }
 
@@ -1356,6 +1382,129 @@ function memorySectionsCount() {
 // ---- Per-stage run stats (Tier 3 pipeline observability) ----
 // One settings row: { <stage>: {lastRun, ms, model, runs, lastError?},
 // lastConsolidationAt }. Read by the Settings → Memory page.
+// ============================================================================
+// Memory v3.1 (Jul 12 2026) — conversations lane + injection gate + pinned lanes
+// ============================================================================
+
+// Plain-text view of a stored chat message (content may be a string or an
+// array of Anthropic content blocks; renderer-side messages may use .text).
+function memoryMessageText(m) {
+  if (!m) return '';
+  if (typeof m.content === 'string') return m.content;
+  if (Array.isArray(m.content)) return m.content.filter(b => b && b.type === 'text').map(b => b.text || '').join(' ');
+  if (typeof m.text === 'string') return m.text;
+  return '';
+}
+
+// Rebuild the FTS rows for one conversation (DELETE + INSERT — same derived-
+// index pattern as memory_sections). Last 200 messages, 2000 chars each.
+function memoryRebuildConversationFts(convId, title, messages) {
+  if (!db || !convId) return;
+  try {
+    db.prepare('DELETE FROM memory_conversations_fts WHERE conv_id = ?').run(convId);
+    const msgs = (Array.isArray(messages) ? messages : []).slice(-200);
+    const ins = db.prepare('INSERT INTO memory_conversations_fts (conv_id, title, content) VALUES (?, ?, ?)');
+    for (const m of msgs) {
+      const text = memoryMessageText(m).trim();
+      if (!text) continue;
+      ins.run(convId, title || 'Untitled', `${m.role || 'user'}: ${text}`.slice(0, 2000));
+    }
+  } catch (e) {
+    console.warn('[memory v3.1] conversation fts rebuild failed:', e.message);
+  }
+}
+
+// Idempotent boot backfill: only rebuilds when the FTS table is empty but
+// conversations exist (mirrors memoryRebuildAllSections).
+function memoryRebuildAllConversationsFts(force = false) {
+  if (!db) return 0;
+  try {
+    const count = db.prepare('SELECT COUNT(*) AS c FROM memory_conversations_fts').get().c;
+    if (count > 0 && !force) return count;
+    if (force) db.prepare('DELETE FROM memory_conversations_fts').run();
+    const convs = db.prepare('SELECT id, title, messages FROM chat_conversations').all();
+    for (const c of convs) {
+      let msgs = [];
+      try { msgs = JSON.parse(c.messages || '[]'); } catch {}
+      memoryRebuildConversationFts(c.id, c.title, msgs);
+    }
+    return db.prepare('SELECT COUNT(*) AS c FROM memory_conversations_fts').get().c;
+  } catch (e) {
+    console.warn('[memory v3.1] conversations fts backfill failed:', e.message);
+    return 0;
+  }
+}
+
+// Shared tokenizer → FTS5 prefix OR-query (same shape as memorySectionsSearch).
+function memoryFtsOrQuery(text, maxTokens = 12) {
+  const tokens = String(text || '').toLowerCase().replace(/[^a-z0-9\s]+/g, ' ')
+    .split(/\s+/).filter(t => t.length >= 2).slice(0, maxTokens);
+  if (!tokens.length) return null;
+  return tokens.map(t => `"${t}"*`).join(' OR ');
+}
+
+// bm25 search over past conversations — the 'conversations' key in memoryRecall.
+function memoryConversationsSearch(query, k = 6) {
+  if (!db || !query) return [];
+  const q = memoryFtsOrQuery(query);
+  if (!q) return [];
+  try {
+    return db.prepare(`
+      SELECT conv_id, title, snippet(memory_conversations_fts, 2, '', '', '…', 24) AS snippet,
+             bm25(memory_conversations_fts) AS score
+      FROM memory_conversations_fts WHERE memory_conversations_fts MATCH ?
+      ORDER BY score LIMIT ?
+    `).all(q, k);
+  } catch (e) {
+    console.warn('[memory v3.1] conversations search failed:', e.message);
+    return [];
+  }
+}
+
+// v3.1 injection gate primitive: does this message share even ONE keyword
+// with the memory corpus? Zero matches → the router model is never invoked
+// for the turn (Vellum's absolute keyword rule: no term match can never
+// open the gate). Conservative by design — any hit opens the gate.
+function memoryGateCheck(text) {
+  if (!db) return false;
+  const q = memoryFtsOrQuery(text);
+  if (!q) return false;
+  try {
+    if (db.prepare('SELECT rowid FROM memory_sections WHERE memory_sections MATCH ? LIMIT 1').get(q)) return true;
+  } catch {}
+  try {
+    if (db.prepare('SELECT rowid FROM memory_conversations_fts WHERE memory_conversations_fts MATCH ? LIMIT 1').get(q)) return true;
+  } catch {}
+  return false;
+}
+
+// ---- Pinned lanes: 'threads' (open loops) + 'recent' (rolling digest) ----
+// Ordinary concept rows with reserved slugs. Always injected at conversation
+// start (alongside essentials), excluded from the router's candidate index,
+// maintained by the consolidation stage via 'lane' ops.
+const MEMORY_LANE_SLUGS = ['threads', 'recent'];
+
+function memoryEnsureLanes() {
+  if (!db) return;
+  const defs = [
+    { slug: 'threads', title: 'Threads — open loops', lead: 'Active commitments, follow-ups in progress, things waiting on someone. Loaded at the start of every conversation.', body: '## open\n\n(nothing tracked yet)\n' },
+    { slug: 'recent', title: 'Recent — rolling digest', lead: 'What happened lately, newest first. Consolidation prunes stale entries. Loaded at the start of every conversation.', body: '## digest\n\n(nothing yet)\n' },
+  ];
+  for (const d of defs) {
+    const exists = db.prepare('SELECT slug FROM memory_concepts WHERE slug = ?').get(d.slug);
+    if (!exists) memoryUpsertConcept({ ...d, source: 'system' });
+  }
+}
+
+function memoryGetLanes() {
+  if (!db) return [];
+  try {
+    return MEMORY_LANE_SLUGS
+      .map(s => db.prepare('SELECT slug, title, lead, body FROM memory_concepts WHERE slug = ?').get(s))
+      .filter(Boolean);
+  } catch { return []; }
+}
+
 function memoryStageStatsGet() {
   try {
     const raw = getSetting('memoryStageStats');
@@ -1861,7 +2010,7 @@ module.exports = {
   getRecentFolders, addRecentFolder, clearRecentFolders,
   setAuthToken, getAuthToken, deleteAuthToken,
   getChatHistory, addChatMessage, clearChatHistory,
-  listConversations, getConversation, createConversation, saveConversation, deleteConversation, touchConversation,
+  listConversations, listAllConversations, getConversation, createConversation, saveConversation, deleteConversation, touchConversation,
   getTasks, addTask, updateTask, deleteTask,
   putOAuthState, consumeOAuthState, getOAuthState, cleanupOAuthState,
   getLiveTickets, saveLiveTickets, clearLiveTickets,
@@ -1879,6 +2028,10 @@ module.exports = {
   memorySectionsForConcept, memorySectionsSearch, memoryAppendToSection,
   memoryUnconsolidatedCount, memorySectionsCount,
   memoryStageStatsGet, memoryStageStatsPatch, memoryStageStatsSetGlobal,
+  // v3.1 — conversations lane + injection gate + pinned lanes
+  memoryRebuildConversationFts, memoryRebuildAllConversationsFts,
+  memoryConversationsSearch, memoryGateCheck,
+  memoryEnsureLanes, memoryGetLanes, MEMORY_LANE_SLUGS,
   // Tier 2 — codebase indexer
   embedBatch, chunkText, hashContent,
   memoryCodeUpsertFile, memoryCodeRemoveFile, memoryCodeStats,

@@ -1413,12 +1413,22 @@ ipcMain.handle('test:delete', async (_event, { folder, name }) => {
 // ============================================================
 
 const MEMORY_STAGE_DEFAULTS = {
-  extraction:    { enabled: true, model: 'Haiku 4.5', tier: 'speed',    extract: ['Corrections', 'Preferences', 'Decisions'] },
+  extraction:    { enabled: true, model: 'Haiku 4.5', tier: 'speed',    extract: ['Corrections', 'Preferences', 'Decisions'], noiseFilter: true },
   consolidation: { enabled: true, model: 'Sonnet 5',  tier: 'balanced', schedule: 'Daily', autoOnBuffer: true, bufferThreshold: 50 },
   retrieval:     { enabled: true, model: 'Sonnet 5',  tier: 'balanced', depth: 'Standard', summariesFirst: true, graphSpread: true },
-  router:        { enabled: true, model: 'Haiku 4.5', tier: 'speed',    bucketBudget: 3 },
+  router:        { enabled: true, model: 'Haiku 4.5', tier: 'speed',    bucketBudget: 3, gate: true },
   l2selector:    { enabled: true, model: 'Haiku 4.5', tier: 'speed' },
+  retrospective: { enabled: true, model: 'Sonnet 5',  tier: 'balanced', quietMinutes: 30, maxPerTick: 2 },
 };
+
+// Bump a named counter inside a stage's stats blob (gate skips, noise skips).
+function memoryStatCounter(stage, key) {
+  try {
+    const cur = db.memoryStageStatsGet();
+    const val = (((cur || {})[stage] || {})[key] || 0) + 1;
+    db.memoryStageStatsPatch(stage, { [key]: val });
+  } catch {}
+}
 
 function memoryStageConf(stage) {
   let saved = null;
@@ -1498,11 +1508,14 @@ async function runConsolidationPass(reason = 'manual') {
     const concepts = db.memoryListConcepts(100);
     const articleIndex = concepts.map(c => `- ${c.slug} — ${c.title}${c.lead ? ': ' + String(c.lead).slice(0, 120) : ''}`).join('\n') || '(no articles yet)';
     const bufferLines = buffer.map(b => `[${b.id}] (${b.source || 'chat'}) ${String(b.content).slice(0, 400)}`).join('\n');
-    const system = `You are the consolidation stage of an IDE assistant's memory system. Merge buffered facts into wiki-style concept articles. Prefer appending to existing articles; create an article only for a genuinely new durable topic. Use "essential" only for identity-level facts that must load every session. Use "drop" for noise, duplicates, and transient status. Every buffer id must appear in exactly one op. Return ONLY JSON:
+    const system = `You are the consolidation stage of an IDE assistant's memory system. Merge buffered facts into wiki-style concept articles. Prefer appending to existing articles; create an article only for a genuinely new durable topic. Use "essential" only for identity-level facts that must load every session. Use "drop" for noise, duplicates, and transient status.
+Two special always-loaded articles exist: 'threads' (open loops — active commitments, follow-ups, waiting-on-someone) and 'recent' (rolling digest of notable events, newest first). Keep them current: file open-loop facts into 'threads' and notable events into 'recent' (append, or a "lane" op to REPLACE the whole body when entries resolved or went stale — keep each lane under ~20 lines). "lane" ops take ids:[] and don't consume buffer ids.
+Every buffer id must appear in exactly one non-lane op. Return ONLY JSON:
 {"ops":[
  {"op":"append","ids":[1],"slug":"existing-slug","section":"section heading","content":"markdown to append"},
  {"op":"create","ids":[2,3],"slug":"kebab-slug","title":"Title","lead":"1-2 sentence standalone summary","body":"markdown with ## section headings"},
  {"op":"essential","ids":[4],"key":"snake_case_key","value":"short value"},
+ {"op":"lane","ids":[],"slug":"threads","body":"full replacement markdown"},
  {"op":"drop","ids":[5]}
 ]}`;
     const user = `EXISTING ARTICLES:\n${articleIndex}\n\nBUFFER (unconsolidated facts):\n${bufferLines}`;
@@ -1510,7 +1523,7 @@ async function runConsolidationPass(reason = 'manual') {
     if (!text) return { ok: false, error: 'inference_unavailable', reason };
     const parsed = memoryParseJson(text);
     if (!parsed || !Array.isArray(parsed.ops)) return { ok: false, error: 'bad_model_output', reason };
-    const applied = { append: 0, create: 0, essential: 0, drop: 0 };
+    const applied = { append: 0, create: 0, essential: 0, drop: 0, lane: 0 };
     const doneIds = new Set();
     for (const op of parsed.ops) {
       const ids = Array.isArray(op.ids) ? op.ids.filter(id => buffer.find(b => b.id === id)) : [];
@@ -1530,6 +1543,11 @@ async function runConsolidationPass(reason = 'manual') {
         } else if (op.op === 'essential' && op.key && op.value) {
           db.memorySetEssential(op.key, op.value, 'consolidation', 0.9);
           applied.essential++;
+        } else if (op.op === 'lane' && db.MEMORY_LANE_SLUGS.includes(op.slug) && op.body) {
+          // Full-body replacement of a pinned lane (threads / recent).
+          const cur = db.memoryGetConcept(op.slug);
+          db.memoryUpsertConcept({ slug: op.slug, title: cur?.title || op.slug, lead: cur?.lead || null, body: String(op.body), source: 'consolidation' });
+          applied.lane++;
         } else if (op.op === 'drop') {
           applied.drop++;
         } else {
@@ -1579,6 +1597,100 @@ function maybeScheduledConsolidation() {
 setInterval(maybeScheduledConsolidation, 30 * 60 * 1000);
 setTimeout(maybeScheduledConsolidation, 90 * 1000);
 
+// ---- v3.1 Stage 6: retrospective (post-conversation sweep) ----
+// Live extraction sees one turn at a time; the retrospective re-reads a
+// whole conversation once it has gone quiet and captures what was missed
+// (arcs, decisions, corrections). Output lands in the buffer like any other
+// fact (source='retrospective'). State lives in the 'memoryRetroState'
+// settings row: convId → the updated_at that was last swept.
+let retrospectiveRunning = false;
+
+function memoryRetroState() {
+  try { return JSON.parse(db.getSetting('memoryRetroState') || '{}'); } catch { return {}; }
+}
+function memoryRetroMarkDone(convId, updatedAt) {
+  try {
+    const s = memoryRetroState();
+    s[convId] = updatedAt || new Date().toISOString();
+    db.setSetting('memoryRetroState', JSON.stringify(s));
+  } catch {}
+}
+// SQLite CURRENT_TIMESTAMP strings are UTC without a zone marker — parse as UTC.
+function sqliteUtcMs(ts) {
+  if (!ts) return 0;
+  const s = String(ts);
+  return Date.parse(s.includes('T') || s.endsWith('Z') ? s : s.replace(' ', 'T') + 'Z') || 0;
+}
+
+async function runRetrospective(convId) {
+  const conv = db.getConversation(convId);
+  if (!conv) return { ok: false, error: 'no_such_conversation' };
+  let msgs = [];
+  try { msgs = JSON.parse(conv.messages || '[]'); } catch {}
+  const textOf = (m) => typeof m?.content === 'string' ? m.content
+    : Array.isArray(m?.content) ? m.content.filter(b => b && b.type === 'text').map(b => b.text || '').join(' ')
+    : typeof m?.text === 'string' ? m.text : '';
+  const lines = msgs.slice(-40)
+    .map(m => `${(m.role === 'assistant' || m.role === 'agent') ? 'assistant' : 'user'}: ${textOf(m).slice(0, 500)}`)
+    .filter(l => l.length > 12);
+  if (lines.length < 4) {
+    memoryRetroMarkDone(convId, conv.updated_at);
+    return { ok: true, skipped: true, reason: 'too_short' };
+  }
+  const already = db.memoryBufferList(false, 30).map(b => `- ${String(b.content).slice(0, 120)}`).join('\n') || '(none)';
+  const system = `You are the retrospective stage of an IDE assistant's memory. Review a finished conversation and capture durable facts that the live per-turn extraction MISSED — decisions, corrections, preferences, plans, project state. Skip code contents, transient status, and anything in ALREADY CAPTURED. Return ONLY JSON {"items":[{"kind":"correction|preference|decision|name|plan|fact","content":"one-line fact"}]} — items may be empty.`;
+  const user = `CONVERSATION "${conv.title || 'Untitled'}":\n${lines.join('\n').slice(0, 12000)}\n\nALREADY CAPTURED (recent buffer):\n${already}`;
+  const text = await memoryStageInference('retrospective', system, user, 700);
+  if (text === null) return { ok: false, error: 'inference_unavailable' };
+  const parsed = memoryParseJson(text);
+  const items = Array.isArray(parsed?.items) ? parsed.items.slice(0, 8) : [];
+  for (const item of items) {
+    if (!item || !item.content) continue;
+    db.memoryBufferAppend(`[${item.kind || 'fact'}] ${item.content}`, `retrospective: ${conv.title || convId}`, 'retrospective');
+  }
+  memoryRetroMarkDone(convId, conv.updated_at);
+  if (items.length) maybeAutoConsolidate();
+  console.log(`[memory tier3] retrospective "${conv.title || convId}": ${items.length} facts captured`);
+  return { ok: true, items: items.length, title: conv.title };
+}
+
+async function maybeRetrospectives() {
+  if (retrospectiveRunning) return;
+  retrospectiveRunning = true;
+  try {
+    const conf = memoryStageConf('retrospective');
+    if (!conf.enabled) return;
+    const quietMs = Math.max(5, Number(conf.quietMinutes) || 30) * 60e3;
+    // First run ever: don't storm through history — only the 3 most recent
+    // conversations are eligible; everything older is marked as swept.
+    if (!db.getSetting('memoryRetroState')) {
+      const seed = {};
+      db.listAllConversations(500).slice(3).forEach(c => { seed[c.id] = c.updated_at; });
+      db.setSetting('memoryRetroState', JSON.stringify(seed));
+    }
+    const state = memoryRetroState();
+    const convs = db.listAllConversations(60);
+    let ran = 0;
+    for (const c of convs) {
+      if (ran >= (Number(conf.maxPerTick) || 2)) break;
+      if (state[c.id] === c.updated_at) continue;                  // nothing new since last sweep
+      if (Date.now() - sqliteUtcMs(c.updated_at) < quietMs) continue; // still active — wait for quiet
+      try {
+        const r = await runRetrospective(c.id);
+        if (r.ok && !r.skipped) ran++;
+      } catch (e) {
+        console.warn('[memory tier3] retrospective failed:', e.message);
+      }
+    }
+  } catch (e) {
+    console.warn('[memory tier3] retrospective sweep failed:', e.message);
+  } finally {
+    retrospectiveRunning = false;
+  }
+}
+setInterval(maybeRetrospectives, 30 * 60 * 1000);
+setTimeout(maybeRetrospectives, 150 * 1000);
+
 ipcMain.handle('memory:bootstrap', async () => db.memoryBootstrap());
 ipcMain.handle('memory:recall', async (_event, query, limit) => {
   const res = await db.memoryRecall(query, limit);
@@ -1620,6 +1732,18 @@ ipcMain.handle('memory:remember', async (_event, content, opts) => {
   // facts before anything enters the buffer. Disabled / no auth / bad
   // output → raw buffering (pre-Tier-3 behavior).
   const conf = memoryStageConf('extraction');
+
+  // v3.1 noise pre-filter (Vellum-style): low-value acks skip the extraction
+  // model call entirely. The archive row above already holds the raw text,
+  // so nothing is lost — this just saves a model call on "ok" / "thanks".
+  if (conf.enabled && conf.noiseFilter !== false) {
+    const t = String(content).trim();
+    if (t.length < 10 || /^(ok(ay)?|k+|y(es|ep|eah)?|no(pe)?|thanks?(\s+you)?|ty|thx|cool|nice|got it|sounds good|sure(\s+thing)?|lol|ha(ha)+|great|perfect|done|nvm|hm+|huh|yo|hey|hi|hello)[.!?\s]*$/i.test(t)) {
+      memoryStatCounter('extraction', 'noiseSkips');
+      return { ok: true, extracted: 0, skipped: true, noise: true };
+    }
+  }
+
   if (conf.enabled) {
     try {
       const cats = (Array.isArray(conf.extract) && conf.extract.length ? conf.extract : ['Corrections', 'Preferences', 'Decisions']).join(', ');
@@ -1683,18 +1807,31 @@ ipcMain.handle('memory:route', async (_event, opts = {}) => {
   const context = String(opts?.context || '').slice(0, 800);
   const routerConf = memoryStageConf('router');
   const essentials = db.memoryListEssentials();
-  if (!routerConf.enabled) return { ok: false, disabled: true, essentials };
-  const all = db.memoryListConcepts(150);
-  if (!all.length) return { ok: true, essentials, concepts: [], routed: [] };
+  // v3.1 pinned lanes (threads + recent): always returned; the renderer
+  // injects them on the first message of a conversation like essentials.
+  const lanes = db.memoryGetLanes();
+  if (!routerConf.enabled) return { ok: false, disabled: true, essentials, lanes };
+
+  // v3.1 injection gate: when the message shares zero keywords with the
+  // memory corpus, skip the router model entirely — no model call, no
+  // routed injection. Essentials + lanes still flow on the first message.
+  if (routerConf.gate !== false && !db.memoryGateCheck(context)) {
+    memoryStatCounter('router', 'gateSkips');
+    return { ok: true, essentials, lanes, concepts: [], routed: [], gated: true };
+  }
+
+  // Lanes are always injected, so they never compete for router budget.
+  const all = db.memoryListConcepts(150).filter(c => !db.MEMORY_LANE_SLUGS.includes(c.slug));
+  if (!all.length) return { ok: true, essentials, lanes, concepts: [], routed: [] };
   const budget = Math.max(1, Math.min(Number(routerConf.bucketBudget) || 3, 6));
   const index = all.map(c => `- ${c.slug} — ${c.title}${c.lead ? ': ' + String(c.lead).slice(0, 140) : ''}`).join('\n');
   const routerSystem = `You are the memory router of an IDE assistant. Given the user's new message and the article index, pick up to ${budget} articles genuinely useful for answering. Return ONLY JSON {"slugs":["slug",...]}. Return {"slugs":[]} when none are relevant.`;
   const routerText = await memoryStageInference('router', routerSystem, `USER MESSAGE:\n${context}\n\nARTICLE INDEX:\n${index}`, 200);
-  if (routerText === null) return { ok: false, error: 'router_unavailable', essentials };
+  if (routerText === null) return { ok: false, error: 'router_unavailable', essentials, lanes };
   const routerParsed = memoryParseJson(routerText);
   const slugs = (Array.isArray(routerParsed?.slugs) ? routerParsed.slugs : [])
     .filter(s => all.find(c => c.slug === s)).slice(0, budget);
-  if (!slugs.length) return { ok: true, essentials, concepts: [], routed: [] };
+  if (!slugs.length) return { ok: true, essentials, lanes, concepts: [], routed: [] };
 
   // Stage 5: L2 section selector — only worth a model call when at least
   // one routed article actually has multiple sections.
@@ -1728,11 +1865,21 @@ ipcMain.handle('memory:route', async (_event, opts = {}) => {
       out.push({ slug, title: full.title, lead: full.lead, sections: [] });
     }
   }
-  return { ok: true, essentials, concepts: out, routed: slugs };
+  return { ok: true, essentials, lanes, concepts: out, routed: slugs };
 });
 
 // Manual "Run now" for the consolidation stage (Settings → Memory).
 ipcMain.handle('memory:run-consolidation', async () => await runConsolidationPass('manual'));
+
+// Manual retrospective (Settings → Memory "Run now", or with an explicit
+// conversation id). Without an id, sweeps the most recent conversation
+// regardless of quiet time.
+ipcMain.handle('memory:run-retrospective', async (_event, convId) => {
+  if (convId) return await runRetrospective(convId);
+  const convs = db.listAllConversations(1);
+  if (!convs.length) return { ok: false, error: 'no_conversations' };
+  return await runRetrospective(convs[0].id);
+});
 
 // Per-stage run stats + corpus counters for the Settings page.
 ipcMain.handle('memory:stage-stats', async () => ({
@@ -3052,6 +3199,17 @@ const AGENT_TOOLS = [
     name: 'open_testview',
     description: 'Navigate the canvas preview to Test View so the user can see the test runner panel. Use this BEFORE test_list / test_save / test_run when the user asks anything about tests — they expect to see Test View, not the Post View. Auto-switches the canvas mode to live if needed. No-op if the canvas is already in Test View.',
     input_schema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'memory_recall',
+    description: 'Search Farnsworth\'s long-term memory: concept articles, article sections, essentials, unfiled buffer facts, past conversations, and the indexed codebase. Use when the user references something from a previous session that isn\'t in this conversation (a past decision, an earlier chat, project history).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'What to look for — topic, decision, name, or phrase' }
+      },
+      required: ['query']
+    }
   }
 ];
 
@@ -3074,6 +3232,22 @@ function globToRegex(glob) {
 }
 
 async function executeAgentTool(name, input) {
+  // memory_recall works without a workspace folder — it searches the
+  // assistant's own store, not the project.
+  if (name === 'memory_recall') {
+    const q = String(input?.query || '').trim();
+    if (!q) return { ok: false, error: 'bad_input', message: 'query required' };
+    const res = await db.memoryRecall(q, 8);
+    const fmt = [];
+    if (res.essentials?.length) fmt.push('essentials:\n' + res.essentials.map(e => `- ${e.key}: ${e.value}`).join('\n'));
+    if (res.concepts?.length) fmt.push('concepts:\n' + res.concepts.map(c => `- ${c.slug}: ${String(c.lead || c.title || '').slice(0, 200)}`).join('\n'));
+    if (res.sections?.length) fmt.push('sections:\n' + res.sections.map(s => `- ${s.slug} § ${s.heading}: ${String(s.content || '').slice(0, 300)}`).join('\n'));
+    if (res.conversations?.length) fmt.push('past conversations:\n' + res.conversations.map(c => `- "${c.title}": ${c.snippet}`).join('\n'));
+    if (res.buffer?.length) fmt.push('recent unfiled facts:\n' + res.buffer.map(b => `- ${String(b.content).slice(0, 160)}`).join('\n'));
+    if (res.code?.length) fmt.push('code index:\n' + res.code.map(c => `- ${c.path || c.file || '?'}: ${String(c.content || '').slice(0, 120)}`).join('\n'));
+    return { ok: true, result: fmt.join('\n\n') || 'No memory matches for that query.' };
+  }
+
   const folder = db.getSetting('currentFolder');
   if (!folder) {
     return { ok: false, error: 'no_folder', message: 'No workspace folder open. Open a folder first.' };

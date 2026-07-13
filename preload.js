@@ -270,6 +270,7 @@ contextBridge.exposeInMainWorld('farnsworth', {
   // Tier 3 (Jul 12 2026) — routing + consolidation + stage stats
   memoryRoute: (opts) => ipcRenderer.invoke('memory:route', opts),
   memoryRunConsolidation: () => ipcRenderer.invoke('memory:run-consolidation'),
+  memoryRunRetrospective: (convId) => ipcRenderer.invoke('memory:run-retrospective', convId),
   memoryStageStats: () => ipcRenderer.invoke('memory:stage-stats'),
   // Tier 2 — codebase indexer (sqlite-vec)
   memoryCodeStats: (workspacePath) => ipcRenderer.invoke('memory:code-stats', workspacePath),

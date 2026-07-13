@@ -1,8 +1,8 @@
 # Farnsworth IPC Surface — Full Method Inventory
 
 **Source:** `app/preload.js` (auto-generated 1:1 — keep in sync when methods are added/removed/renamed).
-**Verified count:** 124 methods as of Jul 12, 2026.
-**Historical count:** 84 (post-Tier 1, Jul 5) → 91 (post-Tier 2, Jul 6 ~20:23 ET) → 121 (Jul 12 morning) → 124 (Jul 12 Tier 3: `memoryRoute`, `memoryRunConsolidation`, `memoryStageStats`). Earlier growth driven by Test View (5), canvas polish (3), relay (5), tab persistence (2), Devvit settings (8), chat conversations (5), Claude Code auth gate (2), and one-offs.
+**Verified count:** 125 methods as of Jul 13, 2026.
+**Historical count:** 84 (post-Tier 1, Jul 5) → 91 (post-Tier 2, Jul 6 ~20:23 ET) → 121 (Jul 12 morning) → 124 (Jul 12 Tier 3: `memoryRoute`, `memoryRunConsolidation`, `memoryStageStats`) → 125 (Jul 13 v3.1: `memoryRunRetrospective`). Earlier growth driven by Test View (5), canvas polish (3), relay (5), tab persistence (2), Devvit settings (8), chat conversations (5), Claude Code auth gate (2), and one-offs.
 
 ## Conventions
 
@@ -50,7 +50,7 @@ Channels in `main.js` use colon-prefixed lowercase (`memory:code-watch`, `canvas
 21. [Live panel — cached ticket suggestions](#21-live-panel--cached-ticket-suggestions--3)
 22. [Terminal panel](#22-terminal-panel--3)
 23. [Claude Code panel](#23-claude-code-panel--6)
-24. [Memory — Tiers 1 + 3](#24-memory--tiers-1--3--17)
+24. [Memory — Tiers 1 + 3](#24-memory--tiers-1--3--18)
 25. [Memory — Tier 2 (codebase indexer)](#25-memory--tier-2-codebase-indexer--6)
 26. [Folder watcher](#26-folder-watcher--3)
 27. [Memory — concept operations](#27-memory--concept-operations--2)
@@ -289,15 +289,15 @@ Spawns the `claude` binary in a PTY (not bash). Same WS protocol as terminal pan
 | `claudeCodeCheckAuth` | `claudeCode:checkAuth` | `()` | `Promise<{authenticated: boolean}>` | Renderer checks before spawning the `claude` TUI. |
 | `claudeCodeRunLogin` | `claudeCode:runLogin` | `()` | `Promise<{ok} \| {ok:false, error}>` | Spawns `claude login`, waits for Keychain update. |
 
-### 24. Memory — Tiers 1 + 3 — 17
+### 24. Memory — Tiers 1 + 3 — 18
 
 SQLite-backed persistence (4 tables + `memory_sections`, a derived FTS5 index at section grain: `memory_essentials`, `memory_concepts`, `memory_buffer`, `memory_archive`, `memory_sections`). **Tier 1 IPCs use object args.** Tier 3 (Jul 12) added the per-stage model pipeline: extraction on remember, model consolidation, retrieval re-rank on recall, and pre-turn routing (`memoryRoute`). The concept `body` column stays canonical; `memory_sections` is rebuilt on every concept write.
 
 | Renderer method | Channel | Signature | Returns | Notes |
 |---|---|---|---|---|
 | `memoryBootstrap` | `memory:bootstrap` | `()` | `Promise<{essentials, recentConcepts, today}>` | Called on app init. |
-| `memoryRecall` | `memory:recall` | `(query: string, limit?: number)` | `Promise<{essentials, concepts, code, buffer, sections, reranked?}>` | **5-key shape as of Jul 12 (Tier 3)** — `sections` is section-grain FTS5 hits over `memory_sections`. When the retrieval stage is enabled, concepts + sections come back model-re-ranked with `reranked: true`; on any failure the raw FTS5 order returns unchanged. |
-| `memoryRemember` | `memory:remember` | `(content: string, opts?: object)` | `Promise<{ok, id?, extracted?, skipped?}>` | Archive always gets the raw content. **Tier 3:** when the extraction stage is enabled, a cheap model distills the content into `[kind] fact` buffer rows (`source='extraction'`, max 6; `keep:false` skips buffering entirely, returning `{ok, extracted: 0, skipped: true}`). Disabled/no-auth/bad-output falls back to raw buffering. |
+| `memoryRecall` | `memory:recall` | `(query: string, limit?: number)` | `Promise<{essentials, concepts, code, buffer, sections, conversations, reranked?}>` | **6-key shape as of Jul 13 (v3.1)** — `sections` is section-grain FTS5 hits over `memory_sections`; `conversations` is bm25 hits over `memory_conversations_fts` (`{conv_id, title, snippet}`). When the retrieval stage is enabled, concepts + sections come back model-re-ranked with `reranked: true`; on any failure the raw FTS5 order returns unchanged. |
+| `memoryRemember` | `memory:remember` | `(content: string, opts?: object)` | `Promise<{ok, id?, extracted?, skipped?, noise?}>` | Archive always gets the raw content. **Tier 3:** when the extraction stage is enabled, a cheap model distills the content into `[kind] fact` buffer rows (`source='extraction'`, max 6; `keep:false` skips buffering entirely, returning `{ok, extracted: 0, skipped: true}`). **v3.1:** a zero-cost noise pre-filter (`noiseFilter`, default on) skips the model call for trivial acks ("ok", "thanks", <10 chars), returning `{skipped: true, noise: true}` and bumping `extraction.noiseSkips`. Disabled/no-auth/bad-output falls back to raw buffering. |
 | `memoryGet` | `memory:get` | `(slug: string)` | `Promise<Concept \| null>` | |
 | `memorySet` | `memory:set` | `(concept: Concept)` | `Promise<{ok}>` | |
 | `memoryDelete` | `memory:delete` | `(slug: string)` | `Promise<{ok}>` | |
@@ -309,8 +309,9 @@ SQLite-backed persistence (4 tables + `memory_sections`, a derived FTS5 index at
 | `memoryConsolidate` | `memory:consolidate` | `(bufferIds: number[] \| null)` | `Promise<{ok, count?} \| ConsolidationResult>` | Explicit ids: plain flag flip (per-row Settings buttons). **`null` (Tier 3): runs the full Stage-2 model pass** — merges buffer facts into concept sections via append/create/essential/drop ops. |
 | `memoryArchive` | `memory:archive` | `(opts?: {since?, until?})` | `Promise<ArchiveEntry[]>` | |
 | `memoryBuffer` | `memory:buffer` | `(onlyUnconsolidated?: boolean, limit?: number)` | `Promise<BufferEntry[]>` | |
-| `memoryRoute` | `memory:route` | `({context: string})` | `Promise<{ok, essentials, concepts, routed} \| {ok: false, disabled?, error?}>` | **Tier 3 stages 4+5.** Router picks ≤ bucketBudget concept articles for the message; L2 selector picks sections within them (lead always included). L2 disabled → whole `body` per concept (v2-style). Router disabled → `{ok: false, disabled: true, essentials}`. Called by the renderer on **every chat send**. |
-| `memoryRunConsolidation` | `memory:run-consolidation` | `()` | `Promise<ConsolidationResult>` | Manual "Run now" from Settings → Memory. `{ok, processed, total, applied: {append, create, essential, drop}, reason}`. |
+| `memoryRoute` | `memory:route` | `({context: string})` | `Promise<{ok, essentials, lanes, concepts, routed, gated?} \| {ok: false, disabled?, error?}>` | **Tier 3 stages 4+5.** Router picks ≤ bucketBudget concept articles for the message; L2 selector picks sections within them (lead always included). L2 disabled → whole `body` per concept (v2-style). Router disabled → `{ok: false, disabled: true, essentials, lanes}`. **v3.1:** `lanes` = the pinned `threads` + `recent` articles (renderer injects them once per conversation, like essentials; excluded from the router index). Injection gate (`router.gate`, default on): zero keyword overlap between the message and the corpus → `{gated: true, concepts: []}` with **no model call** (bumps `router.gateSkips`). Called by the renderer on **every chat send**. |
+| `memoryRunConsolidation` | `memory:run-consolidation` | `()` | `Promise<ConsolidationResult>` | Manual "Run now" from Settings → Memory. `{ok, processed, total, applied: {append, create, essential, drop, lane}, reason}`. v3.1: consolidation also maintains the `threads`/`recent` lanes (`lane` ops replace a lane body; ids:[]). |
+| `memoryRunRetrospective` | `memory:run-retrospective` | `(convId?: string)` | `Promise<{ok, items?, title?, skipped?, reason?} \| {ok: false, error}>` | **v3.1 Stage 6.** Without `convId`: sweeps the most recent conversation regardless of quiet time (Settings "Run now"). With `convId`: sweeps that conversation. Model output lands as `[kind] fact` buffer rows (`source='retrospective'`). The scheduler (30-min tick + 150s post-boot) auto-sweeps conversations that have gone quiet ≥ `quietMinutes` with new activity since the last sweep (state: `memoryRetroState` settings row; first run seeds all but the 3 newest as swept). |
 | `memoryStageStats` | `memory:stage-stats` | `()` | `Promise<{ok, stats, bufferCount, sectionsCount}>` | Per-stage `{lastRun, ms, model, runs, lastError}` + global `lastConsolidationAt` from the `memoryStageStats` settings row. |
 
 ### 25. Memory — Tier 2 (codebase indexer) — 6

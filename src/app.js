@@ -95,11 +95,12 @@ const state = {
     verification: { selfVerify: true, externalCheck: false },
     streaming: true,
     memory: {
-      extraction: { enabled: true, model: 'Haiku 4.5', tier: 'speed', extract: ['Corrections', 'Preferences', 'Decisions'] },
+      extraction: { enabled: true, model: 'Haiku 4.5', tier: 'speed', extract: ['Corrections', 'Preferences', 'Decisions'], noiseFilter: true },
       consolidation: { enabled: true, model: 'Sonnet 5', tier: 'balanced', schedule: 'Daily', autoOnBuffer: true, bufferThreshold: 50 },
       retrieval: { enabled: true, model: 'Sonnet 5', tier: 'balanced', depth: 'Standard', summariesFirst: true, graphSpread: true },
-      router: { enabled: true, model: 'Haiku 4.5', tier: 'speed', bucketBudget: 3 },
+      router: { enabled: true, model: 'Haiku 4.5', tier: 'speed', bucketBudget: 3, gate: true },
       l2selector: { enabled: true, model: 'Haiku 4.5', tier: 'speed' },
+      retrospective: { enabled: true, model: 'Sonnet 5', tier: 'balanced', quietMinutes: 30 },
       pipelineVersion: 3,
     },
     canvas: {
@@ -5709,7 +5710,7 @@ function renderMemorySettings() {
         <div class="settings-page__title">Memory</div>
         <span class="settings-pill settings-pill--v23">TIER 3 · LIVE</span>
       </div>
-      <div class="settings-page__sub">Five-stage pipeline over the SQLite store. Every-turn stages (extraction, router, section selector) run on a cheap model; consolidation and recall re-ranking run on a stronger one. Every stage degrades to its non-model fallback when disabled.</div>
+      <div class="settings-page__sub">Six-stage pipeline over the SQLite store. Every-turn stages (extraction, router, section selector) run on a cheap model; consolidation, retrospective and recall re-ranking run on a stronger one. A zero-cost keyword gate skips the router on no-signal turns. Every stage degrades to its non-model fallback when disabled.</div>
     </div>
   `;
   wrap.appendChild(makeMemoryStage(1, 'Extraction', 'extraction', m.extraction,
@@ -5722,12 +5723,14 @@ function renderMemorySettings() {
     'Every turn: picks which concept articles to load for the new message, up to the budget. Keeps context bounded as the corpus grows. Disabled: recent-concepts preamble on the first message only.'));
   wrap.appendChild(makeMemoryStage(5, 'Section Selector', 'l2selector', m.l2selector,
     'Stage two of routing: picks the relevant sections inside routed articles so whole articles never flood context. The article lead is always included. Disabled: whole articles are injected.'));
+  wrap.appendChild(makeMemoryStage(6, 'Retrospective', 'retrospective', m.retrospective,
+    'Re-reads a conversation once it goes quiet and captures what per-turn extraction missed — arcs, decisions, corrections. Output lands in the buffer like any other fact. Disabled: only live extraction feeds the buffer.'));
 
   // Per-stage run stats — filled in async once the IPC resolves.
   if (window.farnsworth?.memoryStageStats) {
     window.farnsworth.memoryStageStats().then((r) => {
       if (!r || !r.ok) return;
-      for (const key of ['extraction', 'consolidation', 'retrieval', 'router', 'l2selector']) {
+      for (const key of ['extraction', 'consolidation', 'retrieval', 'router', 'l2selector', 'retrospective']) {
         const target = wrap.querySelector(`[data-stage-stats="${key}"]`);
         if (!target) continue;
         const s = r.stats && r.stats[key];
@@ -5735,6 +5738,8 @@ function renderMemorySettings() {
         const mins = Math.max(0, Math.round((Date.now() - Date.parse(s.lastRun)) / 60000));
         const ago = mins < 1 ? 'just now' : mins < 60 ? `${mins}m ago` : mins < 1440 ? `${Math.round(mins / 60)}h ago` : `${Math.round(mins / 1440)}d ago`;
         target.textContent = `${s.runs || 0} runs · last ${ago} · ${s.ms}ms · ${s.model}${s.lastError ? ' · error: ' + String(s.lastError).slice(0, 60) : ''}`;
+        const extras = [s.gateSkips ? `${s.gateSkips} gate-skips` : null, s.noiseSkips ? `${s.noiseSkips} noise-skips` : null].filter(Boolean);
+        if (extras.length) target.textContent += ' · ' + extras.join(' · ');
         if (s.lastError) target.style.color = 'var(--error)';
       }
       const bufEl = wrap.querySelector('[data-stage-buffer]');
@@ -6060,6 +6065,49 @@ function makeMemoryStage(num, name, stageKey, cfg, desc) {
       persistSettings();
     });
     row.appendChild(bb);
+    const gate = el('button', { class: 'memory-stage__chip' + (cfg.gate !== false ? ' is-active' : ''), title: 'Zero-cost FTS pre-check: when the message shares no keywords with the memory corpus, the router model is skipped entirely for the turn' }, 'Keyword gate');
+    gate.addEventListener('click', () => {
+      cfg.gate = (cfg.gate === false);
+      persistSettings();
+      renderSettings();
+    });
+    row.appendChild(gate);
+  }
+
+  if (stageKey === 'extraction') {
+    row.appendChild(el('span', { class: 'memory-stage__divider' }));
+    const noise = el('button', { class: 'memory-stage__chip' + (cfg.noiseFilter !== false ? ' is-active' : ''), title: 'Skip the extraction model on trivial acknowledgements ("ok", "thanks") — the raw text still lands in the daily archive' }, 'Noise filter');
+    noise.addEventListener('click', () => {
+      cfg.noiseFilter = (cfg.noiseFilter === false);
+      persistSettings();
+      renderSettings();
+    });
+    row.appendChild(noise);
+  }
+
+  if (stageKey === 'retrospective') {
+    row.appendChild(el('span', { class: 'memory-stage__divider' }));
+    row.appendChild(el('span', { class: 'memory-stage__label' }, 'QUIET'));
+    const qm = el('input', { type: 'number', value: String(cfg.quietMinutes ?? 30), min: '5', max: '240', title: 'Minutes a conversation must be idle before it gets swept', style: 'width:52px;padding:3px 6px;background:var(--bg);border:1px solid var(--border);border-radius:4px;font-size:11px;font-family:var(--mono);color:inherit;' });
+    qm.addEventListener('change', () => {
+      cfg.quietMinutes = Math.max(5, Math.min(240, Number(qm.value) || 30));
+      qm.value = String(cfg.quietMinutes);
+      persistSettings();
+    });
+    row.appendChild(qm);
+    row.appendChild(el('span', { class: 'memory-stage__label' }, 'MIN'));
+    const runRetro = el('button', { class: 'memory-stage__chip', title: 'Sweep the most recent conversation now' }, '▶ Run now');
+    runRetro.addEventListener('click', async () => {
+      runRetro.disabled = true;
+      runRetro.textContent = 'Running…';
+      try {
+        const r = await window.farnsworth.memoryRunRetrospective();
+        if (r && r.ok) alert(r.skipped ? `Retrospective skipped (${r.reason || 'nothing to do'}).` : `Retrospective done: ${r.items ?? 0} facts captured from "${r.title || 'latest conversation'}".`);
+        else alert('Retrospective failed: ' + (r && r.error || 'unknown'));
+      } catch (e) { alert('Retrospective failed: ' + (e && e.message || e)); }
+      renderSettings();
+    });
+    row.appendChild(runRetro);
   }
   stage.appendChild(row);
 
@@ -6347,11 +6395,12 @@ async function loadSettings() {
     // migration) force stage models to the new defaults — the old model
     // chips were dead UI, so persisted models were never a user choice.
     const memDefaults = {
-      extraction:    { enabled: true, model: 'Haiku 4.5', tier: 'speed',    extract: ['Corrections', 'Preferences', 'Decisions'] },
+      extraction:    { enabled: true, model: 'Haiku 4.5', tier: 'speed',    extract: ['Corrections', 'Preferences', 'Decisions'], noiseFilter: true },
       consolidation: { enabled: true, model: 'Sonnet 5',  tier: 'balanced', schedule: 'Daily', autoOnBuffer: true, bufferThreshold: 50 },
       retrieval:     { enabled: true, model: 'Sonnet 5',  tier: 'balanced', depth: 'Standard', summariesFirst: true, graphSpread: true },
-      router:        { enabled: true, model: 'Haiku 4.5', tier: 'speed',    bucketBudget: 3 },
+      router:        { enabled: true, model: 'Haiku 4.5', tier: 'speed',    bucketBudget: 3, gate: true },
       l2selector:    { enabled: true, model: 'Haiku 4.5', tier: 'speed' },
+      retrospective: { enabled: true, model: 'Sonnet 5',  tier: 'balanced', quietMinutes: 30 },
     };
     const savedMem = (loaded && typeof loaded.memory === 'object' && loaded.memory) || {};
     const migrated = savedMem.pipelineVersion === 3;
@@ -8252,6 +8301,16 @@ async function sendChatMessage() {
           lines.push('# Memory essentials (always-loaded)');
           for (const e of routed.essentials) lines.push(`- ${e.key}: ${e.value}`);
         }
+        // v3.1 pinned lanes: threads (open loops) + recent (rolling digest),
+        // injected once per conversation like essentials.
+        if (isNewMemConv && routed.lanes && routed.lanes.length) {
+          for (const lane of routed.lanes) {
+            state.memoryInjectedSlugs.add(lane.slug);
+            lines.push('');
+            lines.push(`# Memory: ${lane.title || lane.slug} (always-loaded)`);
+            if (lane.body) lines.push(lane.body);
+          }
+        }
         const fresh = (routed.concepts || []).filter(c => !state.memoryInjectedSlugs.has(c.slug));
         if (fresh.length) {
           lines.push('');
@@ -8384,6 +8443,7 @@ async function sendChatMessage() {
           '- list_files(pattern?) — list workspace files (optional glob filter)',
           '- run_command(command) — run a shell command in the workspace (30s timeout)',
           '- ui_show(surfaceType, data) — render an inline UI surface in the chat stream (card, choice, form, copy_block, work_result, etc.)',
+          '- memory_recall(query) — search long-term memory (concept articles, sections, past conversations, code index) for facts from previous sessions',
           '',
           '**Test View tools (Jul 11 ~18:50 ET):**',
           '- open_testview() — switch the canvas to Test View so the user sees the test runner',
@@ -8554,6 +8614,8 @@ async function sendChatMessage() {
           });
           // Switch to terminal tab so the user sees the command run live
           if (state.leftPanel !== 'terminal') switchLeftPanel('terminal');
+        } else if (tu.name === 'memory_recall') {
+          resultContent = toolRes.result || 'No memory matches.';
         } else {
           resultContent = toolRes.message || 'OK';
         }
