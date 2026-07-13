@@ -1138,7 +1138,14 @@ button { font-family: inherit; cursor: pointer; }
   padding: 60px 20px;
   overflow: auto;
 }
-.artboard { position: relative; }
+.artboard {
+  position: relative;
+  /* Don't let the stage flex-squeeze the artboard below its set size — it
+     made layout lie (style 900px, offsetWidth 736) so the size label was
+     wrong and drags locked to the squeezed aspect. The stage scrolls and
+     Test View auto-fits, so oversized artboards are handled honestly. */
+  flex-shrink: 0;
+}
 .artboard--mobile { width: 360px; height: 692px; }
 .artboard--desktop { width: 720px; height: 460px; }
 
@@ -4813,16 +4820,21 @@ button { font-family: inherit; cursor: pointer; }
   display: flex;
   align-items: center;
   justify-content: center;
-  flex: 0 0 390px;
-  min-width: 390px;
+  flex: 0 0 auto;
+  min-width: 0;
+  height: 100%;
 }
 
 .testview__phone {
-  /* Reuse .phone chrome from the mobile preview but at fixed 390×844 so
-     the WebContentsView's bounds match what the Python test runner expects
-     (target viewport for click coords + screenshots). */
-  width: 390px;
-  height: 844px;
+  /* Scales WITH the artboard (Jul 13) so corner-drag resize reaches the
+     game view, matching mobile/desktop/post behavior. Height tracks the
+     artboard's inner height; width follows via aspect-ratio. At the default
+     900×876 artboard this lands exactly 390×844 (the old fixed size — the
+     test runner's expected default). Resizing changes the game's real CSS
+     viewport, same as dragging the mobile artboard. */
+  height: 100%;
+  width: auto;
+  aspect-ratio: 390 / 844;
   flex: none;
   margin: 0;
 }

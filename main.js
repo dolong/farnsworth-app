@@ -900,6 +900,13 @@ ipcMain.handle('devvit:set-project-settings', async (_event, workspacePath, curr
 //   target — its own debugger target is at port 9222 type=page
 
 const canvasWebContentsViews = new Map();
+// Desired content zoom factor per view (set via canvas:setZoomFactor).
+// Electron persists per-origin zoom levels in the persist:farnsworth
+// partition and RESTORES them when a navigation commits — silently
+// overriding any factor set before the page loaded (bit us Jul 13: fresh
+// views came up at yesterday's 0.99 instead of the current canvas zoom).
+// We re-apply the desired factor on load-commit events instead.
+const canvasViewZoomFactors = new Map();
 
 ipcMain.handle('canvas:createView', async (_event, { viewId, url, bounds }) => {
   try {
@@ -920,6 +927,15 @@ ipcMain.handle('canvas:createView', async (_event, { viewId, url, bounds }) => {
     });
     mainWindow.contentView.addChildView(view);
     view.setBounds(bounds);
+    // Pin the content zoom on every navigation commit — otherwise the
+    // partition's persisted per-origin zoom wins over whatever the renderer
+    // set while the page was still loading.
+    const applyZoom = () => {
+      const f = canvasViewZoomFactors.get(viewId);
+      if (f) { try { view.webContents.setZoomFactor(f); } catch {} }
+    };
+    view.webContents.on('did-navigate', applyZoom);
+    view.webContents.on('did-finish-load', applyZoom);
     view.webContents.loadURL(url);
     canvasWebContentsViews.set(viewId, view);
     return { ok: true };
@@ -947,6 +963,7 @@ ipcMain.handle('canvas:removeView', (_event, { viewId }) => {
     mainWindow.contentView.removeChildView(view);
     view.webContents.destroy();
     canvasWebContentsViews.delete(viewId);
+    canvasViewZoomFactors.delete(viewId);
     return { ok: true };
   } catch (e) {
     return { ok: false, error: e.message };
@@ -970,6 +987,7 @@ ipcMain.handle('canvas:removeAllViews', () => {
       } catch {}
     }
     canvasWebContentsViews.clear();
+    canvasViewZoomFactors.clear();
     return { ok: true, removed: canvasWebContentsViews.size };
   } catch (e) {
     return { ok: false, error: e.message };
@@ -1131,6 +1149,7 @@ ipcMain.handle('canvas:setZoomFactor', (_event, { viewId, factor }) => {
   const f = Number(factor);
   if (!Number.isFinite(f) || f <= 0.05 || f > 5) return { ok: false, error: 'bad_factor' };
   try {
+    canvasViewZoomFactors.set(viewId, f);
     view.webContents.setZoomFactor(f);
     return { ok: true };
   } catch (e) {

@@ -822,12 +822,12 @@ function setupCanvasBrowserViews() {
           return;
         }
         el.dataset.canvasViewId = viewId;
-        // If the canvas is currently zoomed, the freshly created view needs
-        // the matching content zoom factor (bounds come from the transformed
-        // placeholder rect; setZoomFactor keeps the game's CSS viewport at
-        // its logical size — 390x844 for Test View — so the test runner's
-        // screenshots and selectors are unaffected by display scale).
-        if (state.zoom !== 100 && window.farnsworth.canvasSetZoomFactor) {
+        // ALWAYS pin the content zoom factor on fresh views — including at
+        // 100%. Electron restores the partition's persisted per-origin zoom
+        // on navigation, so a view left unpinned comes up at whatever factor
+        // the origin last had (e.g. yesterday's 0.99), not 1.0. Main.js
+        // records the desired factor and re-applies it on load-commit.
+        if (window.farnsworth.canvasSetZoomFactor) {
           window.farnsworth.canvasSetZoomFactor(viewId, state.zoom / 100);
         }
         syncCanvasViewBounds();
@@ -2204,9 +2204,11 @@ function renderLivePreview() {
   else if (state.preview === 'desktop') wrap.style.height = (customH || (initialW * 596 / 724)) + 'px';
   // Fullscreen — larger, immersive 16:9 game canvas with no action bar.
   else if (state.preview === 'fullscreen') wrap.style.height = (customH || (initialW * 9 / 16)) + 'px';
-  // Test View — split layout with phone-sized game canvas on the left
-  // (390×844 mobile aspect) + test runner panel on the right.
-  else if (state.preview === 'testview') wrap.style.height = (customH || 844) + 'px';
+  // Test View — split layout with phone game canvas on the left + test
+  // runner panel on the right. Height derives from width via the default
+  // 900:876 outer aspect (876 = 844 phone + 2×16 padding) so a corner-drag
+  // size survives re-renders; the phone lands exactly 390×844 at default.
+  else if (state.preview === 'testview') wrap.style.height = (customH || (initialW * 876 / 900)) + 'px';
 
   // Artboard frame
   const frame = el('div', { class: 'artboard__frame' });
@@ -2244,7 +2246,7 @@ function renderLivePreview() {
       if (state.preview === 'mobile') h = w * 844 / 390;
       else if (state.preview === 'desktop') h = w * 596 / 724;
       else if (state.preview === 'fullscreen') h = w * 9 / 16;
-      else if (state.preview === 'testview') h = 844;
+      else if (state.preview === 'testview') h = w * 876 / 900;
       else h = w;
     }
     size.textContent = Math.round(w) + ' × ' + Math.round(h);
@@ -2280,11 +2282,12 @@ function renderLivePreview() {
       ? initialW * 844 / 390
       : initialW * 596 / 724);
     requestAnimationFrame(() => calibrateArtboardToInner(wrap, mode, targetInnerW, targetInnerH));
-  } else if (state.preview === 'testview') {
-    // Test View: the phone-sized game canvas inside has the same inner
-    // calibration as mobile (390×844). Reuse the calibrate helper.
-    requestAnimationFrame(() => calibrateArtboardToInner(wrap, 'mobile', 390, 844));
   }
+  // Test View needs no calibration (Jul 13): the phone's geometry is fully
+  // CSS-derived (height:100% + aspect-ratio), so the 390×844 default falls
+  // out of the 900×876 artboard. The old calibrate call assumed inner width
+  // follows outer width 1:1, which is false for the split layout — it
+  // drifted the artboard width on every render once the phone became fluid.
 
   return wrap;
 }
@@ -2318,9 +2321,13 @@ function startArtboardResize(e, wrap, corner, sizeLabel) {
   e.preventDefault();
   e.stopPropagation();
 
-  const rect = wrap.getBoundingClientRect();
-  const initialW = rect.width;
-  const initialH = rect.height;
+  // Layout sizes, NOT getBoundingClientRect — the artboard may be under a
+  // zoom scale() transform (auto-fit / manual zoom, Jul 13). The transformed
+  // rect is the visual size; writing mouse deltas against it would snap the
+  // layout width from e.g. 900 to 486 on the first drag at 54% zoom.
+  const initialW = wrap.offsetWidth;
+  const initialH = wrap.offsetHeight;
+  const zoomScale = (state.zoom || 100) / 100;
   if (initialW < 50 || initialH < 50) return; // not yet measurable
 
   // Aspect = width / height. For Post View, use the captured aspect if available
@@ -2338,8 +2345,10 @@ function startArtboardResize(e, wrap, corner, sizeLabel) {
   const sign = cornerSign[corner];
 
   const onMove = (ev) => {
-    const dx = ev.clientX - initialMouseX;
-    const dy = ev.clientY - initialMouseY;
+    // Mouse deltas are in screen px; divide by the zoom scale so the edge
+    // tracks the cursor when the artboard is visually scaled.
+    const dx = (ev.clientX - initialMouseX) / zoomScale;
+    const dy = (ev.clientY - initialMouseY) / zoomScale;
     // Width change due to vertical drag (aspect-locked): dy contributes (dy * aspect)
     const dwFromDx = dx * sign;
     const dwFromDy = dy * sign * aspect;
@@ -2349,6 +2358,13 @@ function startArtboardResize(e, wrap, corner, sizeLabel) {
     const newH = newW / aspect;
     wrap.style.width = newW + 'px';
     wrap.style.height = newH + 'px';
+    // Keep the zoom margin compensation in step with the new layout size
+    // (updateZoom() computes it from offsetWidth/Height at zoom time; a drag
+    // afterwards would leave stale margins and mis-center the artboard).
+    if (zoomScale !== 1) {
+      wrap.style.marginRight = (-(newW * (1 - zoomScale))) + 'px';
+      wrap.style.marginBottom = (-(newH * (1 - zoomScale))) + 'px';
+    }
     if (sizeLabel) sizeLabel.textContent = Math.round(newW) + ' × ' + Math.round(newH);
   };
 
@@ -2372,6 +2388,12 @@ function startArtboardResize(e, wrap, corner, sizeLabel) {
       }
     }
     state.previewWidths[state.preview] = finalW;
+    // Test View with a Custom height override active: keep it tracking the
+    // dragged height, otherwise the next render snaps back to the stale one.
+    if (state.preview === 'testview' && state.previewCustomHeight?.testview) {
+      const fh = parseFloat(wrap.style.height);
+      if (fh > 10) state.previewCustomHeight.testview = fh;
+    }
     // Lock Post aspect going forward so future renders don't fall back to content height
     if (state.preview === 'post') {
       const finalH = parseFloat(wrap.style.height) || initialH;
