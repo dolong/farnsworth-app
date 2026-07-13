@@ -1279,6 +1279,33 @@ async function sendCanvasStateToCompanions() {
   }
 }
 
+// ----- Chat event forwarding (Farnsworth -> companion chat stream) -----
+// Mirrors the canvas-state forwarding pattern. Companion v0.4 listens for
+// chat:start / chat:delta / chat:done on its WS connection and renders
+// the stream incrementally in its chat panel (instead of waiting for a
+// single 'chat' event at the end).
+//
+// chat:start - fires once per user message when the agent begins processing
+// chat:delta - fires on each text_delta chunk from streamMessage
+// chat:done  - fires once per user message when the agent loop finishes
+//               (success OR error path; outer try/finally covers errors)
+//
+// Pure renderer-side: no main.js changes needed. The relay is dumb (JSON
+// pass-through), so this just becomes more message types on the wire.
+function sendChatEventToCompanions(eventType, payload) {
+  if (!window.farnsworth?.relaySend) return;
+  try {
+    window.farnsworth.relaySend({
+      type: eventType,
+      conversationId: state.chatActiveId || null,
+      ts: Date.now(),
+      ...payload,
+    });
+  } catch (e) {
+    console.warn('[chat-stream] relaySend failed:', e.message);
+  }
+}
+
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
@@ -8407,6 +8434,10 @@ async function sendChatMessage() {
     }
   };
 
+  // Stream chat:start to companion so it can render an in-progress message bubble
+  // immediately instead of waiting for the final 'chat' event at the end.
+  sendChatEventToCompanions('chat:start', { messageId: agentMsgId });
+
   try {
     // Tool-use loop — iterate up to 10 times (read_file → answer is the common path)
     for (let iter = 0; iter < 10; iter++) {
@@ -8481,6 +8512,11 @@ async function sendChatMessage() {
           if (chunk.type === 'text_delta') {
             agentMsg.text = (agentMsg.text || '') + (chunk.text || '');
             scheduleRender();
+            // Forward text chunk to companion so it streams incrementally
+            sendChatEventToCompanions('chat:delta', {
+              messageId: agentMsgId,
+              delta: chunk.text || '',
+            });
           } else if (chunk.type === 'block_start') {
             const block = chunk.block || {};
             if (block.type === 'tool_use') {
@@ -8516,6 +8552,13 @@ async function sendChatMessage() {
           error: true,
           chips: [...(agentMsg.chips || []), ...extraChips],
         });
+        // Forward the error as a chat:done with error info so companion can
+        // mark the in-progress bubble as failed and stop its spinner.
+        sendChatEventToCompanions('chat:done', {
+          messageId: agentMsgId,
+          error: msg,
+          finalText: agentMsg.text || '',
+        });
         return;
       }
       if (!res || !res.ok) {
@@ -8532,6 +8575,13 @@ async function sendChatMessage() {
           text: msg,
           error: true,
           chips: [...(agentMsg.chips || []), ...extraChips],
+        });
+        // Forward the error as a chat:done with error info so companion can
+        // mark the in-progress bubble as failed and stop its spinner.
+        sendChatEventToCompanions('chat:done', {
+          messageId: agentMsgId,
+          error: msg,
+          finalText: agentMsg.text || '',
         });
         return;
       }
@@ -8558,6 +8608,12 @@ async function sendChatMessage() {
           text: res.text || '(empty response)',
           verified: true,
           chips: [...(agentMsg.chips || []), ...(usageChip ? [usageChip] : [])],
+        });
+        // Final response (no tool use) - send chat:done here too so companion
+        // gets the done event before sendChatMessage returns.
+        sendChatEventToCompanions('chat:done', {
+          messageId: agentMsgId,
+          finalText: agentMsg.text || '',
         });
         return;
       }
@@ -8658,6 +8714,14 @@ async function sendChatMessage() {
       if (agentText && !finalAgent?.error) window.farnsworth.memoryRemember(agentText, { kind: 'fact', source: 'chat.agent', context: `conv=${state.chatActiveId}` });
     }
   }
+  // chat:done was already sent on the error paths (inner catch + res.ok check).
+  // For the success path, send it here so companion always gets exactly one
+  // chat:done per user message. Idempotent if called twice (companion v0.4
+  // collapses duplicates by messageId).
+  sendChatEventToCompanions('chat:done', {
+    messageId: agentMsgId,
+    finalText: agentMsg.text || '',
+  });
 }
 
 // ============================================================================
