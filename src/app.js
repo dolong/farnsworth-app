@@ -9219,6 +9219,24 @@ async function initClaudeCode(tabId) {
   term.onResize(({ cols, rows }) => {
     if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'resize', cols, rows }));
   });
+  // Shift+Enter inserts a newline instead of submitting (Jul 13, Long's
+  // report). xterm has no distinct sequence for Shift+Enter — it emits a
+  // plain \r, identical to Enter, so claude submits the message. Intercept
+  // the keydown and send ESC+CR (meta-Enter) instead: the sequence claude's
+  // TUI binds to "insert newline" — the same one its own /terminal-setup
+  // wires Shift+Enter to in iTerm2/VS Code. The chat panel's textarea
+  // handles Shift+Enter separately; this brings the Claude Code panel to
+  // parity. Scoped to this panel only — a plain shell has no use for
+  // meta-CR, so the Terminal panel keeps stock behavior.
+  term.attachCustomKeyEventHandler((ev) => {
+    if (ev.key === 'Enter' && ev.shiftKey && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
+      if (ev.type === 'keydown' && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'data', data: '\x1b\r' }));
+      }
+      return false; // swallow keydown/keypress/keyup so xterm never emits its own \r
+    }
+    return true;
+  });
   ws.onopen = () => {
     fit.fit();
     // Tell main the workspace cwd so the PTY spawns in the right directory
