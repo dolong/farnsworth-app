@@ -81,6 +81,8 @@ Test View is the fifth canvas preview mode (the flask icon in the canvas size to
 
 Switching into Test View (or any preview change) tears down all existing WebContentsViews first and rebuilds the right one, which prevents orphaned views from stacking on top of each other.
 
+**Small windows.** Test View auto-fits: it picks the largest zoom (up to 100%) where the whole layout — game canvas, test list, and header buttons — fits the canvas area, and re-fits when the window resizes. Zooming manually with the +/− controls turns auto-fit off until you switch preview modes. The canvas area also scrolls when the artboard is larger than the space. Display zoom never changes the game's logical viewport, so selectors, clicks, and screenshots behave identically at any zoom level.
+
 ---
 
 ## 4. Creating tests
