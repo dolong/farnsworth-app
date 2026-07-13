@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Electron's V8 needs writable+executable memory for JIT. -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <!-- V8's code pages need to be writable+executable. -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    <!-- Electron's framework loading uses dyld env vars at startup. -->
+    <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+    <true/>
+    <!-- Allow loading Electron Framework's libraries which may not be signed
+         with our identity (they're linker-signed ad-hoc). -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+    <!-- Run OUTSIDE the App Sandbox. The sandbox blocks PTY + child process
+         spawning which Farnsworth's Claude Code panel depends on. -->
+    <key>com.apple.security.app-sandbox</key>
+    <false/>
+</dict>
+</plist>

@@ -33,7 +33,7 @@ const state = {
   vmMarkupStrokes: [],        // [{ points: [{x,y}], color, width }] in 0-1 coords
   vmComments: [],             // [{ id, x, y, text, createdAt }] in 0-1 coords
   vmCommentsDisplay: false,   // expand comment text inline (for screenshots / chat capture)
-  preview: 'post',            // post | mobile | desktop | fullscreen
+  preview: 'post',            // post | mobile | desktop | fullscreen | testview
   canvasMode: 'live',         // live | storybook | code
   codeFile: '',
 
@@ -47,7 +47,7 @@ const state = {
 
   // Persisted artboard widths per preview mode (height derives from aspect ratio)
   // Mobile aspect = 360/692, Desktop aspect = 720/460, Post aspect captured at drag start
-  previewWidths: { post: 700, mobile: 390, desktop: 724, fullscreen: 1120 },
+  previewWidths: { post: 700, mobile: 390, desktop: 724, fullscreen: 1120, testview: 900 },
 
   // Left panel width (in-memory; resets on reload). Drag handle lets the user
   // grow it up to 66% of the viewport so Claude Code / Terminal can use more room.
@@ -80,6 +80,10 @@ const state = {
   // Settings — persisted via IPC
   settings: {
     defaultModel: 'Opus 4.8 High',
+    // Model for test-runner llm-steps (Settings → AI → Testing model).
+    // Injected into farnsworth-test.py as FARNSWORTH_TEST_MODEL by the
+    // test:run spawns; a per-step "model" field still overrides. Jul 12.
+    testingModel: 'Sonnet 5',
     perCallSiteRouting: [
       { id: 'commit', name: 'Commit messages', model: 'Haiku 4.5', savings: 'saves ~50× vs Opus', confirm: false },
       { id: 'review', name: 'Code review', model: 'Sonnet 4.5', confirm: false },
@@ -92,11 +96,11 @@ const state = {
     streaming: true,
     memory: {
       extraction: { enabled: true, model: 'Haiku 4.5', tier: 'speed', extract: ['Corrections', 'Preferences', 'Decisions'] },
-      consolidation: { enabled: true, model: 'Sonnet 4.5', tier: 'balanced', schedule: 'Daily', autoOnBuffer: true },
-      retrieval: { enabled: true, model: 'Sonnet 4.5', tier: 'balanced', depth: 'Standard', summariesFirst: true, graphSpread: true },
+      consolidation: { enabled: true, model: 'Sonnet 5', tier: 'balanced', schedule: 'Daily', autoOnBuffer: true, bufferThreshold: 50 },
+      retrieval: { enabled: true, model: 'Sonnet 5', tier: 'balanced', depth: 'Standard', summariesFirst: true, graphSpread: true },
       router: { enabled: true, model: 'Haiku 4.5', tier: 'speed', bucketBudget: 3 },
-      l2selector: { enabled: true, model: 'Sonnet 4.5', tier: 'balanced' },
-      v2migration: { enabled: true, parallel: true },
+      l2selector: { enabled: true, model: 'Haiku 4.5', tier: 'speed' },
+      pipelineVersion: 3,
     },
     canvas: {
       defaultZoom: 100, fitOnOpen: false,
@@ -209,10 +213,11 @@ const CHAT_MODEL_OPTIONS = [
   { display: 'Fable 5',       effort: 'high', desc: 'Vellum default (Jul 2 ~16:00 ET)' },
 ];
 
-// Model picker popover — anchored under the dropdown button at
-// Settings → AI → Default model. Picking an option updates
-// state.settings.defaultModel and persists via persistSettings().
-function openModelPicker(anchorBtn) {
+// Model picker popover — anchored under a dropdown button in Settings → AI.
+// Generic over the settings key it edits: 'defaultModel' (main chat thread)
+// or 'testingModel' (test-runner llm-steps). Picking an option updates
+// state.settings[settingsKey] and persists via persistSettings().
+function openModelPicker(anchorBtn, settingsKey = 'defaultModel') {
   // Close any existing picker first.
   const existing = document.querySelector('.model-picker');
   if (existing) existing.remove();
@@ -231,7 +236,7 @@ function openModelPicker(anchorBtn) {
   pop.style.left = r.left + 'px';
 
   for (const opt of CHAT_MODEL_OPTIONS) {
-    const isCurrent = state.settings?.defaultModel === opt.display;
+    const isCurrent = state.settings?.[settingsKey] === opt.display;
     const row = el('button', {
       class: 'model-picker__row' + (isCurrent ? ' is-current' : ''),
       style: `
@@ -251,7 +256,7 @@ function openModelPicker(anchorBtn) {
       <div style="font-size:11.5px;color:#949ba4;margin-top:2px;">${opt.desc}</div>
     `;
     row.addEventListener('click', () => {
-      state.settings.defaultModel = opt.display;
+      state.settings[settingsKey] = opt.display;
       persistSettings();
       pop.remove();
       renderSettings(); // re-render so the dropdown button shows the new value
@@ -660,6 +665,420 @@ function renderMessage(m) {
 }
 
 // ============================================================================
+// CANVAS BROWSERVIEW WIRING (Jul 9 ~18:20 ET)
+// ============================================================================
+// Each [data-canvas-view] placeholder div in the live preview is the
+// layout slot for a BrowserView rendered by main.js. BrowserView is the
+// proper Electron API for this -- <webview> locks the inner viewport at
+// first-load size (~300x150 HTML default) and never propagates CSS-driven
+// height changes (verified end-to-end Jul 9 ~17:35 ET: webview element
+// was 390x844 at reload time but inner viewport stayed 390x150, console
+// log proved the reload fired). BrowserView.setBounds() is called in the
+// main process so the inner viewport's dimensions match the bounds
+// directly -- no CSS race, no reload-after-layout, no 150px squish.
+//
+// The placeholder stores its BrowserView's viewId on a data attribute
+// so ResizeObserver callbacks can look it up. Bounds are queried via
+// getBoundingClientRect() which returns window-content pixel
+// coordinates (same coordinate system as BrowserView.setBounds).
+
+function teardownCanvasBrowserViews() {
+  // Find every placeholder that still has a viewId, send canvas:removeView
+  // for it, disconnect its ResizeObserver, and clear the data attribute.
+  // Called from renderCanvas() BEFORE stage.innerHTML = '' so we can
+  // still query the old DOM by selector.
+  document.querySelectorAll('[data-canvas-view-id]').forEach(el => {
+    const viewId = el.dataset.canvasViewId;
+    if (viewId && window.farnsworth?.canvasRemoveView) {
+      window.farnsworth.canvasRemoveView(viewId).catch(() => {});
+    }
+    if (el._browserViewRo) { el._browserViewRo.disconnect(); el._browserViewRo = null; }
+    delete el.dataset.canvasViewId;
+  });
+}
+
+function setupCanvasBrowserViews() {
+  // Find every [data-canvas-view] placeholder in the freshly-rendered
+  // canvas (skipped ones that already have a viewId -- defensive against
+  // double-setup). For each, generate a viewId, send canvas:createView
+  // with the placeholder's current pixel rect, then attach a
+  // ResizeObserver that keeps the BrowserView bounds in sync on resize /
+  // zoom / resolution changes.
+  if (!window.farnsworth?.canvasCreateView) return;
+
+  // Viewport-level observer — fires when the IDE window resizes or the
+  // left/right panel collapses/expands (the canvas-viewport changes
+  // width). The artboard re-centers in the wider canvas-stage, but the
+  // placeholder inside doesn't resize, only repositions. ResizeObserver
+  // on the placeholder itself doesn't fire for position-only changes,
+  // so the WebContentsView's bounds would stay locked at the original
+  // position while the artboard drifts — leaving dead space on the
+  // trailing side of the canvas (verified Jul 10: viewport 1318 wide,
+  // placeholder centered at x=848 but WebContentsView stuck at x=577).
+  // Observing the viewport catches this case; the per-placeholder
+  // observer below still handles resolution preset changes (where the
+  // placeholder itself resizes).
+  const viewport = document.getElementById('canvas-viewport');
+  if (viewport && !viewport._canvasViewportRo) {
+    const viewportRo = new ResizeObserver(() => {
+      // Clip placeholder bounds to the viewport rect so the WebContentsView
+      // doesn't overflow when the IDE window shrinks below the placeholder's
+      // natural size (e.g. mobile phone frame stays at 390x844 even when the
+      // canvas-viewport is only 364x679 -- the placeholder overflows the
+      // viewport and the WebContentsView follows, covering adjacent UI).
+      // Intersection with viewport bounds keeps the view contained.
+      const vpR = viewport.getBoundingClientRect();
+      document.querySelectorAll('[data-canvas-view-id]').forEach(el => {
+        const viewId = el.dataset.canvasViewId;
+        if (!viewId || !window.farnsworth?.canvasUpdateViewBounds) return;
+        const r = el.getBoundingClientRect();
+        const x = Math.max(Math.round(r.left), Math.round(vpR.left));
+        const y = Math.max(Math.round(r.top), Math.round(vpR.top));
+        const right = Math.min(Math.round(r.right), Math.round(vpR.right));
+        const bottom = Math.min(Math.round(r.bottom), Math.round(vpR.bottom));
+        const width = Math.max(0, right - x);
+        const height = Math.max(0, bottom - y);
+        window.farnsworth.canvasUpdateViewBounds(viewId, {
+          x, y, width, height,
+        });
+      });
+    });
+    viewportRo.observe(viewport);
+    viewport._canvasViewportRo = viewportRo;
+  }
+
+  document.querySelectorAll('[data-canvas-view]').forEach(el => {
+    if (el.dataset.canvasViewId) return;
+    const viewId = `canvas-${el.dataset.canvasView}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const url = el.dataset.canvasUrl;
+    const rect = el.getBoundingClientRect();
+    const bounds = {
+      x: Math.round(rect.left),
+      y: Math.round(rect.top),
+      width: Math.round(rect.width),
+      height: Math.round(rect.height),
+    };
+    // Don't assign the viewId until the IPC succeeds -- otherwise the
+    // teardown logic in renderCanvas() can't tell which placeholders
+    // actually have a BrowserView and which have a pending IPC.
+    (async () => {
+      try {
+        const result = await window.farnsworth.canvasCreateView(viewId, url, bounds);
+        if (!result?.ok) {
+          console.error('[canvas:setup] createView failed for viewId=' + viewId + ':', result?.error);
+          return;
+        }
+        el.dataset.canvasViewId = viewId;
+        const ro = new ResizeObserver(() => {
+          // Same viewport-clip as the viewport-level observer above — when
+          // the placeholder itself resizes (resolution preset change), it
+          // can also exceed the viewport when the window is small.
+          const vpEl = document.getElementById('canvas-viewport');
+          const vpR = vpEl?.getBoundingClientRect();
+          const r = el.getBoundingClientRect();
+          if (!vpR) {
+            window.farnsworth.canvasUpdateViewBounds(viewId, {
+              x: Math.round(r.left),
+              y: Math.round(r.top),
+              width: Math.round(r.width),
+              height: Math.round(r.height),
+            });
+            return;
+          }
+          const x = Math.max(Math.round(r.left), Math.round(vpR.left));
+          const y = Math.max(Math.round(r.top), Math.round(vpR.top));
+          const right = Math.min(Math.round(r.right), Math.round(vpR.right));
+          const bottom = Math.min(Math.round(r.bottom), Math.round(vpR.bottom));
+          const width = Math.max(0, right - x);
+          const height = Math.max(0, bottom - y);
+          window.farnsworth.canvasUpdateViewBounds(viewId, {
+            x, y, width, height,
+          });
+        });
+        ro.observe(el);
+        el._browserViewRo = ro;
+      } catch (e) {
+        console.error('[canvas:setup] IPC exception for viewId=' + viewId + ':', e);
+      }
+    })();
+  });
+}
+
+// ============================================================================
+// TEST CREATOR (NLP-driven test script authoring, Jul 10 ~23:50 ET)
+//
+// In-canvas panel that lets the user type plain English and get a JSON test
+// script. Flow:
+//   1. User types English ("click PLAY, dismiss the welcome dialog")
+//   2. Generate button → renderer calls window.farnsworth.sendMessage
+//      with a system prompt that converts English to JSON test steps
+//   3. JSON preview is shown (editable) + Save button writes to
+//      ~/Documents/farnsworth-tests/tests/<name>.json
+//   4. Save & run button spawns the Python CDP test runner and shows output
+//
+// If the LLM call fails (no auth, network error, etc.) we fall back to
+// keyword matching using the same parser as farnsworth-test.py's `new` cmd.
+// ============================================================================
+const TEST_CREATOR_SYSTEM_PROMPT = `You are a test script generator for Farnsworth's canvas preview.
+Convert a plain-English test description into a JSON test script.
+
+Available actions (each step is one of these):
+  - reload:          Page.reload + sleep, resets state for idempotent runs
+  - waitFor:         poll document.querySelector until found or timeout
+  - click:           click center of element matching selector
+  - clickIfPresent:  click only if selector exists (no exception if absent)
+  - screenshot:      save PNG to given path
+  - eval:            run JS in the page, print return value
+
+Common CSS selectors for the Farnsworth canvas (the game inside the preview):
+  - Canvas stage (desktop):   .fw-stage--desktop
+  - Canvas stage (mobile):    .fw-stage--mobile
+  - Canvas stage (fullscreen): .fw-stage--fullscreen
+  - Welcome modal:            .fw-stage--desktop .lobby2-ftue svg
+  - PLAY tab:                 .bnav-play
+  - ROSTER/DRAFT/BP/OPTIONS:  .bnav-item (text identifies which)
+  - RANKED button:            .lb2-qbtn (text "RANKED")
+  - TRAINING button:          .lb2-qbtn (text "TRAINING")
+  - DAILY/WEEKLY tabs:        .lb2-mission-tab
+
+Output rules:
+  - Reply with ONLY valid JSON (no markdown, no explanation)
+  - Format: {"name": "<short test name>", "steps": [{"action": "...", ...}, ...]}
+  - First step should usually be "reload" for idempotent runs
+  - Use real CSS selectors from the list above, not made-up ones
+  - For "dismiss welcome" / "close dialog", use clickIfPresent on .fw-stage--desktop .lobby2-ftue svg
+  - For "click PLAY", use .bnav-play (not text "PLAY")
+  - Always start with {"name": and end with }`;
+
+function keywordFallbackParse(text) {
+  // Same logic as farnsworth-test.py's parse_english_steps — used when LLM fails
+  const parts = text.split(/[,;\n]|then|and then/).map(s => s.trim()).filter(Boolean);
+  const steps = [];
+  for (const p of parts) {
+    const pl = p.toLowerCase();
+    if (pl === 'reload') {
+      steps.push({ action: 'reload', waitMs: 2000 });
+    } else if (pl.startsWith('wait for ') || pl.startsWith('wait until ')) {
+      steps.push({ action: 'waitFor', selector: p.split(' ', 2).slice(-1)[0], timeout: 5000 });
+    } else if (pl.startsWith('click ') || pl.startsWith('tap ') || pl.startsWith('press ')) {
+      steps.push({ action: 'click', selector: p.split(' ', 1)[1] || p });
+    } else if (pl.startsWith('dismiss') || pl.startsWith('close modal') || pl.startsWith('close dialogue') || pl.startsWith('close dialog')) {
+      steps.push({ action: 'clickIfPresent', selector: '.fw-stage--desktop .lobby2-ftue svg, [role=dialog] button' });
+    } else if (pl.startsWith('screenshot') || pl.startsWith('snap') || pl.startsWith('shot')) {
+      steps.push({ action: 'screenshot', path: '/tmp/' + pl.replace(/[^a-z0-9]+/g, '-') + '.png' });
+    } else if (pl.startsWith('eval ') || pl.startsWith('inspect ') || pl.startsWith('check ')) {
+      steps.push({ action: 'eval', expression: p.split(' ', 1)[1] || p });
+    } else {
+      steps.push({ action: 'eval', expression: p });
+    }
+  }
+  return steps;
+}
+
+function deriveTestName(text) {
+  // Auto-derive a kebab-case name from the first ~40 chars of the prompt
+  const t = text.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  return (t || 'test').slice(0, 40);
+}
+
+function setTestCreatorStatus(text, kind = '') {
+  const el = document.getElementById('test-creator-status');
+  if (!el) return;
+  el.textContent = text || '';
+  el.className = 'test-creator__status' + (kind ? ' is-' + kind : '');
+}
+
+function setTestCreatorButtonsEnabled(enabled) {
+  const save = document.getElementById('test-creator-save');
+  const run = document.getElementById('test-creator-run');
+  if (save) save.disabled = !enabled;
+  if (run) run.disabled = !enabled;
+}
+
+async function generateTestFromNLP(description) {
+  // Try LLM first; fall back to keyword matching if anything fails
+  if (window.farnsworth?.sendMessage) {
+    try {
+      const res = await window.farnsworth.sendMessage({
+        model: 'claude-fable-5',
+        maxTokens: 1500,
+        system: TEST_CREATOR_SYSTEM_PROMPT,
+        messages: [{ role: 'user', content: description }],
+      });
+      if (res?.ok && res.text) {
+        // Strip markdown fences if Claude added them
+        let text = res.text.trim();
+        text = text.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '');
+        const parsed = JSON.parse(text);
+        if (parsed && Array.isArray(parsed.steps)) {
+          return { ok: true, json: parsed, source: 'llm' };
+        }
+      }
+    } catch (e) {
+      console.warn('[test-creator] LLM failed, falling back to keyword matching:', e?.message);
+    }
+  }
+  // Fallback: keyword matching (less capable but always works)
+  const steps = keywordFallbackParse(description);
+  const json = { name: deriveTestName(description), steps };
+  return { ok: true, json, source: 'fallback' };
+}
+
+async function onTestCreatorGenerate() {
+  const promptEl = document.getElementById('test-creator-prompt');
+  const jsonEl = document.getElementById('test-creator-json');
+  const nameEl = document.getElementById('test-creator-name');
+  const description = promptEl.value.trim();
+  if (!description) {
+    setTestCreatorStatus('Type a description first.', 'error');
+    return;
+  }
+  setTestCreatorStatus('Generating...');
+  const result = await generateTestFromNLP(description);
+  if (!result.ok) {
+    setTestCreatorStatus('Generation failed: ' + (result.error || 'unknown'), 'error');
+    return;
+  }
+  jsonEl.value = JSON.stringify(result.json, null, 2);
+  if (!nameEl.value.trim()) nameEl.value = result.json.name || deriveTestName(description);
+  setTestCreatorStatus(
+    result.source === 'llm' ? 'Generated via LLM (editable).' : 'Generated via keyword fallback (LLM unavailable).',
+    'success'
+  );
+  setTestCreatorButtonsEnabled(true);
+}
+
+async function onTestCreatorSave() {
+  const jsonEl = document.getElementById('test-creator-json');
+  const nameEl = document.getElementById('test-creator-name');
+  const json = jsonEl.value.trim();
+  const name = nameEl.value.trim() || deriveTestName(nameEl.value || jsonEl.value);
+  if (!json) { setTestCreatorStatus('Nothing to save.', 'error'); return; }
+  // Validate JSON locally before sending to main
+  try { JSON.parse(json); } catch (e) {
+    setTestCreatorStatus('Invalid JSON: ' + e.message, 'error');
+    return;
+  }
+  setTestCreatorStatus('Saving...');
+  const res = await window.farnsworth.testSave({ name, json });
+  if (!res?.ok) {
+    setTestCreatorStatus('Save failed: ' + (res?.error || 'unknown'), 'error');
+    return;
+  }
+  setTestCreatorStatus('Saved to ' + res.path, 'success');
+}
+
+async function onTestCreatorSaveAndRun() {
+  await onTestCreatorSave();
+  const status = document.getElementById('test-creator-status');
+  if (status.className.includes('is-error')) return; // save failed
+  // Extract the path from the status text
+  const m = status.textContent.match(/Saved to (.+)$/);
+  if (!m) { setTestCreatorStatus('Save status missing path — run manually.', 'error'); return; }
+  const testPath = m[1];
+  const outputEl = document.getElementById('test-creator-output');
+  outputEl.textContent = 'Running...';
+  setTestCreatorStatus('Running...');
+  const res = await window.farnsworth.testRun({ path: testPath });
+  if (!res) {
+    outputEl.textContent = 'No response from test runner.';
+    return;
+  }
+  const out = (res.stdout || '') + (res.stderr ? '\n--- stderr ---\n' + res.stderr : '');
+  outputEl.textContent = out || '(no output)';
+  if (res.ok) {
+    setTestCreatorStatus('Test passed.', 'success');
+  } else if (res.failed > 0) {
+    setTestCreatorStatus('Test ran with ' + res.failed + ' failed step(s).', 'error');
+  } else {
+    setTestCreatorStatus('Test exited with code ' + res.code + '.', 'error');
+  }
+}
+
+function onTestCreatorOpenFolder() {
+  // Reveal the tests folder in Finder via shell.openPath. Farnsworth's main
+  // process has shell; we route through a tiny IPC since the renderer doesn't.
+  // For now, just copy the path so the user can paste into Finder.
+  const path = '~/Documents/farnsworth-tests/tests/';
+  navigator.clipboard?.writeText(path);
+  setTestCreatorStatus('Path copied to clipboard: ' + path, 'success');
+}
+
+function openTestCreator() {
+  const panel = document.getElementById('test-creator');
+  if (!panel) return;
+  panel.hidden = false;
+  // Hide canvas views while the panel is open so the backdrop is clean
+  // (canvas views are separate composited layers and would show through).
+  // The optional chaining is defensive in case hideAllCanvasViews isn't
+  // defined yet at first paint (it normally is, hoisted function decl).
+  hideAllCanvasViews?.();
+  // Defensive: any canvas re-render while the panel is open will tear
+  // down + re-create the WebContentsViews (stripping data-canvas-view-id
+  // then setting it again on a fresh placeholder). Watch for those new
+  // viewIds and hide them so the panel backdrop stays clean. Disconnect
+  // on close.
+  if (window.MutationObserver && !state.testCreatorCanvasObserver) {
+    const vp = document.getElementById('canvas-viewport');
+    if (vp) {
+      const observer = new MutationObserver(() => {
+        if (state.testCreatorOpen) hideAllCanvasViews?.();
+      });
+      observer.observe(vp, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['data-canvas-view-id'],
+      });
+      state.testCreatorCanvasObserver = observer;
+    }
+  }
+  state.testCreatorOpen = true;
+  const input = document.getElementById('test-creator-prompt');
+  if (input) setTimeout(() => input.focus(), 50);
+}
+
+function closeTestCreator() {
+  const panel = document.getElementById('test-creator');
+  if (!panel) return;
+  panel.hidden = true;
+  state.testCreatorOpen = false;
+  // Restore canvas views
+  showAllCanvasViews?.();
+  if (state.testCreatorCanvasObserver) {
+    state.testCreatorCanvasObserver.disconnect();
+    state.testCreatorCanvasObserver = null;
+  }
+}
+
+// Wire up once on initial load
+function setupTestCreator() {
+  const openBtn = document.getElementById('open-test-creator');
+  const closeBtn = document.getElementById('test-creator-close');
+  const genBtn = document.getElementById('test-creator-generate');
+  const saveBtn = document.getElementById('test-creator-save');
+  const runBtn = document.getElementById('test-creator-run');
+  const openFolderBtn = document.getElementById('test-creator-open-folder');
+  const backdrop = document.querySelector('.test-creator__backdrop');
+  if (openBtn) openBtn.addEventListener('click', openTestCreator);
+  if (closeBtn) closeBtn.addEventListener('click', closeTestCreator);
+  if (backdrop) backdrop.addEventListener('click', closeTestCreator);
+  if (genBtn) genBtn.addEventListener('click', onTestCreatorGenerate);
+  if (saveBtn) saveBtn.addEventListener('click', onTestCreatorSave);
+  if (runBtn) runBtn.addEventListener('click', onTestCreatorSaveAndRun);
+  if (openFolderBtn) openFolderBtn.addEventListener('click', onTestCreatorOpenFolder);
+  // Allow Enter in the prompt textarea to trigger generate (with Cmd/Ctrl)
+  const promptEl = document.getElementById('test-creator-prompt');
+  if (promptEl) {
+    promptEl.addEventListener('keydown', (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+        e.preventDefault();
+        onTestCreatorGenerate();
+      }
+    });
+  }
+}
+
 // CANVAS STAGE
 // ============================================================================
 function renderCanvas() {
@@ -667,11 +1086,49 @@ function renderCanvas() {
   // transform applied via updateZoom() is lost. The artboard is
   // re-mounted with id="canvas-artboard"; re-apply zoom on the next
   // animation frame so the scale picks up before paint.
+  // Nuke every canvas WebContentsView in main.js before doing anything
+  // else. This catches two orphan scenarios:
+  //   1. Page.reload via CDP: renderer JS wipes the DOM but main.js's
+  //      canvasWebContentsViews map keeps the old views alive. The next
+  //      renderCanvas() has no DOM placeholders to find, so the per-view
+  //      teardown below is a no-op and the orphan WebContentsView keeps
+  //      compositing on top of whatever the new preview renders.
+  //      Long reported this Jul 11 ~17:09 ET — the Test View's 390x844
+  //      game canvas persisted across reload and overlapped Post View.
+  //   2. Async setup race: a view created via canvasCreateView resolves
+  //      AFTER teardown already ran, leaving an orphan view in the map
+  //      with no DOM placeholder referencing it. The previous setPreview
+  //      + preview-tab handlers call this for their own paths; centralizing
+  //      it here means every renderCanvas() catches it regardless of trigger.
+  // After this, teardownCanvasBrowserViews() is redundant (the IPC
+  // already destroyed every view) but harmless — it just disconnects
+  // per-placeholder ResizeObservers on the old DOM elements.
+  window.farnsworth?.canvasRemoveAllViews?.();
+  // Teardown any existing canvas BrowserViews BEFORE wiping the DOM —
+  // each placeholder stores its viewId on a data attribute so this is
+  // a single querySelectorAll + IPC round-trip. (Replaces the <webview>
+  // approach which couldn't propagate CSS-driven height changes to the
+  // inner viewport -- see teardownCanvasBrowserViews for the squish-bug
+  // history.)
+  teardownCanvasBrowserViews();
   const stage = $('#canvas-stage');
   const viewport = $('#canvas-viewport');
   stage.innerHTML = '';
   if (viewport) {
     viewport.classList.toggle('canvas__viewport--code', state.canvasMode === 'code');
+  }
+
+  // Post View is a DOM-only mock — the WebContentsView layers must be hidden
+  // so the iframe doesn't render on top of the Reddit post UI. This is the
+  // initial-load path: setPreview() only fires on user clicks, so without
+  // this branch renderCanvas() leaves the WebContentsView visible on first
+  // paint. Same compositing-layer fix as the cogwheel popover (Jul 10 ~11:52).
+  // Test View is the opposite: the game WebContentsView IS the canvas, so
+  // we must show it (not hide).
+  if (state.canvasMode === 'live' && state.preview === 'post') {
+    hideAllCanvasViews?.();
+  } else if (state.canvasMode === 'live') {
+    showAllCanvasViews?.();
   }
 
   if (state.canvasMode === 'live') {
@@ -728,6 +1185,14 @@ function renderCanvas() {
   // preview modes or resolution presets snaps back to 100%.
   requestAnimationFrame(() => updateZoom());
 
+  // Set up canvas BrowserViews for any [data-canvas-view] placeholders
+  // in the freshly-rendered artboard. BrowserView.setBounds() is set in
+  // the main process, so the inner viewport's dimensions match the
+  // placeholder's pixel rect from first paint -- no squish bug. The
+  // ResizeObserver inside setupCanvasBrowserViews() keeps bounds in
+  // sync on window resize / zoom / resolution preset changes.
+  requestAnimationFrame(() => setupCanvasBrowserViews());
+
   // Push canvas state to companion apps via the relay. The companion's
   // canvas viewer subscribes once on WS open; we re-push on every render
   // so the iframe in the companion stays in sync with Farnsworth's view.
@@ -750,7 +1215,7 @@ function captureCanvasState() {
       if (activeFile) {
         html = `<pre style="font-family:monospace;padding:20px;color:#ddd;background:#1e1e1e;">${escapeHtml(activeFile.content || '')}</pre>`;
       }
-    } else if (state.preview === 'mobile' || state.preview === 'desktop' || state.preview === 'fullscreen') {
+    } else if (state.preview === 'mobile' || state.preview === 'desktop' || state.preview === 'fullscreen' || state.preview === 'testview') {
       // Live game preview — use the dev server URL directly so the iframe
       // can render the actual game. Companion's iframe src points to this.
       const iframe = document.querySelector('#canvas-artboard iframe');
@@ -843,8 +1308,26 @@ function wireRelay() {
         state.canvasMode = args.mode;
         renderCanvas();
       } else if (name === 'setPreview' && args.preview) {
-        // Switch between post | mobile | desktop | fullscreen within live mode
+        // Switch between post | mobile | desktop | fullscreen | testview
+        // within live mode
+        // Nuke every canvas WebContentsView before changing preview --
+        // catches the async setup race (Jul 11 ~16:30 ET) where a view
+        // created via canvasCreateView resolves after teardown already
+        // ran, leaving an orphan view visible in the new preview.
+        window.farnsworth?.canvasRemoveAllViews?.();
         state.preview = args.preview;
+        // Post View is a DOM-only mock -- hide the WebContentsView layers so
+        // the iframe doesn't render on top of the Reddit post UI. Same pattern
+        // as the cogwheel popover fix (Jul 10 ~11:52 ET) and the test creator
+        // panel (Jul 11 04:22 ET) -- both call hideAllCanvasViews on open and
+        // showAllCanvasViews on close to keep WebContentsView behind any DOM
+        // overlay that overlaps the canvas region. Test View keeps the game
+        // canvas visible (the game IS the canvas surface for testing).
+        if (state.preview === 'post') {
+          hideAllCanvasViews?.();
+        } else {
+          showAllCanvasViews?.();
+        }
         renderCanvas();
       }
     } else if (t === 'canvas:subscribe') {
@@ -1328,7 +1811,11 @@ async function openDevvitUserMenu() {
 // devvit:upsert-user / devvit:upsert-subreddit.
 async function openDevvitConfig() {
   const existing = document.querySelector('.devvit-config-popover');
-  if (existing) { existing.remove(); return; }
+  if (existing) {
+    existing.remove();
+    showAllCanvasViews();
+    return;
+  }
 
   if (!state.folder || !window.farnsworth?.devvitListUsers) {
     showToast?.('Open a devvit workspace first.');
@@ -1406,11 +1893,24 @@ async function openDevvitConfig() {
     pop.style.right = Math.max(8, window.innerWidth - rect.right) + 'px';
   }
 
+  // Hide canvas WebContentsViews so the iframe doesn't cover the popover.
+  // CSS z-index doesn't apply to WebContentsViews — they're a separate
+  // composited layer rendered above the DOM. Hide them while the popover
+  // is open; restore on every close path below.
+  hideAllCanvasViews();
+  const closeAndRestore = () => {
+    pop.remove();
+    showAllCanvasViews();
+  };
+
   // Wire delete buttons.
   pop.querySelectorAll('[data-del-user]').forEach((btn) => {
     btn.addEventListener('click', async () => {
       const id = Number(btn.getAttribute('data-del-user'));
       await window.farnsworth.devvitDeleteUser(id);
+      // Re-open shows views first then re-hides — flicker is imperceptible
+      // but cleaner to keep them visible through the swap.
+      showAllCanvasViews();
       pop.remove();
       openDevvitConfig(); // re-render
     });
@@ -1419,6 +1919,7 @@ async function openDevvitConfig() {
     btn.addEventListener('click', async () => {
       const id = Number(btn.getAttribute('data-del-sub'));
       await window.farnsworth.devvitDeleteSubreddit(id);
+      showAllCanvasViews();
       pop.remove();
       openDevvitConfig(); // re-render
     });
@@ -1430,18 +1931,18 @@ async function openDevvitConfig() {
     if (!username) return;
     const reddit_id = prompt('Reddit id (e.g. t2_alice99):') || `t2_${username.replace(/[^a-z0-9]/gi, '').toLowerCase()}_${Date.now().toString(36).slice(-4)}`;
     window.farnsworth.devvitUpsertUser({ reddit_id, username, link_karma: 0, comment_karma: 0, is_employee: 0 })
-      .then(() => { pop.remove(); openDevvitConfig(); });
+      .then(() => { showAllCanvasViews(); pop.remove(); openDevvitConfig(); });
   });
   pop.querySelector('#devvit-config-add-sub')?.addEventListener('click', () => {
     const name = prompt('New subreddit name (e.g. r/foo):');
     if (!name) return;
     const reddit_id = prompt('Reddit id (e.g. t5_foo01):') || `t5_${name.replace(/[^a-z0-9]/gi, '').toLowerCase()}_${Date.now().toString(36).slice(-4)}`;
     window.farnsworth.devvitUpsertSubreddit({ reddit_id, name, type: 'public', member_count: 0 })
-      .then(() => { pop.remove(); openDevvitConfig(); });
+      .then(() => { showAllCanvasViews(); pop.remove(); openDevvitConfig(); });
   });
 
   // Cancel closes.
-  pop.querySelector('#devvit-config-cancel')?.addEventListener('click', () => pop.remove());
+  pop.querySelector('#devvit-config-cancel')?.addEventListener('click', closeAndRestore);
 
   // Save & reload — writes active selection, restarts dev server.
   pop.querySelector('#devvit-config-save')?.addEventListener('click', async () => {
@@ -1451,6 +1952,7 @@ async function openDevvitConfig() {
     try {
       await window.farnsworth.devvitSetProjectSettings(state.folder, userId, subId);
       pop.remove();
+      showAllCanvasViews();
       showToast?.('Devvit config saved. Restarting dev server…');
       await stopFarnsworthDev();
       await bootFarnsworthDev();
@@ -1464,11 +1966,34 @@ async function openDevvitConfig() {
     const onClick = (e) => {
       if (!pop.contains(e.target) && e.target !== anchor) {
         pop.remove();
+        showAllCanvasViews();
         document.removeEventListener('click', onClick);
       }
     };
     document.addEventListener('click', onClick);
   }, 0);
+}
+
+// Hide every canvas WebContentsView so overlays (cogwheel popover, modals)
+// don't get visually covered by the iframe behind them.
+function hideAllCanvasViews() {
+  document.querySelectorAll('[data-canvas-view-id]').forEach((el) => {
+    const viewId = el.dataset.canvasViewId;
+    if (viewId && window.farnsworth?.canvasSetVisible) {
+      window.farnsworth.canvasSetVisible(viewId, false);
+    }
+  });
+}
+
+// Restore visibility of every canvas WebContentsView (called from every
+// close path of openDevvitConfig).
+function showAllCanvasViews() {
+  document.querySelectorAll('[data-canvas-view-id]').forEach((el) => {
+    const viewId = el.dataset.canvasViewId;
+    if (viewId && window.farnsworth?.canvasSetVisible) {
+      window.farnsworth.canvasSetVisible(viewId, true);
+    }
+  });
 }
 
 // Boots the dev server for the open workspace's app type, then re-detects and
@@ -1529,7 +2054,8 @@ function renderLivePreview() {
   const cls = state.preview === 'post'
     ? 'artboard--post'
     : (state.preview === 'mobile' ? 'artboard--mobile'
-      : (state.preview === 'fullscreen' ? 'artboard--fullscreen' : 'artboard--desktop'));
+      : (state.preview === 'fullscreen' ? 'artboard--fullscreen'
+        : (state.preview === 'testview' ? 'artboard--testview' : 'artboard--desktop')));
   const wrap = el('div', { class: 'artboard ' + cls, id: 'canvas-artboard' });
 
   // Apply persisted width; height is derived from aspect ratio on mobile/desktop
@@ -1553,6 +2079,9 @@ function renderLivePreview() {
   else if (state.preview === 'desktop') wrap.style.height = (customH || (initialW * 596 / 724)) + 'px';
   // Fullscreen — larger, immersive 16:9 game canvas with no action bar.
   else if (state.preview === 'fullscreen') wrap.style.height = (customH || (initialW * 9 / 16)) + 'px';
+  // Test View — split layout with phone-sized game canvas on the left
+  // (390×844 mobile aspect) + test runner panel on the right.
+  else if (state.preview === 'testview') wrap.style.height = (customH || 844) + 'px';
 
   // Artboard frame
   const frame = el('div', { class: 'artboard__frame' });
@@ -1568,6 +2097,8 @@ function renderLivePreview() {
     label.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>Frame · Post View';
   } else if (state.preview === 'fullscreen') {
     label.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M8 21H5a2 2 0 0 1-2-2v-3M16 21h3a2 2 0 0 0 2-2v-3"/></svg>Frame · Fullscreen';
+  } else if (state.preview === 'testview') {
+    label.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2v6L4 18a2 2 0 0 0 1.7 3h12.6a2 2 0 0 0 1.7-3L15 8V2M9 2h6M9 14h6"/></svg>Frame · Test View';
   } else {
     label.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/></svg>Frame · Matchmaking';
   }
@@ -1588,6 +2119,7 @@ function renderLivePreview() {
       if (state.preview === 'mobile') h = w * 844 / 390;
       else if (state.preview === 'desktop') h = w * 596 / 724;
       else if (state.preview === 'fullscreen') h = w * 9 / 16;
+      else if (state.preview === 'testview') h = 844;
       else h = w;
     }
     size.textContent = Math.round(w) + ' × ' + Math.round(h);
@@ -1598,6 +2130,7 @@ function renderLivePreview() {
   if (state.preview === 'post') wrap.appendChild(renderPostView());
   else if (state.preview === 'mobile') wrap.appendChild(renderPhone());
   else if (state.preview === 'fullscreen') wrap.appendChild(renderFullscreen());
+  else if (state.preview === 'testview') wrap.appendChild(renderTestView());
   else wrap.appendChild(renderDesktop());
 
   // Wire up corner drag (after body so getBoundingClientRect reflects final layout)
@@ -1622,6 +2155,10 @@ function renderLivePreview() {
       ? initialW * 844 / 390
       : initialW * 596 / 724);
     requestAnimationFrame(() => calibrateArtboardToInner(wrap, mode, targetInnerW, targetInnerH));
+  } else if (state.preview === 'testview') {
+    // Test View: the phone-sized game canvas inside has the same inner
+    // calibration as mobile (390×844). Reuse the calibrate helper.
+    requestAnimationFrame(() => calibrateArtboardToInner(wrap, 'mobile', 390, 844));
   }
 
   return wrap;
@@ -1812,18 +2349,20 @@ function renderPostView() {
     || 'Strange Mild Japanese Katsu Curry';
   content.appendChild(title);
 
-  // Flair (Level 21-40)
-  const flair = el('div', { class: 'post-view__flair' });
-  flair.textContent = 'Level 21-40';
-  content.appendChild(flair);
+  
 
   // Game embed — real Sword & Supper Devvit iframe screenshot (732×512)
   // captured from the live Reddit post on Jun 26 ~12:24 ET.
   // Replaces the earlier CSS-art mock with the actual game scene.
   // Jul 2: when `npm run farnsworth` is running (state.farnsworthDev.available),
-  // the static background-image is overlaid with a live iframe pointing at
+  // the static background-image was overlaid with a live iframe pointing at
   // the dev server's splash.tsx render (?view=post). Background-image stays
   // as the fallback when farnsworth isn't available.
+  // Jul 11 ~14:42 ET: the-last-draft doesn't have a splash.tsx — loading
+  // ?view=post renders the full game UI which overflows the 732×512 embed
+  // area and visually overlays the Reddit post. Skip the iframe for
+  // lastdraft (or any project without a compact splash view); the static
+  // background-image still shows the embed look.
   const embed = el('div', { class: 'post-view__embed' });
   if (state.farnsworthDev?.available) {
     embed.appendChild(el('iframe', {
@@ -1918,14 +2457,14 @@ function renderPhone() {
       <div class="phone__appbar-close">
         <svg viewBox="0 0 20 20" fill="currentColor" width="18" height="18"><path d="M14.7 5.3a1 1 0 010 1.4L11.4 10l3.3 3.3a1 1 0 11-1.4 1.4L10 11.4l-3.3 3.3a1 1 0 11-1.4-1.4L8.6 10 5.3 6.7a1 1 0 011.4-1.4L10 8.6l3.3-3.3a1 1 0 011.4 0z"/></svg>
       </div>
-      <div class="phone__appbar-title">Daily Dungeon: Friday, June 26, 2026</div>
+      <div class="phone__appbar-title">${(state.liveConfig?.projectName && state.liveConfig.projectName.trim()) || ''}</div>
       <div class="phone__appbar-more">
         <svg viewBox="0 0 20 20" fill="currentColor" width="18" height="18"><circle cx="5" cy="10" r="1.4"/><circle cx="10" cy="10" r="1.4"/><circle cx="15" cy="10" r="1.4"/></svg>
       </div>
     </div>
     <div class="phone__screen">
       ${state.farnsworthDev?.available
-        ? `<iframe class="phone__screen-iframe" src="${state.farnsworthDev.url}/?view=mobile" title="Live mobile preview"></iframe>`
+        ? `<div class="phone__screen-iframe phone__screen-browser-view" data-canvas-view="mobile" data-canvas-url="${state.farnsworthDev.url}/?view=mobile" style="width:100%;height:100%;display:block;background:#000"></div>`
         : `<img src="src/assets/reddit/swordandsuppermobile.png" alt="Sword & Supper game" />`}
     </div>
     <div class="phone__actions">
@@ -1961,7 +2500,7 @@ function renderDesktop() {
   const d = el('div', { class: 'desktop' });
   d.innerHTML = `
     <div class="desktop__titlebar">
-      <div class="desktop__title">Daily Dungeon: Friday, June 26, 2026</div>
+      <div class="desktop__title">${(state.liveConfig?.projectName && state.liveConfig.projectName.trim()) || ''}</div>
       <div class="desktop__controls">
         <button class="desktop__control desktop__control--dots"><svg viewBox="0 0 20 20" fill="currentColor" width="14" height="14"><circle cx="5" cy="10" r="1.4"/><circle cx="10" cy="10" r="1.4"/><circle cx="15" cy="10" r="1.4"/></svg></button>
         <button class="desktop__control desktop__control--fs"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" width="14" height="14"><path d="M3 8V4h4M17 8V4h-4M3 12v4h4M17 12v4h-4"/></svg></button>
@@ -1970,7 +2509,7 @@ function renderDesktop() {
     </div>
     <div class="desktop__stage">
       ${state.farnsworthDev?.available
-        ? `<iframe class="desktop__stage-iframe" src="${state.farnsworthDev.url}/?view=desktop" title="Live desktop preview"></iframe>`
+        ? `<div class="desktop__stage-iframe desktop__stage-browser-view" data-canvas-view="desktop" data-canvas-url="${state.farnsworthDev.url}/?view=desktop" style="width:100%;height:100%;display:block;background:#000"></div>`
         : `<img src="src/assets/reddit/swordandsuppermobile.png" alt="Sword & Supper game" />`}
     </div>
     <div class="desktop__actions">
@@ -2006,7 +2545,7 @@ function renderFullscreen() {
   const f = el('div', { class: 'fullscreen' });
   f.innerHTML = `
     <div class="fullscreen__titlebar">
-      <div class="fullscreen__title">Daily Dungeon: Friday, June 26, 2026</div>
+      <div class="fullscreen__title">${(state.liveConfig?.projectName && state.liveConfig.projectName.trim()) || ''}</div>
       <div class="fullscreen__controls">
         <button class="fullscreen__control fullscreen__control--min"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" width="14" height="14"><path d="M4 10h12"/></svg></button>
         <button class="fullscreen__control fullscreen__control--exit"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" width="14" height="14"><path d="M8 3H5a2 2 0 0 0-2 2v3M15 3h2a2 2 0 0 1 2 2v3M8 17H5a2 2 0 0 1-2-2v-3M15 17h2a2 2 0 0 0 2-2v-3"/></svg></button>
@@ -2015,11 +2554,397 @@ function renderFullscreen() {
     </div>
     <div class="fullscreen__stage">
       ${state.farnsworthDev?.available
-        ? `<iframe class="fullscreen__stage-iframe" src="${state.farnsworthDev.url}/?view=desktop" title="Live fullscreen preview"></iframe>`
+        ? `<div class="fullscreen__stage-iframe fullscreen__stage-browser-view" data-canvas-view="fullscreen" data-canvas-url="${state.farnsworthDev.url}/?view=desktop" style="width:100%;height:100%;display:block;background:#000"></div>`
         : `<img src="src/assets/reddit/swordandsuppermobile.png" alt="Sword & Supper game" />`}
     </div>
   `;
   return f;
+}
+
+// Test View — split layout with phone-sized game canvas on the left and a
+// test runner panel on the right. The game canvas is a WebContentsView
+// pointing at the dev server (?view=mobile); the test runner lists all
+// JSON tests in ~/Documents/farnsworth-tests/tests/, has per-test Run
+// buttons, an output panel showing stdout/stderr from the last run, and a
+// Reset Game button that reloads the WebContentsView to a fresh game
+// instance. Tests target the WebContentsView's CDP target directly via
+// python3 farnsworth-test.py.
+function renderTestView() {
+  const wrap = el('div', { class: 'testview' });
+
+  // Left: phone-frame game canvas (390x844) hosting the live game.
+  const game = el('div', { class: 'testview__game' });
+  const phone = el('div', { class: 'phone testview__phone' });
+  phone.innerHTML = `
+    <div class="phone__statusbar">
+      <div class="phone__statusbar-time">12:24</div>
+      <div class="phone__statusbar-right">
+        <svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14"><path d="M12 18a2 2 0 002-2H10a2 2 0 002 2zm6-6V9a6 6 0 10-12 0v3H4v8h16v-8h-2z"/></svg>
+        <svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14"><path d="M2 18h2v-6H2v6zm4 0h2V8H6v10zm4 0h2v-4h-2v4zm4 0h2V4h-2v14zm4 0h2v-2h-2v2z"/></svg>
+        <svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14"><path d="M15.67 4H14V2h-4v2H8.33C7.6 4 7 4.6 7 5.33v15.33C7 21.4 7.6 22 8.33 22h7.33c.74 0 1.34-.6 1.34-1.33V5.33C17 4.6 16.4 4 15.67 4zM13 21h-2v-1h2v1zm0-3h-2V6h2v12z"/></svg>
+      </div>
+    </div>
+    <div class="phone__appbar">
+      <div class="phone__appbar-close">
+        <svg viewBox="0 0 20 20" fill="currentColor" width="18" height="18"><path d="M14.7 5.3a1 1 0 010 1.4L11.4 10l3.3 3.3a1 1 0 11-1.4 1.4L10 11.4l-3.3 3.3a1 1 0 11-1.4-1.4L8.6 10 5.3 6.7a1 1 0 011.4-1.4L10 8.6l3.3-3.3a1 1 0 011.4 0z"/></svg>
+      </div>
+      <div class="phone__appbar-title">${(state.liveConfig?.projectName && state.liveConfig.projectName.trim()) || ''}</div>
+      <div class="phone__appbar-more">
+        <svg viewBox="0 0 20 20" fill="currentColor" width="18" height="18"><circle cx="5" cy="10" r="1.4"/><circle cx="10" cy="10" r="1.4"/><circle cx="15" cy="10" r="1.4"/></svg>
+      </div>
+    </div>
+    <div class="phone__screen">
+      ${state.farnsworthDev?.available
+        ? `<div class="phone__screen-iframe phone__screen-browser-view" data-canvas-view="mobile" data-canvas-url="${state.farnsworthDev.url}/?view=mobile" style="width:100%;height:100%;display:block;background:#000"></div>`
+        : `<div class="testview__no-dev">Start \`npm run farnsworth\` in the project to load a game.</div>`}
+    </div>
+  `;
+  game.appendChild(phone);
+  wrap.appendChild(game);
+
+  // Right: test runner panel.
+  const panel = el('div', { class: 'testview__panel' });
+
+  // Header with title + actions (+ New, Refresh, Reset Game).
+  // + New opens the editor in 'new' mode; the standalone NLP test creator
+  // modal that used to live in the canvas overlay bar (Jul 10 ~23:50 ET)
+  // was removed when Long asked to combine test building features into
+  // Test View (Jul 11 ~16:42 ET).
+  const head = el('div', { class: 'testview__panel-head' });
+  head.innerHTML = `
+    <div class="testview__panel-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2v6L4 18a2 2 0 0 0 1.7 3h12.6a2 2 0 0 0 1.7-3L15 8V2M9 2h6M9 14h6"/></svg>
+      Tests
+    </div>
+    <div class="testview__panel-actions">
+      <button class="testview__btn testview__btn--accent" id="testview-new" title="Create a new test (or generate from description)">+ New</button>
+      <button class="testview__btn testview__btn--ghost" id="testview-refresh" title="Re-list tests from ~/Documents/farnsworth-tests/tests/">Refresh</button>
+      <button class="testview__btn testview__btn--primary" id="testview-reset-game" title="Reload the game WebContentsView to a fresh instance">Reset Game</button>
+    </div>
+  `;
+  panel.appendChild(head);
+
+  // Test list — populated by loadTestViewTests() (async). Each row has
+  // Run / Edit / × buttons. Edit opens the editor in 'edit' mode; ×
+  // confirms and calls test:delete.
+  const list = el('div', { class: 'testview__list' });
+  list.id = 'testview-list';
+  list.innerHTML = '<div class="testview__list-empty">Loading tests…</div>';
+  panel.appendChild(list);
+
+  // Editor section — toggles open when + New or Edit is clicked. Hidden
+  // by default. Holds: name input + description (optional, for NLP
+  // generate) + JSON textarea + Save / Save & Run / Cancel buttons. Replaces
+  // the standalone NLP test creator modal (deprecated Jul 11 ~16:42 ET).
+  const editor = el('div', { class: 'testview__editor', id: 'testview-editor', hidden: true });
+  editor.innerHTML = `
+    <div class="testview__editor-head">
+      <span class="testview__editor-title" id="testview-editor-title">Edit test</span>
+      <button class="testview__editor-close" id="testview-editor-close" aria-label="Close editor" title="Close editor">×</button>
+    </div>
+    <div class="testview__editor-body">
+      <label class="testview__editor-label">Test name</label>
+      <input type="text" class="testview__editor-input" id="testview-editor-name" placeholder="my-test-name" spellcheck="false" />
+
+      <details class="testview__editor-generate-section">
+        <summary class="testview__editor-generate-toggle">Generate from description (optional, uses LLM)</summary>
+        <textarea class="testview__editor-desc" id="testview-editor-desc" rows="2" placeholder="e.g. Click PLAY, dismiss welcome, screenshot lobby"></textarea>
+        <button class="testview__btn testview__btn--ghost" id="testview-editor-generate">Generate</button>
+      </details>
+
+      <label class="testview__editor-label">JSON</label>
+      <textarea class="testview__editor-json" id="testview-editor-json" rows="14" spellcheck="false" placeholder='{"name": "my-test", "steps": [{"action": "reload"}]}'></textarea>
+
+      <div class="testview__editor-status" id="testview-editor-status"></div>
+
+      <div class="testview__editor-actions">
+        <button class="testview__btn testview__btn--primary" id="testview-editor-save">Save</button>
+        <button class="testview__btn testview__btn--accent" id="testview-editor-save-run">Save & Run</button>
+        <button class="testview__btn testview__btn--ghost" id="testview-editor-cancel">Cancel</button>
+      </div>
+    </div>
+  `;
+  panel.appendChild(editor);
+
+  // Output panel — populated by runTestViewTest() (async).
+  const output = el('div', { class: 'testview__output' });
+  output.id = 'testview-output';
+  output.innerHTML = '<div class="testview__output-empty">Select a test above and click Run. Output appears here.</div>';
+  panel.appendChild(output);
+
+  wrap.appendChild(panel);
+
+  // Wire up the buttons + populate the test list. Defer to next frame so
+  // the DOM is in place before handlers attach.
+  requestAnimationFrame(() => {
+    const refreshBtn = panel.querySelector('#testview-refresh');
+    const resetBtn = panel.querySelector('#testview-reset-game');
+    const newBtn = panel.querySelector('#testview-new');
+    if (refreshBtn) refreshBtn.addEventListener('click', () => {
+      closeTestViewEditor(panel);
+      loadTestViewTests(panel);
+    });
+    if (resetBtn) resetBtn.addEventListener('click', () => resetTestViewGame(wrap));
+    if (newBtn) newBtn.addEventListener('click', () => openTestViewEditor(panel, 'new'));
+
+    // Editor button handlers
+    const editorCloseBtn = panel.querySelector('#testview-editor-close');
+    const editorCancelBtn = panel.querySelector('#testview-editor-cancel');
+    const editorSaveBtn = panel.querySelector('#testview-editor-save');
+    const editorSaveRunBtn = panel.querySelector('#testview-editor-save-run');
+    const editorGenerateBtn = panel.querySelector('#testview-editor-generate');
+    if (editorCloseBtn) editorCloseBtn.addEventListener('click', () => closeTestViewEditor(panel));
+    if (editorCancelBtn) editorCancelBtn.addEventListener('click', () => closeTestViewEditor(panel));
+    if (editorSaveBtn) editorSaveBtn.addEventListener('click', () => saveTestViewEditor(panel));
+    if (editorSaveRunBtn) editorSaveRunBtn.addEventListener('click', () => saveAndRunTestViewEditor(panel));
+    if (editorGenerateBtn) editorGenerateBtn.addEventListener('click', () => generateTestViewEditor(panel));
+
+    loadTestViewTests(panel);
+  });
+
+  return wrap;
+}
+
+// Populate the test list by calling window.farnsworth.testList() (test:list IPC).
+// Re-renders the list rows on every call. Each row has Run / Edit / × buttons.
+// Pass state.folder so the IPC resolves to <folder>/.farnsworth/devvit-tests/
+// (per-project test location, Jul 11 ~18:38 ET).
+async function loadTestViewTests(panel) {
+  const list = panel.querySelector('#testview-list');
+  if (!list) return;
+  const result = await window.farnsworth?.testList?.({ folder: state.folder });
+  if (!result || !result.ok) {
+    // Surface a hint when there's no active folder — Test View needs
+    // a project root to resolve the per-project tests dir
+    // (<folder>/.farnsworth/devvit-tests/). Jul 11 ~18:38 ET.
+    if (result.error === 'no_folder') {
+      list.innerHTML = '<div class="testview__list-empty">Pick a folder first. Tests live at <code>&lt;project&gt;/.farnsworth/devvit-tests/</code>.</div>';
+      return;
+    }
+    list.innerHTML = `<div class="testview__list-empty">Failed to list tests: ${result?.error || 'unknown'}</div>`;
+    return;
+  }
+  if (!result.tests || result.tests.length === 0) {
+    const dir = result.dir || `${state.folder || '<folder>'}/.farnsworth/devvit-tests/`;
+    list.innerHTML = `<div class="testview__list-empty">No tests found in <code>${dir}</code>. Click + New to create one.</div>`;
+    return;
+  }
+  list.innerHTML = '';
+  for (const t of result.tests) {
+    const row = el('div', { class: 'testview__test-row', 'data-test-path': t.path });
+    row.innerHTML = `
+      <div class="testview__test-info">
+        <div class="testview__test-name">${t.name}.json</div>
+        <div class="testview__test-meta">${t.size} bytes · ${new Date(t.modified).toLocaleString()}</div>
+      </div>
+      <div class="testview__test-actions">
+        <button class="testview__btn testview__btn--primary testview__test-run" data-test-path="${t.path}" title="Run this test">Run</button>
+        <button class="testview__btn testview__btn--ghost testview__test-edit" data-test-name="${t.name}" title="Edit JSON in the inline editor">Edit</button>
+        <button class="testview__btn testview__btn--danger testview__test-delete" data-test-name="${t.name}" title="Delete this test">×</button>
+      </div>
+    `;
+    row.querySelector('.testview__test-run').addEventListener('click', () => runTestViewTest(panel, t));
+    row.querySelector('.testview__test-edit').addEventListener('click', () => openTestViewEditor(panel, 'edit', t.name));
+    row.querySelector('.testview__test-delete').addEventListener('click', () => deleteTestViewTest(panel, t.name));
+    list.appendChild(row);
+  }
+}
+
+// Open the inline editor in 'new' or 'edit' mode. In 'edit' mode, reads
+// the JSON from disk via test:read and populates the fields. In 'new'
+// mode, leaves them empty for the user to fill in.
+async function openTestViewEditor(panel, mode, testName) {
+  const editor = panel.querySelector('#testview-editor');
+  if (!editor) return;
+  const titleEl = editor.querySelector('#testview-editor-title');
+  const nameEl = editor.querySelector('#testview-editor-name');
+  const jsonEl = editor.querySelector('#testview-editor-json');
+  const descEl = editor.querySelector('#testview-editor-desc');
+  const statusEl = editor.querySelector('#testview-editor-status');
+
+  editor.dataset.mode = mode;
+  editor.dataset.originalName = testName || '';
+
+  if (mode === 'edit') {
+    titleEl.textContent = `Edit: ${testName}.json`;
+    statusEl.textContent = 'Loading...';
+    statusEl.className = 'testview__editor-status';
+    editor.hidden = false;
+
+    const res = await window.farnsworth?.testRead?.({ folder: state.folder, name: testName });
+    if (!res?.ok) {
+      statusEl.textContent = `Failed to read: ${res?.error || 'unknown'}`;
+      statusEl.className = 'testview__editor-status is-error';
+      return;
+    }
+    nameEl.value = res.name;
+    jsonEl.value = res.json;
+    descEl.value = '';
+    statusEl.textContent = '';
+    statusEl.className = 'testview__editor-status';
+  } else {
+    titleEl.textContent = 'New test';
+    nameEl.value = '';
+    jsonEl.value = '';
+    descEl.value = '';
+    statusEl.textContent = 'Type a description and click Generate, or write JSON directly.';
+    statusEl.className = 'testview__editor-status is-hint';
+    editor.hidden = false;
+    setTimeout(() => nameEl.focus(), 50);
+  }
+}
+
+function closeTestViewEditor(panel) {
+  const editor = panel.querySelector('#testview-editor');
+  if (editor) editor.hidden = true;
+}
+
+// Validate + save the editor's JSON via test:save. On success, refreshes
+// the list and returns {name, path}. On failure, shows the error in the
+// status line and returns null.
+async function saveTestViewEditor(panel) {
+  const editor = panel.querySelector('#testview-editor');
+  const nameEl = editor.querySelector('#testview-editor-name');
+  const jsonEl = editor.querySelector('#testview-editor-json');
+  const statusEl = editor.querySelector('#testview-editor-status');
+
+  const name = nameEl.value.trim();
+  const json = jsonEl.value.trim();
+
+  if (!name) {
+    statusEl.textContent = 'Name required.';
+    statusEl.className = 'testview__editor-status is-error';
+    return null;
+  }
+  if (!json) {
+    statusEl.textContent = 'JSON required.';
+    statusEl.className = 'testview__editor-status is-error';
+    return null;
+  }
+  try { JSON.parse(json); } catch (e) {
+    statusEl.textContent = 'Invalid JSON: ' + e.message;
+    statusEl.className = 'testview__editor-status is-error';
+    return null;
+  }
+
+  statusEl.textContent = 'Saving...';
+  statusEl.className = 'testview__editor-status';
+
+  const res = await window.farnsworth?.testSave?.({ folder: state.folder, name, json });
+  if (!res?.ok) {
+    statusEl.textContent = 'Save failed: ' + (res?.error || 'unknown');
+    statusEl.className = 'testview__editor-status is-error';
+    return null;
+  }
+
+  statusEl.textContent = `Saved to ${res.path}`;
+  statusEl.className = 'testview__editor-status is-success';
+
+  await loadTestViewTests(panel);
+
+  return { ok: true, name: res.name, path: res.path };
+}
+
+// Save + run in one flow. The 'Save & Run' button. After a successful
+// save, runs the test and streams output into the output panel, then
+// closes the editor.
+async function saveAndRunTestViewEditor(panel) {
+  const result = await saveTestViewEditor(panel);
+  if (!result) return;
+  await runTestViewTest(panel, { name: result.name, path: result.path });
+  closeTestViewEditor(panel);
+}
+
+// Delete a test via test:delete IPC. Confirms first via browser confirm.
+// If the deleted test was being edited, closes the editor too.
+async function deleteTestViewTest(panel, testName) {
+  if (!confirm(`Delete ${testName}.json? This cannot be undone.`)) return;
+  const res = await window.farnsworth?.testDelete?.({ folder: state.folder, name: testName });
+  if (!res?.ok) {
+    alert(`Delete failed: ${res?.error || 'unknown'}`);
+    return;
+  }
+  await loadTestViewTests(panel);
+  const editor = panel.querySelector('#testview-editor');
+  if (editor && !editor.hidden && editor.dataset.originalName === testName) {
+    closeTestViewEditor(panel);
+  }
+}
+
+// Generate JSON from a plain-English description via the NLP helper
+// (TEST_CREATOR_SYSTEM_PROMPT + generateTestFromNLP). Reuses the LLM
+// + keyword-fallback path from the now-deprecated standalone test
+// creator modal — the description input + Generate button inside the
+// inline editor preserve the ability to bootstrap new tests from
+// English without needing to leave Test View.
+async function generateTestViewEditor(panel) {
+  const editor = panel.querySelector('#testview-editor');
+  const descEl = editor.querySelector('#testview-editor-desc');
+  const jsonEl = editor.querySelector('#testview-editor-json');
+  const nameEl = editor.querySelector('#testview-editor-name');
+  const statusEl = editor.querySelector('#testview-editor-status');
+
+  const description = descEl.value.trim();
+  if (!description) {
+    statusEl.textContent = 'Type a description first.';
+    statusEl.className = 'testview__editor-status is-error';
+    return;
+  }
+
+  statusEl.textContent = 'Generating...';
+  statusEl.className = 'testview__editor-status';
+
+  const result = await generateTestFromNLP(description);
+  if (!result.ok) {
+    statusEl.textContent = 'Generation failed.';
+    statusEl.className = 'testview__editor-status is-error';
+    return;
+  }
+
+  jsonEl.value = JSON.stringify(result.json, null, 2);
+  if (!nameEl.value.trim()) nameEl.value = result.json.name || deriveTestName(description);
+  statusEl.textContent = result.source === 'llm' ? 'Generated via LLM (editable).' : 'Generated via keyword fallback (LLM unavailable).';
+  statusEl.className = 'testview__editor-status is-success';
+}
+
+// Run a single test, stream output into the output panel.
+async function runTestViewTest(panel, t) {
+  const output = panel.querySelector('#testview-output');
+  if (!output) return;
+  output.innerHTML = `<div class="testview__output-header">▶ Running ${t.name}.json…</div><pre class="testview__output-pre"></pre>`;
+  const pre = output.querySelector('.testview__output-pre');
+  const result = await window.farnsworth?.testRun?.({ path: t.path });
+  if (!result) {
+    pre.textContent = 'Test runner IPC failed (no response from main).';
+    return;
+  }
+  const status = result.ok ? 'PASS' : (result.failed > 0 ? `FAIL (${result.failed} failed)` : 'ERROR');
+  pre.textContent = `Exit ${result.code ?? '?'} · ${status}\n\n--- stdout ---\n${result.stdout || '(empty)'}\n\n--- stderr ---\n${result.stderr || '(empty)'}`;
+  output.querySelector('.testview__output-header').innerHTML = `▶ ${t.name}.json · ${status}`;
+}
+
+// Reset the game WebContentsView by re-calling canvasCreateView with the same
+// viewId (main.js handler reloads the URL in place, which resets the game's
+// React state to initial). Triggered by the Reset Game button.
+function resetTestViewGame(wrap) {
+  const placeholder = wrap.querySelector('[data-canvas-view="mobile"]');
+  if (!placeholder || !placeholder.dataset.canvasViewId) {
+    // View not yet created (farnsworth dev not available, or createView in flight).
+    return;
+  }
+  const viewId = placeholder.dataset.canvasViewId;
+  const url = placeholder.dataset.canvasUrl;
+  const rect = placeholder.getBoundingClientRect();
+  // call canvasCreateView with same viewId — main.js will reload the URL in place.
+  window.farnsworth?.canvasCreateView?.(viewId, url, {
+    x: rect.left, y: rect.top, width: rect.width, height: rect.height,
+  });
+  // Visual feedback in the output panel.
+  const panel = wrap.querySelector('.testview__panel');
+  const output = panel?.querySelector('#testview-output');
+  if (output) {
+    output.innerHTML = `<div class="testview__output-header">⟳ Game reset</div><div class="testview__output-empty">Game WebContentsView reloaded. Previous test state cleared.</div>`;
+  }
 }
 
 function renderStorybook() {
@@ -4489,11 +5414,16 @@ function openSettings(page) {
   if (page && typeof page === 'string') state.settingsPage = page;
   state.settingsOpen = true;
   $('#settings-overlay').hidden = false;
+  // WebContentsView composites ABOVE the DOM — z-index can't put the
+  // settings overlay on top of the canvas preview (same layer bug as the
+  // Devvit config popover, Jul 10). Hide views while settings is open.
+  hideAllCanvasViews();
   renderSettings();
 }
 function closeSettings() {
   state.settingsOpen = false;
   $('#settings-overlay').hidden = true;
+  showAllCanvasViews();
 }
 
 function renderSettings() {
@@ -4530,6 +5460,17 @@ function renderAISettings() {
         <span class="model-dropdown__dot"></span>
         ${s.defaultModel.replace(' High', '')}
         ${s.defaultModel.includes('High') ? '<span class="model-dropdown__tier">High</span>' : ''}
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#80848e" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="margin-left:14px;"><path d="M6 9l6 6 6-6"/></svg>
+      </button>
+    </div>
+
+    <div class="settings-section">
+      <div class="settings-section__title">Testing model</div>
+      <div class="settings-section__desc">Used by test-runner <code>llm-step</code> visual checks unless a step's <code>model</code> field overrides it. Smaller = faster steps; Haiku is usually enough for YES/NO screenshot judgments.</div>
+      <button class="model-dropdown" id="ai-testing-model-btn">
+        <span class="model-dropdown__dot"></span>
+        ${(s.testingModel || 'Sonnet 5').replace(' High', '')}
+        ${(s.testingModel || '').includes('High') ? '<span class="model-dropdown__tier">High</span>' : ''}
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#80848e" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="margin-left:14px;"><path d="M6 9l6 6 6-6"/></svg>
       </button>
     </div>
@@ -4719,18 +5660,40 @@ function renderMemorySettings() {
     <div style="margin-bottom:22px;">
       <div style="display:flex;align-items:center;gap:9px;">
         <div class="settings-page__title">Memory</div>
-        <span class="settings-pill settings-pill--v23">V2 + V3</span>
+        <span class="settings-pill settings-pill--v23">TIER 3 · LIVE</span>
       </div>
-      <div class="settings-page__sub">The memory pipeline, one model per stage. Cheap models run every turn; correctness-critical stages run on Balanced.</div>
+      <div class="settings-page__sub">Five-stage pipeline over the SQLite store. Every-turn stages (extraction, router, section selector) run on a cheap model; consolidation and recall re-ranking run on a stronger one. Every stage degrades to its non-model fallback when disabled.</div>
     </div>
   `;
-  wrap.appendChild(makeMemoryStage(1, 'Extraction', m.extraction, 'Runs after each turn. Scans the conversation and decides what\'s worth remembering.',
-    ['Corrections', 'Preferences', 'Decisions']));
-  wrap.appendChild(makeMemoryStage(2, 'Consolidation', m.consolidation, 'Merges and deduplicates so the corpus doesn\'t bloat.', null, true));
-  wrap.appendChild(makeMemoryStage(3, 'Retrieval', m.retrieval, 'Runs when the assistant calls recall. Pulls relevant memories into context.'));
-  wrap.appendChild(makeMemoryStage(4, 'Memory Router', m.router, 'Picks which concept buckets to inject next turn. Keeps context bounded as the corpus grows.'));
-  wrap.appendChild(makeMemoryStage(5, 'Memory V3 · L2 Selector', m.l2selector, 'Once a topic-tree leaf is opened, selects the relevant pages inside it. Stage two of two.'));
-  wrap.appendChild(makeMemoryStageV2(6, m.v2migration));
+  wrap.appendChild(makeMemoryStage(1, 'Extraction', 'extraction', m.extraction,
+    'Runs after each turn. Distills the exchange into one-line durable facts before they enter the buffer; the raw turn always lands in the daily archive. Disabled: raw text is buffered unfiltered.'));
+  wrap.appendChild(makeMemoryStage(2, 'Consolidation', 'consolidation', m.consolidation,
+    'Merges buffered facts into concept articles (appending under section headings), promotes identity-level facts to essentials, drops noise. Runs on the schedule, at the buffer threshold, or manually. Disabled: consolidate just flips buffer flags.'));
+  wrap.appendChild(makeMemoryStage(3, 'Retrieval', 'retrieval', m.retrieval,
+    'Re-ranks recall results (concepts + sections) by relevance when memory is searched. Disabled: raw FTS5 order.'));
+  wrap.appendChild(makeMemoryStage(4, 'Memory Router', 'router', m.router,
+    'Every turn: picks which concept articles to load for the new message, up to the budget. Keeps context bounded as the corpus grows. Disabled: recent-concepts preamble on the first message only.'));
+  wrap.appendChild(makeMemoryStage(5, 'Section Selector', 'l2selector', m.l2selector,
+    'Stage two of routing: picks the relevant sections inside routed articles so whole articles never flood context. The article lead is always included. Disabled: whole articles are injected.'));
+
+  // Per-stage run stats — filled in async once the IPC resolves.
+  if (window.farnsworth?.memoryStageStats) {
+    window.farnsworth.memoryStageStats().then((r) => {
+      if (!r || !r.ok) return;
+      for (const key of ['extraction', 'consolidation', 'retrieval', 'router', 'l2selector']) {
+        const target = wrap.querySelector(`[data-stage-stats="${key}"]`);
+        if (!target) continue;
+        const s = r.stats && r.stats[key];
+        if (!s || !s.lastRun) { target.textContent = 'no runs yet'; continue; }
+        const mins = Math.max(0, Math.round((Date.now() - Date.parse(s.lastRun)) / 60000));
+        const ago = mins < 1 ? 'just now' : mins < 60 ? `${mins}m ago` : mins < 1440 ? `${Math.round(mins / 60)}h ago` : `${Math.round(mins / 1440)}d ago`;
+        target.textContent = `${s.runs || 0} runs · last ${ago} · ${s.ms}ms · ${s.model}${s.lastError ? ' · error: ' + String(s.lastError).slice(0, 60) : ''}`;
+        if (s.lastError) target.style.color = 'var(--error)';
+      }
+      const bufEl = wrap.querySelector('[data-stage-buffer]');
+      if (bufEl) bufEl.textContent = `${r.bufferCount} in buffer · ${r.sectionsCount} sections indexed`;
+    }).catch(() => {});
+  }
 
   // ---- Farnsworth Memory (Tier 1, Jul 5 2026) ----
   // Below the legacy V2/V3 pipeline UI: the actual SQLite-backed memory
@@ -4932,6 +5895,11 @@ async function makeMemoryContentsSection() {
       const lines = [];
       lines.push(`Essentials: ${res.essentials?.length || 0}`);
       lines.push(`Concepts: ${res.concepts?.length || 0}${res.concepts?.some(c => c.source === 'vec') ? ' (vec hits present)' : ''}`);
+      lines.push(`Sections: ${res.sections?.length || 0}${res.reranked ? ' (model re-ranked)' : ''}`);
+      if (res.sections?.length) {
+        lines.push('Top sections:');
+        for (const s of res.sections.slice(0, 3)) lines.push(`  • ${s.slug} § ${s.heading}`);
+      }
       lines.push(`Code chunks: ${res.code?.length || 0}${res.code?.length ? ' (vec search active)' : ''}`);
       lines.push(`Buffer: ${res.buffer?.length || 0}`);
       if (res.code?.length) {
@@ -4965,7 +5933,7 @@ async function makeMemoryContentsSection() {
   return sec;
 }
 
-function makeMemoryStage(num, name, cfg, desc, isConsolidation) {
+function makeMemoryStage(num, name, stageKey, cfg, desc) {
   const stage = el('div', { class: 'memory-stage' });
   const head = el('div', { class: 'memory-stage__head' });
   head.appendChild(el('div', { class: 'memory-stage__body' },
@@ -4987,20 +5955,69 @@ function makeMemoryStage(num, name, cfg, desc, isConsolidation) {
 
   const row = el('div', { class: 'memory-stage__row' });
   row.appendChild(el('span', { class: 'memory-stage__label' }, 'MODEL'));
-  row.appendChild(makeModelChip(cfg.model, cfg.tier));
-  if (isConsolidation) {
+  row.appendChild(makeModelChip(cfg));
+
+  if (stageKey === 'consolidation') {
     row.appendChild(el('span', { class: 'memory-stage__divider' }));
     row.appendChild(el('span', { class: 'memory-stage__label' }, 'SCHEDULE'));
-    const sched = el('button', { class: 'memory-stage__chip' }, cfg.schedule || 'Daily', svg('0 0 24 24', ['M6 9l6 6 6-6']));
+    const sched = el('button', { class: 'memory-stage__chip', title: 'Cycle Hourly → Daily → Weekly' }, cfg.schedule || 'Daily', svg('0 0 24 24', ['M6 9l6 6 6-6']));
+    sched.addEventListener('click', () => {
+      const order = ['Hourly', 'Daily', 'Weekly'];
+      cfg.schedule = order[(order.indexOf(cfg.schedule || 'Daily') + 1) % order.length];
+      persistSettings();
+      renderSettings();
+    });
     row.appendChild(sched);
-    row.appendChild(el('span', { class: 'memory-stage__chip is-active' },
-      el('span', { html: '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>' }),
-      'Auto on buffer threshold'
-    ));
+    const auto = el('button', { class: 'memory-stage__chip' + (cfg.autoOnBuffer ? ' is-active' : ''), title: 'Run automatically when the buffer crosses the threshold' });
+    if (cfg.autoOnBuffer) auto.appendChild(el('span', { html: '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>' }));
+    auto.appendChild(document.createTextNode('Auto on buffer threshold'));
+    auto.addEventListener('click', () => {
+      cfg.autoOnBuffer = !cfg.autoOnBuffer;
+      persistSettings();
+      renderSettings();
+    });
+    row.appendChild(auto);
+    const th = el('input', { type: 'number', value: String(cfg.bufferThreshold ?? 50), min: '5', max: '500', title: 'Buffer threshold (facts)', style: 'width:58px;padding:3px 6px;background:var(--bg);border:1px solid var(--border);border-radius:4px;font-size:11px;font-family:var(--mono);color:inherit;' });
+    th.addEventListener('change', () => {
+      const v = Math.max(5, Math.min(500, Number(th.value) || 50));
+      cfg.bufferThreshold = v;
+      th.value = String(v);
+      persistSettings();
+    });
+    row.appendChild(th);
+    const run = el('button', { class: 'memory-stage__chip', title: 'Run consolidation now' }, '▶ Run now');
+    run.addEventListener('click', async () => {
+      run.disabled = true;
+      run.textContent = 'Running…';
+      try {
+        const r = await window.farnsworth.memoryRunConsolidation();
+        if (r && r.ok) {
+          const a = r.applied;
+          alert(`Consolidation done: ${r.processed ?? 0}/${r.total ?? 0} buffer rows${a ? `\nappend ${a.append} · create ${a.create} · essential ${a.essential} · drop ${a.drop}` : ''}`);
+        } else {
+          alert('Consolidation failed: ' + (r && r.error || 'unknown'));
+        }
+      } catch (e) { alert('Consolidation failed: ' + (e && e.message || e)); }
+      renderSettings();
+    });
+    row.appendChild(run);
+  }
+
+  if (stageKey === 'router') {
+    row.appendChild(el('span', { class: 'memory-stage__divider' }));
+    row.appendChild(el('span', { class: 'memory-stage__label' }, 'BUDGET'));
+    const bb = el('input', { type: 'number', value: String(cfg.bucketBudget ?? 3), min: '1', max: '6', title: 'Max concept articles injected per turn', style: 'width:44px;padding:3px 6px;background:var(--bg);border:1px solid var(--border);border-radius:4px;font-size:11px;font-family:var(--mono);color:inherit;' });
+    bb.addEventListener('change', () => {
+      cfg.bucketBudget = Math.max(1, Math.min(6, Number(bb.value) || 3));
+      bb.value = String(cfg.bucketBudget);
+      persistSettings();
+    });
+    row.appendChild(bb);
   }
   stage.appendChild(row);
 
-  // Extract chips for Extraction stage
+  // Extract chips for Extraction stage — the active set is passed to the
+  // extraction prompt as focus categories.
   if (cfg.extract) {
     const extractRow = el('div', { class: 'memory-stage__row' });
     extractRow.appendChild(el('span', { class: 'memory-stage__label' }, 'EXTRACT'));
@@ -5008,7 +6025,6 @@ function makeMemoryStage(num, name, cfg, desc, isConsolidation) {
     allOptions.forEach(opt => {
       const isActive = cfg.extract.includes(opt);
       const chip = el('button', { class: 'memory-stage__chip' + (isActive ? ' is-active' : '') }, opt);
-      if (isActive) chip.insertBefore(document.createTextNode(''), chip.firstChild); // blank for icon space
       chip.addEventListener('click', () => {
         const idx = cfg.extract.indexOf(opt);
         if (idx >= 0) cfg.extract.splice(idx, 1); else cfg.extract.push(opt);
@@ -5019,47 +6035,95 @@ function makeMemoryStage(num, name, cfg, desc, isConsolidation) {
     });
     stage.appendChild(extractRow);
   }
+
+  // Per-stage run stats line, filled async by renderMemorySettings.
+  const statsRow = el('div', { class: 'memory-stage__row', style: 'font-size:11px;color:var(--muted);' });
+  statsRow.appendChild(el('span', { 'data-stage-stats': stageKey }, 'loading stats…'));
+  if (stageKey === 'consolidation') statsRow.appendChild(el('span', { 'data-stage-buffer': '1', style: 'margin-left:auto;' }, ''));
+  stage.appendChild(statsRow);
   return stage;
 }
 
-function makeMemoryStageV2(num, cfg) {
-  const stage = el('div', { class: 'memory-stage' });
-  const head = el('div', { class: 'memory-stage__head' });
-  head.appendChild(el('div', { class: 'memory-stage__body' },
-    el('div', { class: 'memory-stage__name-row' },
-      el('span', { class: 'memory-stage__num' }, String(num)),
-      el('span', { class: 'memory-stage__name' }, 'V2 Migration / Sweep'),
-      el('span', { class: 'memory-stage__status' },
-        el('span', { class: 'memory-stage__status-pulse' }),
-        'RUNNING'
-      ),
-    ),
-    el('div', { class: 'memory-stage__desc' }, 'Maintenance jobs for the legacy V2 format. V2 and V3 coexist during migration.'),
-  ));
-  stage.appendChild(head);
-
-  const row = el('div', { class: 'memory-stage__row' });
-  row.appendChild(el('span', { class: 'memory-stage__chip is-active' },
-    el('span', { html: '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>' }),
-    'Run in parallel with V3'
-  ));
-  row.appendChild(el('span', { style: 'flex:1' }));
-  ['Run migration', 'Run sweep', 'Consolidate'].forEach(label => {
-    row.appendChild(el('button', { class: 'memory-stage__chip' }, label));
-  });
-  stage.appendChild(row);
-  return stage;
+// Tier badge for a stage's model chip, derived from the model family.
+function tierForModel(display) {
+  if (/haiku/i.test(display)) return 'speed';
+  if (/sonnet/i.test(display)) return 'balanced';
+  return 'quality';
 }
 
-function makeModelChip(model, tier) {
-  const chip = el('button', { class: 'memory-stage__chip' });
+function makeModelChip(cfg) {
+  const tier = cfg.tier || tierForModel(cfg.model || '');
+  const chip = el('button', { class: 'memory-stage__chip', title: 'Pick the model for this stage' });
   chip.appendChild(el('span', { class: 'memory-stage__tier memory-stage__tier--' + tier }, tier.toUpperCase()));
-  chip.appendChild(document.createTextNode(model));
+  chip.appendChild(document.createTextNode(cfg.model));
   const chev = svg('0 0 24 24', ['M6 9l6 6 6-6']);
   chev.setAttribute('width', '12'); chev.setAttribute('height', '12');
   chev.setAttribute('stroke', '#80848e'); chev.setAttribute('stroke-width', '2.4');
   chip.appendChild(chev);
+  chip.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    openStageModelPicker(chip, cfg);
+  });
   return chip;
+}
+
+// Model picker for memory pipeline stages. Same popover as openModelPicker
+// but writes into the stage config object (nested under
+// state.settings.memory.<stage>) instead of a flat settings key.
+function openStageModelPicker(anchorBtn, cfg) {
+  const existing = document.querySelector('.model-picker');
+  if (existing) existing.remove();
+
+  const pop = el('div', { class: 'model-picker' });
+  pop.style.cssText = `
+    position: fixed; z-index: 9999;
+    background: #1f2024; border: 1px solid #2a2c32;
+    border-radius: 11px; padding: 6px;
+    min-width: 320px; max-width: 380px;
+    box-shadow: 0 12px 40px rgba(0,0,0,.55);
+    font-size: 13px;
+  `;
+  const r = anchorBtn.getBoundingClientRect();
+  pop.style.top = (r.bottom + 6) + 'px';
+  pop.style.left = r.left + 'px';
+
+  for (const opt of CHAT_MODEL_OPTIONS) {
+    const isCurrent = cfg.model === opt.display;
+    const row = el('button', {
+      class: 'model-picker__row' + (isCurrent ? ' is-current' : ''),
+      style: `
+        display: flex; flex-direction: column; align-items: flex-start;
+        width: 100%; padding: 9px 13px; border: none; border-radius: 7px;
+        background: ${isCurrent ? 'rgba(168,85,247,.18)' : 'transparent'};
+        color: ${isCurrent ? '#c8a6ff' : '#e6e9ef'};
+        cursor: pointer; text-align: left;
+      `,
+    });
+    row.innerHTML = `
+      <div style="display:flex;align-items:center;gap:8px;width:100%;">
+        <span style="font-weight:600;font-size:13px;">${opt.display}</span>
+        ${opt.effort ? `<span style="font-size:10px;color:#949ba4;background:#2a2c32;border-radius:4px;padding:2px 6px;font-weight:600;">${opt.effort.toUpperCase()}</span>` : ''}
+        ${isCurrent ? '<span style="margin-left:auto;font-size:10px;color:#a855f7;">✓ current</span>' : ''}
+      </div>
+      <div style="font-size:11.5px;color:#949ba4;margin-top:2px;">${opt.desc}</div>
+    `;
+    row.addEventListener('click', () => {
+      cfg.model = opt.display;
+      cfg.tier = tierForModel(opt.display);
+      persistSettings();
+      pop.remove();
+      renderSettings();
+    });
+    pop.appendChild(row);
+  }
+
+  document.body.appendChild(pop);
+  setTimeout(() => {
+    const close = (ev) => {
+      if (!pop.contains(ev.target)) { pop.remove(); document.removeEventListener('click', close); }
+    };
+    document.addEventListener('click', close);
+  }, 0);
 }
 
 function renderCanvasSettings() {
@@ -5230,6 +6294,27 @@ async function loadSettings() {
   try {
     const loaded = await window.farnsworth.getSettings();
     if (loaded) Object.assign(state.settings, loaded);
+    // Memory pipeline settings: Object.assign is shallow, so a persisted
+    // 'memory' object would shadow new per-stage defaults. Deep-merge each
+    // stage, drop the legacy v2migration stage, and (one-time, v3 pipeline
+    // migration) force stage models to the new defaults — the old model
+    // chips were dead UI, so persisted models were never a user choice.
+    const memDefaults = {
+      extraction:    { enabled: true, model: 'Haiku 4.5', tier: 'speed',    extract: ['Corrections', 'Preferences', 'Decisions'] },
+      consolidation: { enabled: true, model: 'Sonnet 5',  tier: 'balanced', schedule: 'Daily', autoOnBuffer: true, bufferThreshold: 50 },
+      retrieval:     { enabled: true, model: 'Sonnet 5',  tier: 'balanced', depth: 'Standard', summariesFirst: true, graphSpread: true },
+      router:        { enabled: true, model: 'Haiku 4.5', tier: 'speed',    bucketBudget: 3 },
+      l2selector:    { enabled: true, model: 'Haiku 4.5', tier: 'speed' },
+    };
+    const savedMem = (loaded && typeof loaded.memory === 'object' && loaded.memory) || {};
+    const migrated = savedMem.pipelineVersion === 3;
+    const mem = { pipelineVersion: 3 };
+    for (const k of Object.keys(memDefaults)) {
+      mem[k] = { ...memDefaults[k], ...(savedMem[k] || {}) };
+      if (!migrated) { mem[k].model = memDefaults[k].model; mem[k].tier = memDefaults[k].tier; }
+    }
+    state.settings.memory = mem;
+    if (!migrated && loaded) persistSettings();
   } catch (e) {
     console.warn('Failed to load settings:', e);
   }
@@ -5251,9 +6336,14 @@ async function loadFarnsworthDev() {
   // when a folder is loaded (handleFolderPicked); at init time it may be
   // null, so we default to 'devvit'. Re-run this after folder load to pick
   // up the correct type for non-devvit workspaces.
+  // Pass state.folder so main.js can validate that the cached dev server
+  // belongs to THIS workspace — without this, a stale cache file from a
+  // previous session's workspace would point iframes at the wrong project
+  // (Long Jul 9 ~15:05 ET — lastdraft's bgMusic auto-played in Farnsworth's
+  // iframe because the cache file's repoRoot didn't match the active folder).
   const appType = state.appType || 'devvit';
   try {
-    const info = await window.farnsworth.devFarnsworthGet(appType);
+    const info = await window.farnsworth.devFarnsworthGet(appType, state.folder || null);
     state.farnsworthDev = info || { available: false };
     if (info?.available) {
       console.log(`[Farnsworth] ${info.type} dev server available at`, info.url, 'pid', info.pid);
@@ -6565,6 +7655,16 @@ function wire() {
   // keeps the dropdown in sync with the category defaults so the user
   // isn't surprised by a mismatched value after clicking a category.
   $$('.size-toggle').forEach(t => t.addEventListener('click', () => {
+    // Nuke every canvas WebContentsView BEFORE changing preview so no
+    // orphan views survive the switch. The async setup race (Jul 11
+    // ~16:30 ET -- testview WebContentsView persisted across the
+    // Post View switch because canvasCreateView resolved after teardown
+    // had already run) is caught here: regardless of in-flight
+    // createView promises, every view in main.js's canvasWebContentsViews
+    // map gets destroyed before the new DOM is rendered. The fresh
+    // preview's setupCanvasBrowserViews will recreate any views it
+    // needs immediately after.
+    window.farnsworth?.canvasRemoveAllViews?.();
     state.preview = t.dataset.size;
     // Reset the resolution dropdown to the category's default preset.
     syncResolutionDropdownToCategory();
@@ -6705,6 +7805,29 @@ function wire() {
     }
   });
 
+  // Chat input auto-grow (Jul 11 ~16:57 ET) — textarea grows with content
+  // up to .chat__textarea's max-height (200px ≈ 8 lines), then scrolls.
+  // Resets height to 'auto' before measuring scrollHeight so backspace
+  // actually SHRINKS the box. Runs on input + on every value-mutation
+  // (paste, programmatic set). Called once at init to handle any preloaded
+  // value across renderer reloads.
+  const chatInput = $('#chat-input');
+  const autoresizeChatInput = () => {
+    if (!chatInput) return;
+    // Reset to 'auto' so backspace / delete actually shrinks the box;
+    // scrollHeight reflects only the content + min-height floor after reset.
+    chatInput.style.height = 'auto';
+    // Cap at the .chat__textarea max-height (200px ≈ 8 lines). Past that,
+    // overflow-y:auto on the textarea scrolls the content internally.
+    const targetH = Math.min(chatInput.scrollHeight, 200);
+    chatInput.style.height = targetH + 'px';
+  };
+  if (chatInput) {
+    chatInput.addEventListener('input', autoresizeChatInput);
+    // Initial sizing (in case value was preloaded from a draft)
+    autoresizeChatInput();
+  }
+
   // Chat history dropdown — toggle, new chat, list delegation, delete.
   $('#chat-history-toggle')?.addEventListener('click', (ev) => {
     ev.stopPropagation();
@@ -6755,17 +7878,17 @@ function wire() {
     renderChat();
   });
 
-  // Model picker — the dropdown at Settings → AI → Default model. Long
-  // couldn't switch models before because the button had no click handler
-  // (Jul 6 ~08:30 ET — model was hardcoded via the wrong setting key).
-  // Now clicking it opens a popover with the current Anthropic model list.
-  const modelPickerBtn = $('#ai-model-picker-btn');
-  if (modelPickerBtn) {
-    modelPickerBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      openModelPicker(modelPickerBtn);
-    });
-  }
+  // Model pickers — the dropdowns at Settings → AI (Default model + Testing
+  // model). Wired via document-level delegation because renderSettings()
+  // rebuilds #settings-pane innerHTML on every render, which orphans direct
+  // listeners: wire() runs once at boot, before the buttons exist. (Jul 12 —
+  // this is why a direct `$('#ai-model-picker-btn')` here never attached.)
+  document.addEventListener('click', (e) => {
+    const dm = e.target.closest('#ai-model-picker-btn');
+    if (dm) { e.stopPropagation(); openModelPicker(dm); return; }
+    const tm = e.target.closest('#ai-testing-model-btn');
+    if (tm) { e.stopPropagation(); openModelPicker(tm, 'testingModel'); }
+  });
 
   // Esc closes settings
   document.addEventListener('keydown', e => {
@@ -6885,6 +8008,15 @@ function wire() {
       }
     }
   });
+
+  // Test creator (NLP-driven test script authoring, Jul 10 ~23:50 ET)
+  // DEPRECATED Jul 11 ~16:42 ET — combined into Test View's inline
+  // editor (openTestViewEditor / saveTestViewEditor / generateTestViewEditor).
+  // The NLP helpers (TEST_CREATOR_SYSTEM_PROMPT, generateTestFromNLP,
+  // keywordFallbackParse, deriveTestName) are still used by Test View's
+  // "Generate from description" button — they're not removed.
+  // setupTestCreator() intentionally NOT called: the modal HTML + button
+  // in index.html were removed; the NLP functions remain callable.
 }
 
 function updateZoom() {
@@ -7053,13 +8185,59 @@ async function sendChatMessage() {
   input.value = '';
   renderChat();
 
-  // Memory: bootstrap context for this conversation on first send.
-  // Build a memory preamble (essentials + recent concept leads) and
-  // prepend it to the FIRST user message of the conversation. Subsequent
-  // messages in the same conversation don't re-prepend — the context is
-  // already in the LLM's working memory via the prior turn.
+  // Memory preamble — Tier 3 (Jul 12 2026). Stages 4+5: the router picks
+  // which concept articles matter for THIS message (cheap model, every
+  // turn) and the section selector picks sections within them. Essentials
+  // are injected on the first message of a conversation; routed articles
+  // are injected the first time they're picked (tracked per conversation
+  // so repeats don't re-inject). Falls back to the Tier-1 bootstrap dump
+  // (essentials + recent concept leads, first message only) when the
+  // router stage is disabled or unavailable.
   let memoryPreamble = '';
-  if (!state.memoryLoadedForConv || state.memoryLoadedForConv !== state.chatActiveId) {
+  const isNewMemConv = !state.memoryLoadedForConv || state.memoryLoadedForConv !== state.chatActiveId;
+  if (isNewMemConv || !state.memoryInjectedSlugs) state.memoryInjectedSlugs = new Set();
+  if (state.settings?.memory?.router?.enabled && window.farnsworth?.memoryRoute) {
+    try {
+      const routed = await window.farnsworth.memoryRoute({ context: String(text).slice(0, 800) });
+      if (routed && routed.ok) {
+        const lines = [];
+        if (isNewMemConv && routed.essentials && routed.essentials.length) {
+          lines.push('# Memory essentials (always-loaded)');
+          for (const e of routed.essentials) lines.push(`- ${e.key}: ${e.value}`);
+        }
+        const fresh = (routed.concepts || []).filter(c => !state.memoryInjectedSlugs.has(c.slug));
+        if (fresh.length) {
+          lines.push('');
+          lines.push('# Memory: concepts routed for this message');
+          for (const c of fresh) {
+            state.memoryInjectedSlugs.add(c.slug);
+            lines.push(`## ${c.title} (${c.slug})`);
+            if (c.lead) lines.push(c.lead);
+            if (c.body) lines.push(c.body);
+            else if (c.sections && c.sections.length) {
+              for (const s of c.sections) lines.push(`### ${s.heading}\n${s.content}`);
+            }
+          }
+        }
+        if (isNewMemConv && state.folder && window.farnsworth?.memoryCodeStats) {
+          try {
+            const stats = await window.farnsworth.memoryCodeStats(state.folder);
+            if (stats && stats.files > 0) {
+              lines.push('');
+              lines.push(`# Codebase index (Tier 2 — ${stats.files} files, ${stats.chunks} chunks, ${state.folder})`);
+            }
+          } catch {}
+        }
+        if (lines.length) {
+          memoryPreamble = '[Farnsworth memory — routed]\n' + lines.join('\n') + '\n[/Farnsworth memory]\n\n';
+        }
+        state.memoryLoadedForConv = state.chatActiveId;
+      }
+    } catch (e) {
+      console.warn('[memory] route failed, falling back to bootstrap:', e);
+    }
+  }
+  if (isNewMemConv && !memoryPreamble && (!state.memoryLoadedForConv || state.memoryLoadedForConv !== state.chatActiveId)) {
     try {
       const boot = await window.farnsworth.memoryBootstrap();
       const lines = [];
@@ -7142,8 +8320,49 @@ async function sendChatMessage() {
 
       let res;
       try {
+        // Build a system prompt that tells the agent what tools it has and
+        // when to use them. Currently includes test_view instructions; see
+        // ~/Documents/Farnsworth/app/DEVVIT-TESTS.md for the test format
+        // spec the agent reads on its own (via the read_file tool). The
+        // DEVVIT-TESTS.md path is stable — don't move the file without
+        // updating this string. Jul 11 ~18:50 ET.
+        const systemPrompt = [
+          'You are the Farnsworth chat agent — an AI assistant inside the Farnsworth IDE (Electron app for building Reddit games). You have access to a workspace folder and Farnsworth\'s canvas preview.',
+          '',
+          '## Tools you have',
+          '',
+          '**Workspace tools:**',
+          '- read_file(path) — read a file relative to the workspace folder (e.g. "src/app.js", "package.json")',
+          '- write_file(path, content) — write a file relative to the workspace folder (creates parent dirs)',
+          '- list_files(pattern?) — list workspace files (optional glob filter)',
+          '- run_command(command) — run a shell command in the workspace (30s timeout)',
+          '- ui_show(surfaceType, data) — render an inline UI surface in the chat stream (card, choice, form, copy_block, work_result, etc.)',
+          '',
+          '**Test View tools (Jul 11 ~18:50 ET):**',
+          '- open_testview() — switch the canvas to Test View so the user sees the test runner',
+          '- test_list() — list all tests in the active workspace\'s .farnsworth/devvit-tests/',
+          '- test_read(name) — read a test JSON file by name',
+          '- test_save(name, json) — save a test JSON file (validates JSON first)',
+          '- test_run(path) — run a test (path is ABSOLUTE, not relative — get it from test_list or test_save)',
+          '',
+          '## When to use Test View tools',
+          '',
+          'When the user asks any of: "create a test that...", "make a test for X", "run the test that...", "show me the tests", "edit the test X to...", "what tests exist?", "delete the X test" — call `open_testview` FIRST (so they see Test View in the canvas), then the appropriate test_* tool. Report the result in chat with concrete detail (stdout/stderr if a run failed).',
+          '',
+          '## The test format spec',
+          '',
+          'Tests are JSON files. The full format spec is at `~/Documents/Farnsworth/app/DEVVIT-TESTS.md` — read it with the read_file tool BEFORE creating or editing tests so you get the action list, step shape, and common selectors right. Do NOT guess the format from this prompt — read the MD file.',
+          '',
+          '## General guidance',
+          '',
+          '- The active workspace folder is set via File → Open Folder. If the user asks you to do workspace work and no folder is open, tell them to open one.',
+          '- Use ui_show surfaces when the work has multiple steps (task_progress), produces a structured outcome (work_result), needs a choice (choice), or needs a credential (credential).',
+          '- Be direct, concise, and act. The user runs Farnsworth as their IDE; surface errors with the underlying stdout/stderr so they can fix the issue.',
+        ].join('\n');
+
         res = await window.farnsworth.streamMessage({
           messages: history,
+          system: systemPrompt,
           // Translate Farnsworth display name (state.settings.defaultModel,
           // e.g. 'Opus 4.8 High') to the Anthropic API id (e.g.
           // 'claude-opus-4-8'). state.settings.model was the old wrong key
@@ -7211,7 +8430,18 @@ async function sendChatMessage() {
       }
 
       // Append assistant message to history (full content blocks so Claude can see its own tool_use)
-      history.push({ role: 'assistant', content: res.content || [{ type: 'text', text: res.text || '' }] });
+      // Strip the streaming handler's renderer-side accumulator fields (inputJson, caller) from
+      // tool_use blocks — only { type, id, name, input } are valid Anthropic API fields; extras
+      // cause "messages.N.content.M.tool_use.inputJson: Extra inputs are not permitted" rejections
+      // on the next turn. The API was rejecting every tool call sent back through history. Bug
+      // discovered Jul 11 ~19:45 ET; see /tmp/farnsworth-stream-debug.json for the captured diff.
+      const sanitizedContent = (res.content || []).map(b => {
+        if (b?.type === 'tool_use') {
+          return { type: 'tool_use', id: b.id, name: b.name, input: b.input || {} };
+        }
+        return b;
+      });
+      history.push({ role: 'assistant', content: sanitizedContent.length ? sanitizedContent : [{ type: 'text', text: res.text || '' }] });
 
       // No tool_use blocks — final response, render and stop
       if (!res.toolUses || res.toolUses.length === 0) {
@@ -8618,6 +9848,11 @@ function initLeftPanelResize() {
   const panel = document.getElementById('left-panel');
   const handle = document.getElementById('left-panel-resize-handle');
   if (!panel || !handle) return;
+  // Left-panel min-width bumped from 240 → 340 (Jul 11 ~16:11 ET). The three
+  // left tabs (Chat / Terminal / Claude Code) need ~332px including icon +
+  // padding + toggle button + outer padding. Below that, "Claude Code" tab
+  // text wraps to two lines before spilling. Enforced here AND in styles.css
+  // (`.lefttab { white-space: nowrap; flex-shrink: 0 }`).
 
   // Restore collapsed state FIRST so the collapsed CSS wins over inline width
   if (state.leftPanelCollapsed) {
@@ -8638,7 +9873,9 @@ function initLeftPanelResize() {
     const startX = e.clientX;
     const startW = panel.getBoundingClientRect().width;
     const maxW = Math.floor(window.innerWidth * 0.66);
-    const minW = 240;
+    // Bumped from 240 → 340 so all three left tabs (Chat / Terminal /
+    // Claude Code) stay on one line without wrapping. See comment above.
+    const minW = 340;
 
     handle.classList.add('is-dragging');
     document.body.style.cursor = 'ew-resize';
@@ -8704,6 +9941,31 @@ async function init() {
   // where the only way to open a folder was via the welcome overlay.
   if (window.farnsworth?.onMenuAction) {
     window.farnsworth.onMenuAction(handleMenuAction);
+  }
+  // Programmatic canvas preview switcher (chat agent's open_testview tool,
+  // Jul 11 ~18:50 ET). Mirror the size-toggle click handler — nuke every
+  // WebContentsView, set state.preview, sync the resolution dropdown,
+  // update toggles, re-render. Only meaningful in live mode (the only mode
+  // with a preview region); the IPC still fires but the renderer becomes
+  // a no-op if we're not in live.
+  if (window.farnsworth?.onCanvasSetPreview) {
+    window.farnsworth.onCanvasSetPreview((payload) => {
+      const preview = payload?.preview;
+      const allowed = ['post', 'mobile', 'desktop', 'fullscreen', 'testview'];
+      if (!preview || !allowed.includes(preview)) return;
+      if (state.canvasMode !== 'live') {
+        // Auto-switch to live mode so the preview actually renders.
+        state.canvasMode = 'live';
+      }
+      window.farnsworth?.canvasRemoveAllViews?.();
+      state.preview = preview;
+      if (typeof syncResolutionDropdownToCategory === 'function') {
+        syncResolutionDropdownToCategory();
+      }
+      if (state.previewCustomHeight) delete state.previewCustomHeight[state.preview];
+      updateModeToggles();
+      renderCanvas();
+    });
   }
   // Initial title bar / chat header — shows folder name when set, else
   // "No folder open" placeholder.

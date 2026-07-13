@@ -28,3 +28,12 @@ coverage/
 
 # Build artifacts
 *.tsbuildinfo
+# Local debug scratch (not part of the app)
+.debug-archive-jul11/
+farnsworth-test-probes/
+chat-noauth.png
+final_shot.js
+overlay_shot.js
+min_test.mjs
+quick_test.mjs
+check_ipcs.mjs

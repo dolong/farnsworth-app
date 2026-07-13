@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Farnsworth</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="src/styles.css" />
+  <link rel="stylesheet" href="node_modules/xterm/css/xterm.css" />
+</head>
+<body>
+  <!-- ============ APP SHELL ============ -->
+  <div class="app">
+
+    <!-- ============ TITLE BAR ============ -->
+    <div class="titlebar">
+      <div class="titlebar__brand">
+        <div class="titlebar__logo">
+          <svg width="19" height="19" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+            <defs>
+              <linearGradient id="iris-bg-titlebar" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" stop-color="#7E6BFF"/>
+                <stop offset="100%" stop-color="#5A3FE6"/>
+              </linearGradient>
+            </defs>
+            <rect x="0" y="0" width="100" height="100" rx="18" ry="18" fill="url(#iris-bg-titlebar)"/>
+            <path d="M11 49 L3.5 44.5" fill="none" stroke="#FFFFFF" stroke-width="6" stroke-linecap="round"/>
+            <path d="M89 49 L96.5 44.5" fill="none" stroke="#FFFFFF" stroke-width="6" stroke-linecap="round"/>
+            <circle cx="30" cy="51" r="19" fill="#C9ECE3" stroke="#FFFFFF" stroke-width="7"/>
+            <circle cx="70" cy="51" r="19" fill="#C9ECE3" stroke="#FFFFFF" stroke-width="7"/>
+            <path d="M47 47 Q50 43 53 47" fill="none" stroke="#FFFFFF" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M22 52 L31 43" fill="none" stroke="#2F7A72" stroke-width="3.1" stroke-linecap="round"/>
+            <path d="M25.5 55 L34.5 46" fill="none" stroke="#2F7A72" stroke-width="3.1" stroke-linecap="round"/>
+            <path d="M62 52 L71 43" fill="none" stroke="#2F7A72" stroke-width="3.1" stroke-linecap="round"/>
+            <path d="M65.5 55 L74.5 46" fill="none" stroke="#2F7A72" stroke-width="3.1" stroke-linecap="round"/>
+          </svg>
+        </div>
+        <span class="titlebar__app">Farnsworth</span>
+        <span class="titlebar__sep">/</span>
+        <span class="titlebar__project">No folder open</span>
+      </div>
+      <div class="titlebar__search">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg>
+        <span>Search files</span>
+        <span class="titlebar__kbd">⌘K</span>
+      </div>
+      <div class="titlebar__actions">
+        <button class="btn btn--ghost" id="btn-present">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M21 16v3a2 2 0 0 1-2 2h-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>
+          Present
+        </button>
+        <button class="btn btn--primary">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="M8.6 13.5l6.8 4M15.4 6.5l-6.8 4"/></svg>
+          Share
+        </button>
+        <div class="titlebar__divider"></div>
+        <button class="iconbtn" title="Notifications">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></svg>
+          <span class="iconbtn__dot"></span>
+        </button>
+        <button class="iconbtn iconbtn--settings" id="btn-settings" title="Settings">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.27.61.86 1 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        </button>
+        <div class="titlebar__avatar" title="You">MB</div>
+      </div>
+    </div>
+
+    <!-- ============ BODY: 3 COLUMNS ============ -->
+    <div class="body">
+
+      <!-- ====== LEFT: CHAT ====== -->
+      <aside class="left-panel" id="left-panel">
+        <nav class="left-panel__tabs" id="left-panel-tabs">
+          <button class="lefttab" data-tab="chat" id="lefttab-chat">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.4 8.4 0 0 1-8.5 8.5 8.5 8.5 0 0 1-3.6-.8L3 21l1.8-5.9A8.5 8.5 0 1 1 21 11.5z"/></svg>
+            <span>Chat</span>
+          </button>
+          <button class="lefttab" data-tab="terminal" id="lefttab-terminal">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+            <span>Terminal</span>
+          </button>
+          <button class="lefttab" data-tab="claudecode" id="lefttab-claudecode">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M8 12h8M12 8v8"/></svg>
+            <span>Claude Code</span>
+          </button>
+          <!-- Toggle: collapses the left panel to a 36px icon strip, expands back -->
+          <button class="left-panel__toggle-btn" id="left-panel-toggle-btn" title="Collapse panel" aria-label="Collapse panel">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" class="left-panel__toggle-icon-collapse"><path d="M15 6l-6 6 6 6"/></svg>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" class="left-panel__toggle-icon-expand"><path d="M9 6l6 6-6 6"/></svg>
+          </button>
+        </nav>
+
+        <!-- Drag handle to resize the left panel horizontally (max 66% of viewport) -->
+        <div class="left-panel__resize-handle" id="left-panel-resize-handle" title="Drag to resize"></div>
+
+        <section class="chat" id="chat-pane">
+          <header class="chat__header">
+            <div class="chat__project">
+              <div class="chat__project-avatar">UX</div>
+              <div class="chat__project-meta">
+                <div class="chat__project-name" id="chat-project-name">No folder open</div>
+                <div class="chat__project-sub" id="chat-project-sub">Open a folder to start designing</div>
+              </div>
+            </div>
+            <div class="chat__header-actions">
+              <div class="chathistory" id="chat-history-wrap">
+                <button class="iconbtn iconbtn--sm" id="chat-history-toggle" title="Chat history" aria-haspopup="true" aria-expanded="false">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.4 8.4 0 0 1-8.5 8.5 8.5 8.5 0 0 1-3.6-.8L3 21l1.8-5.9A8.5 8.5 0 1 1 21 11.5z"/><path d="M12 8.5v5M9.5 11h5"/></svg>
+                </button>
+                <div class="chathistory__panel" id="chat-history-panel" hidden>
+                  <div class="chathistory__head">
+                    <div class="chathistory__title">Conversations</div>
+                    <button class="btn btn--ghost btn--sm" id="chat-history-new">
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+                      New chat
+                    </button>
+                  </div>
+                  <div class="chathistory__list" id="chat-history-list"><!-- rendered by app.js --></div>
+                </div>
+              </div>
+              <!-- Orphaned "Hide sidebar" + "Collapse" buttons removed Jun 29 00:46 ET.
+                   Collapse moved to .left-panel__toggle-btn in the tabs nav (above) so it
+                   can actually toggle its own parent. Hide-sidebar was a leftover from
+                   an earlier layout sketch. -->
+            </div>
+          </header>
+
+          <div class="chat__thread" id="chat-thread"><!-- messages rendered by app.js --></div>
+
+          <div class="chat__ctas">
+            <button class="btn btn--ghost btn--sm" id="btn-new-chat">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+              New chat
+            </button>
+            <button class="btn btn--ghost btn--sm" id="btn-continue-here">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9l4-4M4 9l4 4M4 9h11a5 5 0 0 1 5 5v3"/></svg>
+              Continue here
+            </button>
+          </div>
+
+          <div class="chat__input-wrap">
+            <div class="chat__input">
+              <textarea class="chat__textarea" id="chat-input" placeholder="Describe what you want to create…" rows="2"></textarea>
+              <div class="chat__input-actions">
+                <button class="iconbtn iconbtn--sm" title="Attach">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5l-8.5 8.5a5 5 0 0 1-7-7l8.5-8.5a3 3 0 0 1 4.2 4.2l-8.5 8.5a1 1 0 0 1-1.5-1.5l7.8-7.8"/></svg>
+                </button>
+                <button class="chat__model" id="chat-model">
+                  <span class="chat__model-dot"></span>
+                  Opus 4.8
+                  <span class="chat__model-tier">High</span>
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#80848e" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
+                </button>
+                <button class="chat__send" id="chat-send" title="Send (Cmd+Enter)">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+                </button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="terminal" id="terminal-pane" hidden>
+          <div class="terminal__tabs" id="terminal-tabs">
+            <!-- Tab pills are rendered dynamically by renderTerminalTabs() -->
+            <button class="termtab__new" id="terminal-new-tab" title="New terminal">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+            </button>
+          </div>
+          <div class="terminal__host" id="terminal-host">
+            <!-- One xterm container per terminal tab; visibility toggled by switchTerminalTab() -->
+          </div>
+        </section>
+
+        <!-- ====== CLAUDE CODE PANEL ======
+             Wraps the `claude` binary (Anthropic's Claude Code product) in a
+             PTY. Same protocol as the terminal panel (WebSocket bridge on
+             port 9224) but spawns `claude` instead of bash. The chat panel
+             remains Farnsworth's own custom API client; THIS panel runs the
+             official Claude Code binary as a child process, so it's
+             Anthropic's Claude Code product regardless of which shell wraps
+             it. -->
+        <section class="claudecode" id="claude-code-pane" hidden>
+          <div class="claudecode__tabs" id="claude-code-tabs">
+            <button class="cctab__new" id="claude-code-new-tab" title="New Claude Code session">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+            </button>
+          </div>
+          <div class="claudecode__host" id="claude-code-host">
+            <!-- One xterm container per Claude Code session -->
+          </div>
+        </section>
+      </aside>
+
+      <!-- ====== CENTER: CANVAS ====== -->
+      <main class="canvas" id="canvas">
+        <header class="canvas__toolbar">
+          <div class="canvas__title">
+            <div class="canvas__title-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#f0883e" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg></div>
+            <div class="canvas__title-text">
+              <div class="canvas__title-line">
+                <span id="canvas-file-name">Matchmaking VS</span>
+                <span class="canvas__file-type">HTML</span>
+              </div>
+              <div class="canvas__title-sub">screens/ · 7 agents · edited 2m ago</div>
+            </div>
+          </div>
+          <div class="canvas__toolbar-actions">
+            <div class="vm-toggles" id="vm-toggles">
+              <button class="vm-toggle" data-vm="markup">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>
+                Mark up
+              </button>
+              <button class="vm-toggle" data-vm="comments">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.4 8.4 0 0 1-8.5 8.5 8.5 8.5 0 0 1-3.6-.8L3 21l1.8-5.9A8.5 8.5 0 1 1 21 11.5z"/></svg>
+                Comments
+              </button>
+              <button class="vm-toggle" data-vm="edit">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4l7 17 2.5-7.5L21 11z"/></svg>
+                Edit
+              </button>
+              <button class="vm-toggle" data-vm="tweaks">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h8M4 12h12M4 18h6"/><circle cx="16" cy="6" r="2.2"/><circle cx="18" cy="12" r="2.2"/><circle cx="12" cy="18" r="2.2"/></svg>
+                Tweaks
+              </button>
+            </div>
+            <button class="zoom-display" id="zoom-display">100% <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#80848e" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg></button>
+          </div>
+        </header>
+
+        <div class="canvas__viewport" id="canvas-viewport">
+          <div class="canvas__overlay-bar">
+            <div class="canvas__mode-toggles" id="canvas-mode-toggles">
+              <button class="mode-toggle" data-mode="live">
+                <span class="mode-toggle__pulse"></span>
+                Live Preview
+              </button>
+              <button class="mode-toggle" data-mode="storybook">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+                Storybook
+              </button>
+              <button class="mode-toggle" data-mode="code">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 8l-4 4 4 4M15 8l4 4-4 4"/></svg>
+                Code
+              </button>
+            </div>
+            <div class="canvas__size-toggles" id="canvas-size-toggles">
+              <button class="size-toggle" data-size="post">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>
+                Post View
+              </button>
+              <button class="size-toggle" data-size="mobile">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="2" width="10" height="20" rx="2.5"/><path d="M11 18h2"/></svg>
+                App Mobile
+              </button>
+              <button class="size-toggle" data-size="desktop">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+                App Desktop
+              </button>
+              <button class="size-toggle" data-size="fullscreen">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8V5a2 2 0 0 1 2-2h3M21 8V5a2 2 0 0 0-2-2h-3M3 16v3a2 2 0 0 0 2 2h3M21 16v3a2 2 0 0 1-2 2h-3"/></svg>
+                Fullscreen
+              </button>
+              <button class="size-toggle" data-size="testview" title="Run canvas automation tests against a live game instance">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2v6L4 18a2 2 0 0 0 1.7 3h12.6a2 2 0 0 0 1.7-3L15 8V2M9 2h6M9 14h6"/></svg>
+                Test View
+              </button>
+              <!-- Resolution presets — W x H number picker for the canvas artboard.
+                   Mirrors the-last-draft's StoryFrame.jsx (Zoom select) and
+                   PhoneFrame.jsx (device presets). Picking a preset updates
+                   state.previewWidths[state.preview] to the new width and
+                   triggers renderCanvas(). Categories are split like the
+                   menu: Mobile / Desktop / Fit. -->
+              <div class="canvas__resolution-select-wrap" title="Canvas resolution">
+                <svg class="canvas__resolution-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7V5a2 2 0 0 1 2-2h2M21 7V5a2 2 0 0 0-2-2h-2M3 17v2a2 2 0 0 0 2 2h2M21 17v2a2 2 0 0 1-2 2h-2"/><rect x="6" y="9" width="12" height="6" rx="1"/></svg>
+                <select class="canvas__resolution-select" id="canvas-resolution-select" aria-label="Canvas resolution">
+                  <optgroup label="Mobile">
+                    <option value="390,844">390 × 844 · App Mobile Default</option>
+                    <option value="375,667">375 × 667 · iPhone SE 3</option>
+                    <option value="412,915">412 × 915 · Pixel 7</option>
+                    <option value="428,926">428 × 926 · iPhone 14 +</option>
+                  </optgroup>
+                  <optgroup label="Desktop">
+                    <option value="724,596">724 × 596 · App Desktop Default</option>
+                    <option value="1280,800">1280 × 800 · Compact</option>
+                    <option value="1512,1320">1512 × 1320 · Default</option>
+                    <option value="1920,1080">1920 × 1080 · HD</option>
+                    <option value="2560,1440">2560 × 1440 · QHD</option>
+                    <option value="3440,1440">3440 × 1440 · Ultrawide</option>
+                  </optgroup>
+                  <optgroup label="Fullscreen">
+                    <option value="1120,630">1120 × 630 · 16:9</option>
+                  </optgroup>
+                  <optgroup label="Post">
+                    <option value="700,512">700 × 512 · Post View Default</option>
+                  </optgroup>
+                  <optgroup label="Custom">
+                    <option value="custom">Custom…</option>
+                  </optgroup>
+                </select>
+                <!-- Custom W × H inputs (shown only when "Custom…" is picked) -->
+                <div class="canvas__resolution-custom" id="canvas-resolution-custom" hidden>
+                  <input type="number" class="canvas__resolution-input" id="canvas-resolution-w" min="100" max="4000" step="1" placeholder="W" aria-label="Canvas width" />
+                  <span class="canvas__resolution-x">×</span>
+                  <input type="number" class="canvas__resolution-input" id="canvas-resolution-h" min="100" max="4000" step="1" placeholder="H" aria-label="Canvas height" />
+                </div>
+              </div>
+            </div>
+            <div class="canvas__live-status" id="canvas-live-status"><!-- rendered by app.js --></div>
+            <!-- canvas__test-toggles removed Jul 11 ~16:42 ET: standalone NLP test
+                 creator modal was deprecated when Long asked to combine the
+                 test building features into Test View (now uses an inline
+                 editor with + New / Edit / × buttons per test row). -->
+          </div>
+
+          <div class="canvas__stage" id="canvas-stage"><!-- rendered by app.js --></div>
+
+          <div class="canvas__zoom-widget">
+            <button class="zoom-widget__btn" id="zoom-out">−</button>
+            <span class="zoom-widget__value" id="zoom-value">100%</span>
+            <button class="zoom-widget__btn" id="zoom-in">+</button>
+            <div class="canvas__zoom-widget-divider"></div>
+            <button class="zoom-widget__btn"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M21 16v3a2 2 0 0 1-2 2h-3M3 16v3a2 2 0 0 0 2 2h3"/></svg></button>
+          </div>
+        </div>
+      </main>
+
+      <!-- ====== RIGHT: TABBED PANEL ====== -->
+      <aside class="rightpanel" id="right-panel">
+        <div class="rightpanel__tabs" id="rightpanel-tabs">
+          <!-- Toggle: collapses the right panel to a 36px strip on the right edge -->
+          <button class="right-tab__toggle-btn" id="right-panel-toggle-btn" title="Collapse panel" aria-label="Collapse panel">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" class="right-tab__toggle-icon-collapse"><path d="M9 6l6 6-6 6"/></svg>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" class="right-tab__toggle-icon-expand"><path d="M15 6l-6 6 6 6"/></svg>
+          </button>
+          <button class="righttab" data-tab="files">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+            <span>Files</span>
+          </button>
+          <button class="righttab" data-tab="tasks">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3 7-7"/><path d="M20 12v7a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h9"/></svg>
+            <span>Tasks</span>
+          </button>
+          <button class="righttab" data-tab="live">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l3 8 4-16 3 8h4"/></svg>
+            <span>Live</span>
+          </button>
+        </div>
+        <div class="rightpanel__content" id="rightpanel-content"><!-- rendered by app.js --></div>
+        <!-- Drag handle on the LEFT edge to resize the right panel -->
+        <div class="right-panel__resize-handle" id="right-panel-resize-handle" title="Drag to resize"></div>
+      </aside>
+    </div>
+
+    <!-- ============ STATUS BAR ============ -->
+    <div class="statusbar">
+      <span class="statusbar__connected"><span class="statusbar__pulse"></span>Connected</span>
+      <span class="statusbar__sep">·</span>
+      <span class="statusbar__branch">
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#6d7178" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="8" r="2.5"/><path d="M6 8.5v7M18 10.5c0 4-6 2-6 5.5"/></svg>
+        main
+      </span>
+      <span class="statusbar__sep">·</span>
+      <span class="statusbar__path" id="status-path">screens/Matchmaking VS.html</span>
+      <span class="statusbar__right">
+        <span class="statusbar__mem">mem: 6 stages</span>
+        <span class="statusbar__sep">·</span>
+        <span>router 3/turn</span>
+        <span class="statusbar__sep">·</span>
+        <span class="statusbar__ctx">ctx 42%</span>
+        <span class="statusbar__sep">·</span>
+        <span class="statusbar__extracted">
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+          7 extracted
+        </span>
+        <span class="statusbar__sep">·</span>
+        <span class="statusbar__model">Opus 4.8 High</span>
+      </span>
+    </div>
+
+    <!-- ============ WELCOME OVERLAY (no folder) ============ -->
+    <div class="welcome-overlay" id="welcome-overlay" hidden>
+      <div class="welcome">
+        <div class="welcome__brand">
+          <div class="welcome__logo">
+            <svg width="36" height="36" viewBox="0 0 24 24" fill="#fff"><path d="M12 2l2.2 6.3L20.5 10l-6.3 1.7L12 18l-1.7-6.3L4 10l6.3-1.7z"/></svg>
+          </div>
+          <div class="welcome__brand-name">Farnsworth</div>
+        </div>
+        <div class="welcome__title">Open a folder to start designing</div>
+        <div class="welcome__sub">An AI-based IDE for games. Pick a project to begin — chat becomes the design surface.</div>
+
+        <button class="welcome__primary" id="welcome-open-btn">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+          Open Folder…
+          <span class="welcome__kbd">⌘O</span>
+        </button>
+
+        <div class="welcome__recent" id="welcome-recent">
+          <div class="welcome__recent-label">RECENT</div>
+          <div class="welcome__recent-list" id="welcome-recent-list"></div>
+        </div>
+
+        <div class="welcome__hint">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16h.01"/></svg>
+          Farnsworth is folder-based — pick a directory containing your project files.
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ APP TYPE SELECTOR ============ -->
+    <div class="apptype-overlay" id="apptype-overlay" hidden>
+      <div class="apptype">
+        <div class="apptype__head">
+          <div class="apptype__head-icon">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#5865f2" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="7" width="18" height="13" rx="2"/><path d="M8 7V5a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+          </div>
+          <div>
+            <div class="apptype__title">What kind of app are you building?</div>
+            <div class="apptype__sub" id="apptype-folder-name">Loading…</div>
+          </div>
+        </div>
+        <div class="apptype__grid">
+          <button class="apptype__card" data-type="threejs">
+            <div class="apptype__icon apptype__icon--threejs">
+              <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#3ab7f0" stroke-width="1.6"><path d="M12 2L2 7v10l10 5 10-5V7z"/><path d="M2 7l10 5 10-5M12 12v10"/></svg>
+            </div>
+            <div class="apptype__name">Three.js Game</div>
+            <div class="apptype__desc">WebGL games built on three.js. 3D scenes, controls, shaders.</div>
+            <div class="apptype__files">index.html · src/*.js · assets/</div>
+          </button>
+          <button class="apptype__card" data-type="blockchain">
+            <div class="apptype__icon apptype__icon--blockchain">
+              <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#f0b232" stroke-width="1.6"><path d="M12 2l9 5v10l-9 5-9-5V7z"/><path d="M3 7l9 5 9-5M12 12v10M7.5 4.5l9 5M16.5 14.5l-9-5"/></svg>
+            </div>
+            <div class="apptype__name">Blockchain Game</div>
+            <div class="apptype__desc">On-chain games with wallet integration and asset ownership.</div>
+            <div class="apptype__files">contracts/ · web/ · scripts/</div>
+          </button>
+          <button class="apptype__card" data-type="devvit">
+            <div class="apptype__icon apptype__icon--devvit">
+              <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#eb459e" stroke-width="1.6"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4"/><circle cx="12" cy="12" r="1.5" fill="#eb459e" stroke="none"/></svg>
+            </div>
+            <div class="apptype__name">Devvit Reddit Game</div>
+            <div class="apptype__desc">Apps built for Reddit's Devvit platform. Posts, blocks, mod tools.</div>
+            <div class="apptype__files">devvit.json · src/main.tsx · post.json</div>
+          </button>
+        </div>
+        <div class="apptype__skip">
+          <button class="apptype__skip-btn" id="apptype-skip">Skip — I'll set this later</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ SETTINGS OVERLAY ============ -->
+    <div class="settings-overlay" id="settings-overlay" hidden>
+      <div class="settings-overlay__backdrop" data-close-settings></div>
+      <div class="settings" role="dialog" aria-label="Settings">
+        <header class="settings__header">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="#a855f7" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.27.61.86 1 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+          <span class="settings__title">Settings</span>
+          <div class="settings__search">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg>
+            Search settings…
+          </div>
+          <button class="iconbtn" data-close-settings title="Close">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+          </button>
+        </header>
+        <div class="settings__body">
+          <nav class="settings__rail" id="settings-rail">
+            <div class="settings__rail-label">SETTINGS</div>
+            <button class="settings__rail-item" data-page="ai">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/></svg>
+              AI
+            </button>
+            <button class="settings__rail-item" data-page="memory">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="7" width="16" height="12" rx="2"/><path d="M8 7V5a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M9 12h6M9 15h4"/></svg>
+              Memory
+            </button>
+            <button class="settings__rail-item" data-page="canvas">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M8 21h8M12 18v3"/></svg>
+              Canvas
+            </button>
+            <button class="settings__rail-item" data-page="workspace">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="7" width="18" height="13" rx="2"/><path d="M8 7V5a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+              Workspace
+            </button>
+            <button class="settings__rail-item" data-page="appearance">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 3a4 4 0 0 0 0 8 3 3 0 0 1 0 6"/><circle cx="8" cy="9" r="1" fill="currentColor" stroke="none"/><circle cx="9" cy="15" r="1" fill="currentColor" stroke="none"/></svg>
+              Appearance
+            </button>
+            <button class="settings__rail-item" data-page="account">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 4-6 8-6s8 2 8 6"/></svg>
+              Account
+            </button>
+          </nav>
+          <main class="settings__pane" id="settings-pane"><!-- rendered by app.js --></main>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <script>
+    // xterm + addons must load BEFORE Monaco — Monaco's AMD define() hijacks the
+    // global `define`, which makes xterm's UMD wrapper call define([], ...) and
+    // crashes Monaco's loader ("Can only have one anonymous define call per script").
+    // Loading xterm first keeps window.define undefined, so xterm falls into the
+    // UMD wrapper's else branch and assigns Terminal/FitAddon to window directly.
+  </script>
+  <script src="node_modules/xterm/lib/xterm.js"></script>
+  <script src="node_modules/@xterm/addon-fit/lib/addon-fit.js"></script>
+  <script src="node_modules/@xterm/addon-web-links/lib/addon-web-links.js"></script>
+  <script>
+    // Monaco workers — Electron loads via file:// URLs.
+    self.MonacoEnvironment = {
+      getWorkerUrl: function(moduleId, label) {
+        if (label === 'json') return 'node_modules/monaco-editor/min/vs/language/json/json.worker.js';
+        if (label === 'css' || label === 'scss' || label === 'less') return 'node_modules/monaco-editor/min/vs/language/css/css.worker.js';
+        if (label === 'html') return 'node_modules/monaco-editor/min/vs/language/html/html.worker.js';
+        if (label === 'typescript' || label === 'javascript') return 'node_modules/monaco-editor/min/vs/language/typescript/ts.worker.js';
+        return 'node_modules/monaco-editor/min/vs/base/worker/workerMain.js';
+      }
+    };
+  </script>
+  <script src="node_modules/monaco-editor/min/vs/loader.js"></script>
+  <script>
+    require.config({ paths: { vs: 'node_modules/monaco-editor/min/vs' } });
+    require(['vs/editor/editor.main'], function() {
+      window.__monacoReady = true;
+      window.dispatchEvent(new Event('monaco-ready'));
+    });
+  </script>
+  <!-- Chat surface renderer modules (must load before app.js) -->
+  <script src="src/surfaces/index.js"></script>
+  <script src="src/surfaces/card.js"></script>
+  <script src="src/surfaces/choice.js"></script>
+  <script src="src/surfaces/confirmation.js"></script>
+  <script src="src/surfaces/copy_block.js"></script>
+  <script src="src/surfaces/work_result.js"></script>
+  <script src="src/surfaces/form.js"></script>
+  <script src="src/surfaces/credential.js"></script>
+  <script src="src/surfaces/oauth_connect.js"></script>
+  <script src="src/surfaces/file_change.js"></script>
+  <script src="src/surfaces/live_preview.js"></script>
+  <script src="src/surfaces/test_status.js"></script>
+  <script src="src/surfaces/memory_recall.js"></script>
+  <script src="src/app.js"></script>
+</body>
+</html>

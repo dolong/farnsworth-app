@@ -2,7 +2,7 @@
 // Electron desktop shell. SQLite-backed persistence (db.js), folder-based workspace,
 // Claude auth (manual API key + OAuth PKCE via claude.ai), real file operations.
 
-const { app, BrowserWindow, ipcMain, shell, dialog, safeStorage, Menu } = require('electron');
+const { app, BrowserWindow, BrowserView, WebContentsView, ipcMain, shell, dialog, safeStorage, Menu } = require('electron');
 const path = require('path');
 const os = require('os');
 // `fs` is fs/promises — used by 13 `await fs.xxx(...)` call sites in
@@ -437,6 +437,11 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
+      // Enable <webview> tag — used by the canvas live preview to load the
+      // dev server in a separate, CDP-targetable renderer process. Lets us
+      // attach automation (agent-browser) directly to the preview frame
+      // instead of fighting cross-origin barriers from the parent renderer.
+      webviewTag: true,
     },
   });
 
@@ -522,7 +527,11 @@ function createWindow() {
 ipcMain.handle('settings:get', async () => db.getAllSettings());
 
 ipcMain.handle('settings:set', async (_event, settings) => {
-  db.setAllSettings(Object.entries(settings || {}));
+  // Pass the OBJECT — setAllSettings runs Object.entries itself. Passing
+  // entries here double-converted and wrote numeric keys ('0','1',...) with
+  // ["key",value] pair values, silently breaking bulk settings persistence
+  // for every key (found Jul 12 while wiring testingModel).
+  db.setAllSettings(settings || {});
   return true;
 });
 // Single-key getters/setters — preferred for new code. The bulk
@@ -551,7 +560,7 @@ ipcMain.handle('setting:set', async (_event, key, value) => {
 // Returns { available: true, type, url, pid, startedAt } when the dev
 // server is up, or { available: false } (or { available: false, url, pid,
 // dead: true }) when the meta file is missing or the process is dead.
-ipcMain.handle('dev:farnsworth:get', async (_event, appType = 'devvit') => {
+ipcMain.handle('dev:farnsworth:get', async (_event, appType = 'devvit', repoRoot) => {
   const fs = require('fs');
   const path = require('path');
   const type = (typeof appType === 'string' && appType) ? appType : 'devvit';
@@ -560,9 +569,31 @@ ipcMain.handle('dev:farnsworth:get', async (_event, appType = 'devvit') => {
     const raw = await fs.promises.readFile(metaPath, 'utf8');
     const meta = JSON.parse(raw);
     if (!meta || !meta.pid || !meta.url) return { available: false, type };
+    // Validate the cached dev server belongs to the current workspace.
+    // Long Jul 9 ~15:05 ET — without this, opening a different workspace
+    // (e.g. Farnsworth itself) would still load the iframe pointed at
+    // lastdraft's last session's dev server, which auto-plays bgMusic and
+    // wedges Cmd+Q. If the cache's repoRoot doesn't match the active
+    // workspace, treat as not-available (the dev server belongs to a
+    // different project — likely orphaned after a folder switch).
+    if (repoRoot && typeof repoRoot === 'string' && meta.repoRoot && meta.repoRoot !== repoRoot) {
+      return { available: false, type, reason: 'wrong_workspace', cachedRepoRoot: meta.repoRoot };
+    }
     try { process.kill(meta.pid, 0); }
     catch { return { available: false, type, url: meta.url, pid: meta.pid, dead: true }; }
-    return { available: true, type, url: meta.url, pid: meta.pid, startedAt: meta.startedAt };
+    // serverPid + serverUrl added Jul 10 when the Farnsworth-side
+    // server-runner spawned alongside Vite (emulator-backed tRPC + Hono
+    // on port 3000). Older meta files without these fields are valid —
+    // renderer should treat undefined as "not available".
+    return {
+      available: true,
+      type,
+      url: meta.url,
+      pid: meta.pid,
+      startedAt: meta.startedAt,
+      serverPid: meta.serverPid || null,
+      serverUrl: meta.serverUrl || null,
+    };
   } catch {
     return { available: false, type };
   }
@@ -639,9 +670,16 @@ ipcMain.handle('dev:farnsworth:boot', async (_event, appType = 'devvit', repoRoo
         };
         const cacheDir = path2.join(os2.homedir(), '.cache');
         fs2.mkdirSync(cacheDir, { recursive: true });
-        const cfgPath = path2.join(cacheDir, `farnsworth-devvit-${Buffer.from(repoRoot).toString('hex').slice(0, 16)}.json`);
+        const repoHash = Buffer.from(repoRoot).toString('hex').slice(0, 16);
+        const cfgPath = path2.join(cacheDir, `farnsworth-devvit-${repoHash}.json`);
+        // Phase 1: separate state file for emulator-internal state (Redis
+        // store + Reddit posts/comments/flairs). Hydrated on boot, written
+        // back debounced on writes. Survives dev server restarts so the
+        // game doesn't reset between code reloads.
+        const statePath = path2.join(cacheDir, `farnsworth-devvit-${repoHash}-state.json`);
         fs2.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
         env.DEVVIT_EMULATOR_CONFIG = cfgPath;
+        env.DEVVIT_EMULATOR_STATE = statePath;
         // Also expose the config to the browser-side shim via Vite's
         // import.meta.env.VITE_* substitution. The dev-tools vite's
         // @devvit/web/client shim (the-last-draft/dev-tools/devvit-shim.ts)
@@ -712,15 +750,23 @@ ipcMain.handle('dev:farnsworth:stop', async (_event, appType = 'devvit') => {
   const type = (typeof appType === 'string' && appType) ? appType : 'devvit';
   const metaPath = path.join(os.homedir(), '.cache', `farnsworth-${type}.json`);
 
-  // Kill by pid from meta if present.
+  // Kill by pid from meta if present. serverPid was added Jul 10 when the
+  // Farnsworth-side server-runner spawned alongside Vite (so the workspace's
+  // src/server/ tRPC + Hono code runs against the emulator's persistent
+  // redis). Older meta files without serverPid are handled gracefully.
   try {
     const meta = JSON.parse(await fs.promises.readFile(metaPath, 'utf8'));
     if (meta && meta.pid) { try { process.kill(meta.pid, 'SIGKILL'); } catch {} }
+    if (meta && meta.serverPid) { try { process.kill(meta.serverPid, 'SIGKILL'); } catch {} }
   } catch {}
 
-  // Belt-and-suspenders: kill any lingering devtools vite process.
+  // Belt-and-suspenders: kill any lingering devtools vite process + the
+  // server-runner (added Jul 10).
   await new Promise((resolve) => {
     execFile('pkill', ['-f', 'vite.devtools.config.ts'], () => resolve());
+  });
+  await new Promise((resolve) => {
+    execFile('pkill', ['-f', 'server-runner.mjs'], () => resolve());
   });
 
   // Clear the meta so get/re-detect reports unavailable.
@@ -827,6 +873,378 @@ ipcMain.handle('devvit:set-project-settings', async (_event, workspacePath, curr
 });
 
 // ============================================================
+// IPC: Canvas WebContentsView (Jul 9 ~18:55 ET)
+// ============================================================
+// The canvas live preview renders the dev server inside a
+// WebContentsView (not a <webview>) so the inner viewport's dimensions
+// match the container's pixel rect. Electron's <webview> tag locks the
+// inner viewport at first-load size (~300x150 HTML default) and never
+// propagates height changes from CSS — the game renders squished to a
+// 150px strip.
+//
+// BrowserView (the legacy API) was tried first (Jul 9 ~18:20 ET) but
+// failed to visually composite on top of the renderer in Electron 31
+// despite the webContents loading correctly (verified via its own
+// debugger target — game rendered at 390x844 inside, but the
+// BrowserView's pixels never appeared on the Farnsworth window).
+// WebContentsView is the modern replacement (Electron 28+); it uses
+// the same View hierarchy as BrowserView but is wired via
+// `mainWindow.contentView.addChildView()` and composes correctly.
+//
+// Trade-offs vs <webview>:
+// - WebContentsView renders on top of the renderer (separate webContents)
+// - z-order is determined by add order (most recent on top)
+// - Click events inside the view are captured by it; outside clicks
+//   pass through to the renderer
+// - Doesn't share the renderer's CSS, session storage, or DevTools
+//   target — its own debugger target is at port 9222 type=page
+
+const canvasWebContentsViews = new Map();
+
+ipcMain.handle('canvas:createView', async (_event, { viewId, url, bounds }) => {
+  try {
+    // Re-create if a view with this ID already exists (defensive).
+    if (canvasWebContentsViews.has(viewId)) {
+      const existing = canvasWebContentsViews.get(viewId);
+      existing.setBounds(bounds);
+      try { existing.webContents.loadURL(url); } catch {}
+      return { ok: true, updated: true };
+    }
+    const view = new WebContentsView({
+      webPreferences: {
+        partition: 'persist:farnsworth',
+        nodeIntegration: false,
+        contextIsolation: true,
+        sandbox: false,
+      }
+    });
+    mainWindow.contentView.addChildView(view);
+    view.setBounds(bounds);
+    view.webContents.loadURL(url);
+    canvasWebContentsViews.set(viewId, view);
+    return { ok: true };
+  } catch (e) {
+    console.error('[canvas:createView] error:', e);
+    return { ok: false, error: e.message };
+  }
+});
+
+ipcMain.handle('canvas:updateViewBounds', (_event, { viewId, bounds }) => {
+  const view = canvasWebContentsViews.get(viewId);
+  if (!view) return { ok: false, error: 'view_not_found' };
+  try {
+    view.setBounds(bounds);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
+
+ipcMain.handle('canvas:removeView', (_event, { viewId }) => {
+  const view = canvasWebContentsViews.get(viewId);
+  if (!view) return { ok: false, error: 'view_not_found' };
+  try {
+    mainWindow.contentView.removeChildView(view);
+    view.webContents.destroy();
+    canvasWebContentsViews.delete(viewId);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
+
+// Nuke every canvas WebContentsView at once. Used by the renderer when the
+// preview mode changes (testview -> Post View, mobile -> desktop, etc.) to
+// catch the async setup race: if a view is created via canvasCreateView
+// AFTER teardown has already run, it stays orphaned in the
+// canvasWebContentsViews map with no DOM placeholder referencing it.
+// Calling removeAllViews on every preview switch ensures no view survives
+// across previews regardless of in-flight createView promises. Jul 11
+// ~16:30 ET — testview orphan bug fix.
+ipcMain.handle('canvas:removeAllViews', () => {
+  try {
+    for (const [viewId, view] of canvasWebContentsViews) {
+      try {
+        mainWindow.contentView.removeChildView(view);
+        view.webContents.destroy();
+      } catch {}
+    }
+    canvasWebContentsViews.clear();
+    return { ok: true, removed: canvasWebContentsViews.size };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
+
+// Switch the canvas preview mode (post | mobile | desktop | fullscreen | testview).
+// Used by the chat agent's open_testview tool (Jul 11 ~18:50 ET) and any
+// future programmatic preview switcher. Forwards to the renderer via
+// 'canvas:setPreview' IPC; the renderer's handler nukes WebContentsViews,
+// sets state.preview, syncs the resolution dropdown, and re-renders —
+// exactly what the size-toggle click does.
+ipcMain.handle('canvas:setPreview', (_event, { preview } = {}) => {
+  try {
+    const allowed = ['post', 'mobile', 'desktop', 'fullscreen', 'testview'];
+    if (!preview || !allowed.includes(preview)) {
+      return { ok: false, error: 'invalid_preview', allowed };
+    }
+    const target = BrowserWindow.getFocusedWindow() || mainWindow || openWindows[0];
+    if (!target || target.isDestroyed()) return { ok: false, error: 'no_window' };
+    target.webContents.send('canvas:setPreview', { preview });
+    return { ok: true, preview };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
+
+// Toggle visibility of a canvas WebContentsView without destroying it.
+// Used by modals/popovers that overlap the canvas region (e.g. the Devvit
+// emulator cogwheel popover) — the WebContentsView is a separate composited
+// layer that CSS z-index cannot affect, so hide it instead.
+ipcMain.handle('canvas:setVisible', (_event, { viewId, visible }) => {
+  const view = canvasWebContentsViews.get(viewId);
+  if (!view) return { ok: false, error: 'view_not_found' };
+  try {
+    view.setVisible(visible !== false);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
+
+// Debug: inspect a canvas WebContentsView's state.
+ipcMain.handle('canvas:debugView', (_event, { viewId }) => {
+  const view = canvasWebContentsViews.get(viewId);
+  if (!view) return { found: false, error: 'view_not_found' };
+  const wc = view.webContents;
+  try {
+    return {
+      found: true,
+      url: wc.getURL(),
+      title: wc.getTitle(),
+      isLoading: wc.isLoading(),
+      isCrashed: wc.isCrashed(),
+      bounds: view.getBounds(),
+    };
+  } catch (e) {
+    return { found: true, error: e.message };
+  }
+});
+
+// ============================================================
+// IPC: Test scripts (NLP test creator, Jul 10 ~23:50 ET)
+//
+// Per-project location (Jul 11 ~18:38 ET — was ~/Documents/farnsworth-tests/tests/
+// globally). Tests now live at <project>/.farnsworth/devvit-tests/ matching the
+// existing .farnsworth/config.json per-project pattern (Jul 2 ~15:08 ET). Each
+// IPC handler takes a `folder` arg pointing at the active project root and
+// computes the test dir from it. The Python runner moved to
+// ~/Documents/Farnsworth/app/farnsworth-test.py — Farnsworth owns its own test
+// infrastructure tool. Long's request: "shouldnt it make sense to make it in
+// .farnsworth/devvit-tests/ maybe per project".
+//
+// Save: writes a JSON test script to <project>/.farnsworth/devvit-tests/
+// Run:  spawns the Python CDP test runner against the saved file
+//
+// These back the in-canvas test editor in Test View (Jul 11 ~16:42 ET)
+// plus the optional NLP "Generate from description" button.
+// ============================================================
+const TEST_RUNNER_PATH = path.join(app.getAppPath(), 'farnsworth-test.py');
+
+// Settings → AI → Testing model: display name → API id for the runner env
+// (FARNSWORTH_TEST_MODEL). Mirrors src/app.js modelToApiId — keep in sync.
+// Unknown values pass through: the runner accepts haiku/sonnet/opus aliases
+// and full API ids. Returns null when the setting is unset (runner default:
+// claude-sonnet-4-5).
+const MODEL_DISPLAY_TO_API = {
+  'Opus 4.8': 'claude-opus-4-8',
+  'Opus 4.8 High': 'claude-opus-4-8',
+  'Opus 4.7': 'claude-opus-4-7',
+  'Opus 4.6': 'claude-opus-4-6',
+  'Opus 4.5': 'claude-opus-4-5-20251101',
+  'Sonnet 5': 'claude-sonnet-5',
+  'Sonnet 4.6': 'claude-sonnet-4-6',
+  'Sonnet 4.5': 'claude-sonnet-4-5',
+  'Haiku 4.5': 'claude-haiku-4-5',
+  'Fable 5': 'claude-fable-5',
+};
+
+function testingModelApiId() {
+  const display = db.getSetting('testingModel');
+  if (!display || typeof display !== 'string') return null;
+  return MODEL_DISPLAY_TO_API[display] || display;
+}
+
+// Resolve a per-project tests dir from a `folder` arg. The folder must
+// be a valid project root; validate that it exists + is a directory before
+// computing the .farnsworth/devvit-tests/ path. If `folder` is missing or
+// invalid, return null so the IPC handlers can surface a "pick a folder
+// first" hint in the renderer.
+function resolveTestScriptsDir(folder) {
+  if (!folder || typeof folder !== 'string') return null;
+  const resolved = path.resolve(folder);
+  let stat;
+  try { stat = fsSync.statSync(resolved); } catch { return null; }
+  if (!stat.isDirectory()) return null;
+  return path.join(resolved, '.farnsworth', 'devvit-tests');
+}
+
+ipcMain.handle('test:list', async (_event, { folder } = {}) => {
+  // List all JSON tests in <folder>/.farnsworth/devvit-tests/ for the
+  // Test View canvas preview (Jul 11 14:50 ET). Per-project location
+  // adopted Jul 11 ~18:38 ET — each Devvit app has its own tests folder
+  // that travels with the project. Returns name/path/size/modified for
+  // each file; the renderer uses this to populate the test runner panel.
+  // If folder is missing/invalid, return ok:false so the renderer can
+  // show "pick a folder first" instead of an empty list.
+  const dir = resolveTestScriptsDir(folder);
+  if (!dir) return { ok: false, error: 'no_folder', folder };
+  try {
+    await fs.mkdir(dir, { recursive: true });
+    const entries = await fs.readdir(dir, { withFileTypes: true });
+    const tests = [];
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+      const filePath = path.join(dir, entry.name);
+      const stat = await fs.stat(filePath);
+      tests.push({
+        name: entry.name.replace(/\.json$/i, ''),
+        path: filePath,
+        size: stat.size,
+        modified: stat.mtimeMs,
+      });
+    }
+    // Sort by name (stable for users — same order every load).
+    tests.sort((a, b) => a.name.localeCompare(b.name));
+    return { ok: true, tests, dir };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
+
+ipcMain.handle('test:save', async (_event, { folder, name, json }) => {
+  try {
+    const dir = resolveTestScriptsDir(folder);
+    if (!dir) return { ok: false, error: 'no_folder', folder };
+    if (!name || typeof name !== 'string') return { ok: false, error: 'missing_name' };
+    if (!json || typeof json !== 'string') return { ok: false, error: 'missing_json' };
+    // Validate JSON before writing so we don't persist malformed scripts
+    try { JSON.parse(json); } catch (e) {
+      return { ok: false, error: 'invalid_json', message: e.message };
+    }
+    const safeName = name.replace(/[^a-z0-9]+/gi, '-').toLowerCase().replace(/^-+|-+$/g, '');
+    if (!safeName) return { ok: false, error: 'invalid_name' };
+    const filePath = path.join(dir, `${safeName}.json`);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(filePath, json + '\n', 'utf8');
+    return { ok: true, path: filePath, name: safeName };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
+
+ipcMain.handle('test:run', async (_event, { path: testPath }) => {
+  // test:run takes an absolute test path (not a folder) — the renderer
+  // already knows the per-project dir from the test:list response, and
+  // passes the full path through. This lets the IPC work for tests that
+  // live anywhere, not just the active project's dir.
+  try {
+    if (!testPath || typeof testPath !== 'string') return { ok: false, error: 'missing_path' };
+    // Spawn the Python test runner. Capture stdout+stderr, resolve with
+    // the merged output. Exit code 0 = pass, non-zero = fail (but a test
+    // can also exit 0 with "X failed" in stdout — treat that as partial).
+    // cwd is the Farnsworth app dir so the runner's relative imports
+    // (if any) resolve against its own location; the test path is
+    // absolute so cwd doesn't affect what the runner targets.
+    const { spawn } = require('child_process');
+    // Inject the chat's auth into the runner env so llm-step can take the
+    // direct-API fast path (one POST, screenshot inline) instead of shelling
+    // to the claude CLI. Runner falls back to the CLI when absent. Jul 11.
+    const llmAuth = await getValidAccessToken().catch(() => null);
+    const runnerEnv = { ...process.env };
+    if (llmAuth && llmAuth.token) {
+      runnerEnv.FARNSWORTH_AUTH_TOKEN = llmAuth.token;
+      runnerEnv.FARNSWORTH_AUTH_KIND = llmAuth.kind || 'api_key';
+    }
+    const testModel = testingModelApiId();
+    if (testModel) runnerEnv.FARNSWORTH_TEST_MODEL = testModel;
+    return await new Promise((resolve) => {
+      const proc = spawn('python3', [TEST_RUNNER_PATH, testPath], {
+        cwd: app.getAppPath(),
+        env: runnerEnv,
+      });
+      let stdout = '';
+      let stderr = '';
+      proc.stdout.on('data', d => stdout += d.toString());
+      proc.stderr.on('data', d => stderr += d.toString());
+      proc.on('close', code => {
+        const failedMatch = stdout.match(/(\d+)\s+failed/);
+        const failed = failedMatch ? Number(failedMatch[1]) : 0;
+        resolve({
+          ok: code === 0 && failed === 0,
+          code,
+          failed,
+          stdout: stdout.slice(-4000),  // tail, in case of long output
+          stderr: stderr.slice(-2000),
+        });
+      });
+      proc.on('error', err => {
+        resolve({ ok: false, error: err.message });
+      });
+    });
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
+
+// Read a test JSON's contents (used by the Test View editor when the user
+// clicks Edit on a row — load the file's text into the editor textarea so
+// they can modify it). Returns the raw JSON string (not parsed) so the
+// editor can preserve formatting. Jul 11 ~16:42 ET — inline test editor
+// feature in Test View (deprecates the standalone test creator modal).
+// Per-project location: <folder>/.farnsworth/devvit-tests/<name>.json
+// (Jul 11 ~18:38 ET — was the global ~/Documents/farnsworth-tests/tests/).
+ipcMain.handle('test:read', async (_event, { folder, name }) => {
+  try {
+    const dir = resolveTestScriptsDir(folder);
+    if (!dir) return { ok: false, error: 'no_folder', folder };
+    if (!name || typeof name !== 'string') return { ok: false, error: 'missing_name' };
+    const safeName = name.replace(/[^a-z0-9]+/gi, '-').toLowerCase().replace(/^-+|-+$/g, '');
+    if (!safeName) return { ok: false, error: 'invalid_name' };
+    const filePath = path.join(dir, `${safeName}.json`);
+    const json = await fs.readFile(filePath, 'utf8');
+    return { ok: true, path: filePath, name: safeName, json };
+  } catch (e) {
+    if (e.code === 'ENOENT') return { ok: false, error: 'not_found' };
+    return { ok: false, error: e.message };
+  }
+});
+
+// Delete a test JSON. Used by the Test View row's × button (with
+// browser-confirm prompt in the renderer). Idempotent: returns ok:true
+// even if the file didn't exist (matches `rm -f` semantics). Jul 11
+// ~16:42 ET — see test:read for context. Per-project location:
+// <folder>/.farnsworth/devvit-tests/<name>.json (Jul 11 ~18:38 ET).
+ipcMain.handle('test:delete', async (_event, { folder, name }) => {
+  try {
+    const dir = resolveTestScriptsDir(folder);
+    if (!dir) return { ok: false, error: 'no_folder', folder };
+    if (!name || typeof name !== 'string') return { ok: false, error: 'missing_name' };
+    const safeName = name.replace(/[^a-z0-9]+/gi, '-').toLowerCase().replace(/^-+|-+$/g, '');
+    if (!safeName) return { ok: false, error: 'invalid_name' };
+    const filePath = path.join(dir, `${safeName}.json`);
+    try {
+      await fs.unlink(filePath);
+    } catch (e) {
+      if (e.code !== 'ENOENT') throw e;
+    }
+    return { ok: true, path: filePath, name: safeName };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
+
+// ============================================================
 // IPC: Memory system (Tier 1, Jul 5 2026)
 //
 // Surface mirrors Vellum's 6-layer pipeline in compressed form:
@@ -837,20 +1255,254 @@ ipcMain.handle('devvit:set-project-settings', async (_event, workspacePath, curr
 // consolidate = flip buffer rows to consolidated (Tier 2: merge into concept)
 // archive   = read daily log (for debugging + future community-memory)
 // ============================================================
+// ============================================================
+// Memory Tier 3 — per-stage model pipeline (Jul 12 2026)
+//
+// Five real stages, each with its own model + toggle read from the
+// 'memory' settings row (written by Settings → Memory in the renderer):
+//   1 extraction    — distills each turn into durable facts (Haiku 4.5)
+//   2 consolidation — merges buffer → concept sections (Sonnet 5,
+//                     scheduled + buffer-threshold + manual)
+//   3 retrieval     — re-ranks recall results (Sonnet 5, on demand)
+//   4 router        — picks concept articles pre-turn (Haiku 4.5)
+//   5 l2selector    — picks sections within routed articles (Haiku 4.5)
+// Every stage degrades gracefully: disabled / no auth / bad model output
+// falls back to the pre-Tier-3 behavior. Stats per run land in the
+// 'memoryStageStats' settings row for the Settings page.
+// ============================================================
+
+const MEMORY_STAGE_DEFAULTS = {
+  extraction:    { enabled: true, model: 'Haiku 4.5', tier: 'speed',    extract: ['Corrections', 'Preferences', 'Decisions'] },
+  consolidation: { enabled: true, model: 'Sonnet 5',  tier: 'balanced', schedule: 'Daily', autoOnBuffer: true, bufferThreshold: 50 },
+  retrieval:     { enabled: true, model: 'Sonnet 5',  tier: 'balanced', depth: 'Standard', summariesFirst: true, graphSpread: true },
+  router:        { enabled: true, model: 'Haiku 4.5', tier: 'speed',    bucketBudget: 3 },
+  l2selector:    { enabled: true, model: 'Haiku 4.5', tier: 'speed' },
+};
+
+function memoryStageConf(stage) {
+  let saved = null;
+  try {
+    const raw = db.getSetting('memory');
+    saved = raw ? JSON.parse(raw) : null;
+  } catch {}
+  return { ...MEMORY_STAGE_DEFAULTS[stage], ...((saved || {})[stage] || {}) };
+}
+
+// Tolerant JSON extraction from model output (code fences, prose wrapping).
+function memoryParseJson(text) {
+  if (!text || typeof text !== 'string') return null;
+  let t = text.trim();
+  const fence = /```(?:json)?\s*([\s\S]*?)```/.exec(t);
+  if (fence) t = fence[1].trim();
+  const start = t.indexOf('{');
+  const end = t.lastIndexOf('}');
+  if (start === -1 || end === -1 || end <= start) return null;
+  try { return JSON.parse(t.slice(start, end + 1)); } catch { return null; }
+}
+
+// One inference call for a pipeline stage, on the stage's configured model.
+// Returns the response text, or null (stage disabled / no auth / API error).
+// Callers MUST degrade to their non-model behavior on null.
+async function memoryStageInference(stage, system, user, maxTokens = 512) {
+  const conf = memoryStageConf(stage);
+  if (!conf.enabled) return null;
+  const auth = await getValidAccessToken();
+  if (!auth) { console.warn(`[memory tier3] ${stage}: no auth, skipping`); return null; }
+  const model = MODEL_DISPLAY_TO_API[conf.model] || conf.model || 'claude-haiku-4-5';
+  const headers = { 'Content-Type': 'application/json', 'anthropic-version': '2023-06-01' };
+  if (auth.kind === 'oauth') {
+    headers['Authorization'] = `Bearer ${auth.token}`;
+    headers['anthropic-beta'] = 'oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14';
+  } else {
+    headers['x-api-key'] = auth.token;
+  }
+  const t0 = Date.now();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 25000);
+  try {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST', headers, signal: controller.signal,
+      body: JSON.stringify({ model, max_tokens: maxTokens, system, messages: [{ role: 'user', content: user }] }),
+    });
+    const ms = Date.now() - t0;
+    if (!res.ok) {
+      const errText = (await res.text()).slice(0, 300);
+      db.memoryStageStatsPatch(stage, { lastRun: new Date().toISOString(), ms, model, lastError: `${res.status}: ${errText}` }, true);
+      console.warn(`[memory tier3] ${stage} API ${res.status}:`, errText);
+      return null;
+    }
+    const data = await res.json();
+    const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text || '').join('');
+    db.memoryStageStatsPatch(stage, { lastRun: new Date().toISOString(), ms, model, lastError: null }, true);
+    return text;
+  } catch (e) {
+    db.memoryStageStatsPatch(stage, { lastRun: new Date().toISOString(), ms: Date.now() - t0, model, lastError: e.message }, true);
+    console.warn(`[memory tier3] ${stage} failed:`, e.message);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ---- Stage 2: consolidation pass (model-driven merge of buffer → concepts) ----
+let consolidationRunning = false;
+async function runConsolidationPass(reason = 'manual') {
+  if (consolidationRunning) return { ok: false, error: 'already_running' };
+  consolidationRunning = true;
+  try {
+    const buffer = db.memoryBufferList(true, 50);
+    if (!buffer.length) return { ok: true, processed: 0, reason };
+    const conf = memoryStageConf('consolidation');
+    if (!conf.enabled) return db.memoryConsolidate(null); // Tier-1 behavior: flip flags
+    const concepts = db.memoryListConcepts(100);
+    const articleIndex = concepts.map(c => `- ${c.slug} — ${c.title}${c.lead ? ': ' + String(c.lead).slice(0, 120) : ''}`).join('\n') || '(no articles yet)';
+    const bufferLines = buffer.map(b => `[${b.id}] (${b.source || 'chat'}) ${String(b.content).slice(0, 400)}`).join('\n');
+    const system = `You are the consolidation stage of an IDE assistant's memory system. Merge buffered facts into wiki-style concept articles. Prefer appending to existing articles; create an article only for a genuinely new durable topic. Use "essential" only for identity-level facts that must load every session. Use "drop" for noise, duplicates, and transient status. Every buffer id must appear in exactly one op. Return ONLY JSON:
+{"ops":[
+ {"op":"append","ids":[1],"slug":"existing-slug","section":"section heading","content":"markdown to append"},
+ {"op":"create","ids":[2,3],"slug":"kebab-slug","title":"Title","lead":"1-2 sentence standalone summary","body":"markdown with ## section headings"},
+ {"op":"essential","ids":[4],"key":"snake_case_key","value":"short value"},
+ {"op":"drop","ids":[5]}
+]}`;
+    const user = `EXISTING ARTICLES:\n${articleIndex}\n\nBUFFER (unconsolidated facts):\n${bufferLines}`;
+    const text = await memoryStageInference('consolidation', system, user, 2048);
+    if (!text) return { ok: false, error: 'inference_unavailable', reason };
+    const parsed = memoryParseJson(text);
+    if (!parsed || !Array.isArray(parsed.ops)) return { ok: false, error: 'bad_model_output', reason };
+    const applied = { append: 0, create: 0, essential: 0, drop: 0 };
+    const doneIds = new Set();
+    for (const op of parsed.ops) {
+      const ids = Array.isArray(op.ids) ? op.ids.filter(id => buffer.find(b => b.id === id)) : [];
+      try {
+        if (op.op === 'append' && op.slug && op.content) {
+          const r = db.memoryAppendToSection(op.slug, op.section || 'notes', op.content);
+          if (r.ok) applied.append++;
+          else {
+            // Model referenced an unknown slug — recover by creating a
+            // minimal article rather than losing the fact.
+            db.memoryUpsertConcept({ slug: op.slug, title: op.slug.replace(/-/g, ' '), lead: null, body: `## ${op.section || 'notes'}\n\n${op.content}\n`, source: 'consolidation' });
+            applied.create++;
+          }
+        } else if (op.op === 'create' && op.slug && op.title) {
+          db.memoryUpsertConcept({ slug: op.slug, title: op.title, lead: op.lead || null, body: op.body || null, source: 'consolidation' });
+          applied.create++;
+        } else if (op.op === 'essential' && op.key && op.value) {
+          db.memorySetEssential(op.key, op.value, 'consolidation', 0.9);
+          applied.essential++;
+        } else if (op.op === 'drop') {
+          applied.drop++;
+        } else {
+          continue; // malformed op — leave its ids unconsolidated for the next pass
+        }
+        ids.forEach(id => doneIds.add(id));
+      } catch (e) {
+        console.warn('[memory tier3] consolidation op failed:', e.message);
+      }
+    }
+    if (doneIds.size) db.memoryConsolidate([...doneIds]);
+    db.memoryStageStatsSetGlobal('lastConsolidationAt', new Date().toISOString());
+    console.log(`[memory tier3] consolidation (${reason}): ${doneIds.size}/${buffer.length} buffer rows → ${JSON.stringify(applied)}`);
+    return { ok: true, processed: doneIds.size, total: buffer.length, applied, reason };
+  } finally {
+    consolidationRunning = false;
+  }
+}
+
+// Auto-consolidation when the buffer crosses the configured threshold.
+function maybeAutoConsolidate() {
+  try {
+    const conf = memoryStageConf('consolidation');
+    if (!conf.enabled || !conf.autoOnBuffer) return;
+    const threshold = Number(conf.bufferThreshold) || 50;
+    if (db.memoryUnconsolidatedCount() >= threshold && !consolidationRunning) {
+      runConsolidationPass('buffer-threshold').catch(e => console.warn('[memory tier3] auto-consolidation failed:', e.message));
+    }
+  } catch {}
+}
+
+// Scheduled consolidation — Hourly / Daily / Weekly, checked every 30 min
+// (and once shortly after boot).
+const MEMORY_SCHEDULE_MS = { Hourly: 3600e3, Daily: 86400e3, Weekly: 604800e3 };
+function maybeScheduledConsolidation() {
+  try {
+    const conf = memoryStageConf('consolidation');
+    if (!conf.enabled) return;
+    const interval = MEMORY_SCHEDULE_MS[conf.schedule] || MEMORY_SCHEDULE_MS.Daily;
+    const stats = db.memoryStageStatsGet();
+    const last = stats.lastConsolidationAt ? Date.parse(stats.lastConsolidationAt) : 0;
+    if (Date.now() - last >= interval && db.memoryUnconsolidatedCount() > 0 && !consolidationRunning) {
+      runConsolidationPass('scheduled').catch(e => console.warn('[memory tier3] scheduled consolidation failed:', e.message));
+    }
+  } catch {}
+}
+setInterval(maybeScheduledConsolidation, 30 * 60 * 1000);
+setTimeout(maybeScheduledConsolidation, 90 * 1000);
+
 ipcMain.handle('memory:bootstrap', async () => db.memoryBootstrap());
-ipcMain.handle('memory:recall', async (_event, query, limit) => await db.memoryRecall(query, limit));
+ipcMain.handle('memory:recall', async (_event, query, limit) => {
+  const res = await db.memoryRecall(query, limit);
+  // Stage 3: retrieval re-rank. A model orders (and prunes) the concept +
+  // section candidates. Essentials / code / buffer keep their FTS order.
+  // On any failure the raw FTS5-ordered result goes back unchanged.
+  try {
+    const conf = memoryStageConf('retrieval');
+    const candidates = [
+      ...(res.concepts || []).map(c => ({ type: 'concept', ref: c, label: `${c.slug} — ${c.title}: ${String(c.lead || '').slice(0, 120)}` })),
+      ...(res.sections || []).map(s => ({ type: 'section', ref: s, label: `${s.slug} § ${s.heading}: ${String(s.content || '').slice(0, 120)}` })),
+    ];
+    if (conf.enabled && candidates.length > 1) {
+      const list = candidates.map((c, i) => `[${i}] (${c.type}) ${c.label}`).join('\n');
+      const system = 'You rank memory search results. Given a query and numbered candidates, return ONLY JSON {"keep":[indices]} — most relevant first, irrelevant candidates omitted.';
+      const text = await memoryStageInference('retrieval', system, `QUERY: ${query}\n\nCANDIDATES:\n${list}`, 200);
+      const parsed = memoryParseJson(text || '');
+      if (parsed && Array.isArray(parsed.keep) && parsed.keep.length) {
+        const seen = new Set();
+        const keep = parsed.keep.filter(i => Number.isInteger(i) && i >= 0 && i < candidates.length && !seen.has(i) && seen.add(i));
+        res.concepts = keep.filter(i => candidates[i].type === 'concept').map(i => candidates[i].ref);
+        res.sections = keep.filter(i => candidates[i].type === 'section').map(i => candidates[i].ref);
+        res.reranked = true;
+      }
+    }
+  } catch (e) {
+    console.warn('[memory tier3] retrieval re-rank skipped:', e.message);
+  }
+  return res;
+});
 ipcMain.handle('memory:remember', async (_event, content, opts) => {
   const ctx = opts?.context || null;
   const src = opts?.source || 'chat';
   const kind = opts?.kind || 'fact';
-  const bufferRes = db.memoryBufferAppend(content, ctx, src);
-  if (kind !== 'fact') {
-    // Non-fact kinds (correction/commitment/plan/note) also go to the
-    // immutable daily log so they survive across conversations.
-    db.memoryArchiveAppend(kind, content, ctx ? { context: ctx, source: src } : { source: src });
-  } else {
-    db.memoryArchiveAppend('fact', content, ctx ? { context: ctx, source: src } : { source: src });
+  // The immutable daily log always gets the raw content, extraction or not.
+  db.memoryArchiveAppend(kind, content, ctx ? { context: ctx, source: src } : { source: src });
+
+  // Stage 1: extraction. A cheap model distills the raw turn into durable
+  // facts before anything enters the buffer. Disabled / no auth / bad
+  // output → raw buffering (pre-Tier-3 behavior).
+  const conf = memoryStageConf('extraction');
+  if (conf.enabled) {
+    try {
+      const cats = (Array.isArray(conf.extract) && conf.extract.length ? conf.extract : ['Corrections', 'Preferences', 'Decisions']).join(', ');
+      const system = `You are the memory-extraction stage of an IDE assistant. Decide whether this chat content contains durable facts worth remembering across sessions. Focus on: ${cats}. Distill each fact into one short line. Skip small talk, transient status, and code contents. Return ONLY JSON: {"keep":true|false,"items":[{"kind":"correction|preference|decision|name|plan|fact","content":"one-line fact"}]}`;
+      const text = await memoryStageInference('extraction', system, `[source: ${src}] ${String(content).slice(0, 1500)}`, 400);
+      if (text !== null) {
+        const parsed = memoryParseJson(text);
+        if (parsed && parsed.keep === false) return { ok: true, extracted: 0, skipped: true };
+        if (parsed && Array.isArray(parsed.items) && parsed.items.length) {
+          let last = null;
+          for (const item of parsed.items.slice(0, 6)) {
+            if (!item || !item.content) continue;
+            last = db.memoryBufferAppend(`[${item.kind || 'fact'}] ${item.content}`, ctx, 'extraction');
+          }
+          maybeAutoConsolidate();
+          return { ok: true, extracted: parsed.items.length, id: last?.id };
+        }
+      }
+    } catch (e) {
+      console.warn('[memory tier3] extraction failed, raw buffering:', e.message);
+    }
   }
+  const bufferRes = db.memoryBufferAppend(content, ctx, src);
+  maybeAutoConsolidate();
   return bufferRes;
 });
 ipcMain.handle('memory:get', async (_event, slug) => db.memoryGetConcept(slug));
@@ -871,9 +1523,83 @@ ipcMain.handle('memory:essential-get', async (_event, key) => db.memoryGetEssent
 ipcMain.handle('memory:essential-set', async (_event, key, value, source, confidence) => db.memorySetEssential(key, value, source, confidence));
 ipcMain.handle('memory:essential-delete', async (_event, key) => db.memoryDeleteEssential(key));
 ipcMain.handle('memory:essentials', async () => db.memoryListEssentials());
-ipcMain.handle('memory:consolidate', async (_event, bufferIds) => db.memoryConsolidate(bufferIds));
+ipcMain.handle('memory:consolidate', async (_event, bufferIds) => {
+  // Explicit ids (per-row buttons in Settings): plain flag flip. Null (the
+  // "Consolidate all" path): run the real Stage-2 model pass.
+  if (Array.isArray(bufferIds) && bufferIds.length) return db.memoryConsolidate(bufferIds);
+  return await runConsolidationPass('manual');
+});
 ipcMain.handle('memory:archive', async (_event, opts) => db.memoryArchiveList(opts));
 ipcMain.handle('memory:buffer', async (_event, onlyUnconsolidated, limit) => db.memoryBufferList(onlyUnconsolidated, limit));
+
+// ---- Tier 3 IPCs (Jul 12 2026) ----
+
+// Stages 4+5: pre-turn routing. Router picks up to bucketBudget concept
+// articles for the user's new message; the L2 selector then picks sections
+// within them (lead always included). Returns essentials + routed concepts
+// ready for preamble assembly in the renderer.
+ipcMain.handle('memory:route', async (_event, opts = {}) => {
+  const context = String(opts?.context || '').slice(0, 800);
+  const routerConf = memoryStageConf('router');
+  const essentials = db.memoryListEssentials();
+  if (!routerConf.enabled) return { ok: false, disabled: true, essentials };
+  const all = db.memoryListConcepts(150);
+  if (!all.length) return { ok: true, essentials, concepts: [], routed: [] };
+  const budget = Math.max(1, Math.min(Number(routerConf.bucketBudget) || 3, 6));
+  const index = all.map(c => `- ${c.slug} — ${c.title}${c.lead ? ': ' + String(c.lead).slice(0, 140) : ''}`).join('\n');
+  const routerSystem = `You are the memory router of an IDE assistant. Given the user's new message and the article index, pick up to ${budget} articles genuinely useful for answering. Return ONLY JSON {"slugs":["slug",...]}. Return {"slugs":[]} when none are relevant.`;
+  const routerText = await memoryStageInference('router', routerSystem, `USER MESSAGE:\n${context}\n\nARTICLE INDEX:\n${index}`, 200);
+  if (routerText === null) return { ok: false, error: 'router_unavailable', essentials };
+  const routerParsed = memoryParseJson(routerText);
+  const slugs = (Array.isArray(routerParsed?.slugs) ? routerParsed.slugs : [])
+    .filter(s => all.find(c => c.slug === s)).slice(0, budget);
+  if (!slugs.length) return { ok: true, essentials, concepts: [], routed: [] };
+
+  // Stage 5: L2 section selector — only worth a model call when at least
+  // one routed article actually has multiple sections.
+  const l2Conf = memoryStageConf('l2selector');
+  const sectionMap = {};
+  for (const slug of slugs) sectionMap[slug] = db.memorySectionsForConcept(slug);
+  let picks = null;
+  if (l2Conf.enabled && slugs.some(s => (sectionMap[s] || []).length > 1)) {
+    const headingsList = slugs.map(s => `${s}: ${(sectionMap[s] || []).map(x => x.heading).join(' | ') || '(no sections)'}`).join('\n');
+    const l2System = 'You select sections within memory articles. Each article\'s lead paragraph is always included automatically. Given the user message and each article\'s section headings, return ONLY JSON {"picks":[{"slug":"...","sections":["heading",...]}]} — only the sections that matter.';
+    const l2Text = await memoryStageInference('l2selector', l2System, `USER MESSAGE:\n${context}\n\nARTICLE SECTIONS:\n${headingsList}`, 300);
+    const l2Parsed = memoryParseJson(l2Text || '');
+    if (l2Parsed && Array.isArray(l2Parsed.picks)) picks = l2Parsed.picks;
+  }
+
+  const out = [];
+  for (const slug of slugs) {
+    const full = db.memoryGetConcept(slug);
+    if (!full) continue;
+    const secs = sectionMap[slug] || [];
+    if (picks) {
+      const p = picks.find(x => x && x.slug === slug);
+      const wanted = new Set((p?.sections || []).map(h => String(h).toLowerCase()));
+      const chosen = secs.filter(x => wanted.has(String(x.heading).toLowerCase()));
+      out.push({ slug, title: full.title, lead: full.lead, sections: chosen.map(x => ({ heading: x.heading, content: x.content })) });
+    } else if (!l2Conf.enabled) {
+      // L2 disabled: whole article (v2-style injection).
+      out.push({ slug, title: full.title, lead: full.lead, body: full.body });
+    } else {
+      // L2 enabled but didn't run / returned nothing: lead only.
+      out.push({ slug, title: full.title, lead: full.lead, sections: [] });
+    }
+  }
+  return { ok: true, essentials, concepts: out, routed: slugs };
+});
+
+// Manual "Run now" for the consolidation stage (Settings → Memory).
+ipcMain.handle('memory:run-consolidation', async () => await runConsolidationPass('manual'));
+
+// Per-stage run stats + corpus counters for the Settings page.
+ipcMain.handle('memory:stage-stats', async () => ({
+  ok: true,
+  stats: db.memoryStageStatsGet(),
+  bufferCount: db.memoryUnconsolidatedCount(),
+  sectionsCount: db.memorySectionsCount(),
+}));
 
 // ============================================================
 // IPC: Memory Tier 2 — codebase indexer (sqlite-vec)
@@ -2130,8 +2856,61 @@ const AGENT_TOOLS = [
         },
         data: { type: 'object', description: 'Surface-specific payload. Shape depends on surfaceType — see UI-SURFACES.md.' }
       },
-      required: ['surfaceType', 'data']
+      required: ['surfaceType', 'data'],
+      additionalProperties: false
     }
+  },
+  // -------------------------------------------------------------------
+  // Test View tools — chat agent can navigate to Test View, list/read/save
+  // tests, and run them. The chat agent's system prompt references
+  // DEVVIT-TESTS.md which documents the test JSON format. All tools use the
+  // active workspace folder (set via handleFolderPicked → state.folder);
+  // open_testview switches the canvas to Test View so the user can see the
+  // results. Added Jul 11 ~18:50 ET.
+  // -------------------------------------------------------------------
+  {
+    name: 'test_list',
+    description: 'List all JSON tests in the active workspace\'s .farnsworth/devvit-tests/ folder. Returns names, absolute paths, sizes, and modification times. Use this first to see what tests exist before creating, editing, or running one. Requires an open workspace folder.',
+    input_schema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'test_read',
+    description: 'Read a test JSON file from the active workspace\'s .farnsworth/devvit-tests/ folder. Returns the raw JSON string (not parsed) so the editor can preserve formatting. Use this before editing a test to load its current contents.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Test name without .json extension (e.g. "play-tab"). Whitespace becomes dashes.' }
+      },
+      required: ['name']
+    }
+  },
+  {
+    name: 'test_save',
+    description: 'Save a test JSON file to the active workspace\'s .farnsworth/devvit-tests/ folder. JSON is validated before writing. The name is normalized to lowercase-dashes (e.g. "My Test!" → "my-test"). See DEVVIT-TESTS.md for the test format.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Test name (will be normalized to lowercase-dashes)' },
+        json: { type: 'string', description: 'Full test JSON as a string (will be validated)' }
+      },
+      required: ['name', 'json']
+    }
+  },
+  {
+    name: 'test_run',
+    description: 'Run a test against the canvas WebContentsView. Takes the test\'s ABSOLUTE file path (not a name) — get it from test_list or test_save results. Returns stdout/stderr (last 4000/2000 chars), exit code, and a `failed` count parsed from the runner output.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Absolute path to the test JSON file (e.g. /Users/long/Documents/lastdraft/the-last-draft/.farnsworth/devvit-tests/play-tab.json)' }
+      },
+      required: ['path']
+    }
+  },
+  {
+    name: 'open_testview',
+    description: 'Navigate the canvas preview to Test View so the user can see the test runner panel. Use this BEFORE test_list / test_save / test_run when the user asks anything about tests — they expect to see Test View, not the Post View. Auto-switches the canvas mode to live if needed. No-op if the canvas is already in Test View.',
+    input_schema: { type: 'object', properties: {} }
   }
 ];
 
@@ -2184,6 +2963,112 @@ async function executeAgentTool(name, input) {
   }
   if (name === 'run_command') {
     return await runShellCommand(input.command);
+  }
+  // -------------------------------------------------------------------
+  // Test View tools (Jul 11 ~18:50 ET) — wire the chat agent to the
+  // existing test:* IPCs + canvas:setPreview. Each handler calls the
+  // exact same logic as the IPC handler so behavior stays consistent.
+  // -------------------------------------------------------------------
+  if (name === 'test_list') {
+    const dir = resolveTestScriptsDir(folder);
+    if (!dir) return { ok: false, error: 'no_folder', message: 'No workspace folder open. Open a folder first.' };
+    try {
+      await fs.mkdir(dir, { recursive: true });
+      const entries = await fs.readdir(dir, { withFileTypes: true });
+      const tests = [];
+      for (const entry of entries) {
+        if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+        const filePath = path.join(dir, entry.name);
+        const stat = await fs.stat(filePath);
+        tests.push({
+          name: entry.name.replace(/\.json$/i, ''),
+          path: filePath,
+          size: stat.size,
+          modified: stat.mtimeMs,
+        });
+      }
+      tests.sort((a, b) => a.name.localeCompare(b.name));
+      return { ok: true, tests, dir };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+  }
+  if (name === 'test_read') {
+    if (!input?.name || typeof input.name !== 'string') return { ok: false, error: 'missing_name' };
+    const dir = resolveTestScriptsDir(folder);
+    if (!dir) return { ok: false, error: 'no_folder', message: 'No workspace folder open. Open a folder first.' };
+    const safeName = input.name.replace(/[^a-z0-9]+/gi, '-').toLowerCase().replace(/^-+|-+$/g, '');
+    if (!safeName) return { ok: false, error: 'invalid_name' };
+    const filePath = path.join(dir, `${safeName}.json`);
+    try {
+      const json = await fs.readFile(filePath, 'utf8');
+      return { ok: true, name: safeName, path: filePath, json };
+    } catch (e) {
+      if (e.code === 'ENOENT') return { ok: false, error: 'not_found', name: safeName };
+      return { ok: false, error: e.message };
+    }
+  }
+  if (name === 'test_save') {
+    if (!input?.name || typeof input.name !== 'string') return { ok: false, error: 'missing_name' };
+    if (!input?.json || typeof input.json !== 'string') return { ok: false, error: 'missing_json' };
+    const dir = resolveTestScriptsDir(folder);
+    if (!dir) return { ok: false, error: 'no_folder', message: 'No workspace folder open. Open a folder first.' };
+    try { JSON.parse(input.json); } catch (e) {
+      return { ok: false, error: 'invalid_json', message: e.message };
+    }
+    const safeName = input.name.replace(/[^a-z0-9]+/gi, '-').toLowerCase().replace(/^-+|-+$/g, '');
+    if (!safeName) return { ok: false, error: 'invalid_name' };
+    const filePath = path.join(dir, `${safeName}.json`);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(filePath, input.json + '\n', 'utf8');
+    return { ok: true, name: safeName, path: filePath };
+  }
+  if (name === 'test_run') {
+    if (!input?.path || typeof input.path !== 'string') return { ok: false, error: 'missing_path' };
+    if (!fsSync.existsSync(input.path)) return { ok: false, error: 'not_found', path: input.path };
+    const { spawn } = require('child_process');
+    // Same auth injection as the test:run IPC — llm-step direct-API fast path.
+    const llmAuth = await getValidAccessToken().catch(() => null);
+    const runnerEnv = { ...process.env };
+    if (llmAuth && llmAuth.token) {
+      runnerEnv.FARNSWORTH_AUTH_TOKEN = llmAuth.token;
+      runnerEnv.FARNSWORTH_AUTH_KIND = llmAuth.kind || 'api_key';
+    }
+    const testModel = testingModelApiId();
+    if (testModel) runnerEnv.FARNSWORTH_TEST_MODEL = testModel;
+    return await new Promise((resolve) => {
+      const proc = spawn('python3', [TEST_RUNNER_PATH, input.path], {
+        cwd: app.getAppPath(),
+        env: runnerEnv,
+      });
+      let stdout = '';
+      let stderr = '';
+      proc.stdout.on('data', d => stdout += d.toString());
+      proc.stderr.on('data', d => stderr += d.toString());
+      proc.on('close', code => {
+        const failedMatch = stdout.match(/(\d+)\s+failed/);
+        const failed = failedMatch ? Number(failedMatch[1]) : 0;
+        resolve({
+          ok: code === 0 && failed === 0,
+          code,
+          failed,
+          stdout: stdout.slice(-4000),
+          stderr: stderr.slice(-2000),
+        });
+      });
+      proc.on('error', err => {
+        resolve({ ok: false, error: err.message });
+      });
+    });
+  }
+  if (name === 'open_testview') {
+    // Switch canvas to Test View. Auto-switches the canvas mode to live
+    // if needed (so the preview actually renders). No-op if already on
+    // testview but we still send the IPC so the renderer can refresh.
+    const target = BrowserWindow.getFocusedWindow() || mainWindow || openWindows[0];
+    if (!target || target.isDestroyed()) return { ok: false, error: 'no_window' };
+    target.webContents.send('canvas:setPreview', { preview: 'testview' });
+    return { ok: true, preview: 'testview' };
   }
   if (name === 'ui_show') {
     // Renderer-side tool. The renderer's sendChatMessage() stream handler
