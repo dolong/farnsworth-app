@@ -318,6 +318,77 @@ function svg(viewBox, paths) {
   });
   return wrap;
 }
+
+// Simple markdown-ish renderer for the chat agent's response text.
+// Jul 13 ~18:50 ET: used by renderMessage() to format the bottom-of-message
+// response with bold/italic/inline code/code blocks/lists. Newlines in the
+// input string are preserved by the parent .msg__text--response CSS
+// (white-space: pre-wrap), so we don't convert \n to <br>. The el() helper
+// uses textContent for strings, so this function returns HTML for innerHTML.
+function renderText(text) {
+  if (!text) return '';
+  // Escape HTML first so user content can't inject markup.
+  let s = text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+
+  // Process line-by-line for unordered lists. We do this BEFORE the other
+  // markdown passes because the inline patterns (bold, code, etc.) can
+  // appear inside list items and should be processed normally.
+  const lines = s.split('\n');
+  const out = [];
+  let inList = false;
+  for (const line of lines) {
+    const liMatch = line.match(/^[\-\*] (.+)$/);
+    if (liMatch) {
+      if (!inList) { out.push('<ul>'); inList = true; }
+      out.push('<li>' + liMatch[1] + '</li>');
+    } else {
+      if (inList) { out.push('</ul>'); inList = false; }
+      out.push(line);
+    }
+  }
+  if (inList) out.push('</ul>');
+  s = out.join('\n');
+
+  // Fenced code blocks (```lang\ncode\n```). Process before inline code
+  // so the block's content isn't touched by inline rules.
+  s = s.replace(/```(\w*)\n([\s\S]*?)```/g, (m, lang, code) => {
+    return '<pre><code>' + code + '</code></pre>';
+  });
+
+  // Inline code (`foo`)
+  s = s.replace(/`([^`\n]+)`/g, '<code>$1</code>');
+
+  // Bold (**text**). Non-greedy, single-line.
+  s = s.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+
+  // Italic (*text*). Non-greedy, single-line, bounded by non-word chars
+  // so we don't match across ** boundaries (already consumed by bold).
+  s = s.replace(/(?<![\w*])\*([^*\n]+)\*(?![\w*])/g, '<em>$1</em>');
+
+  // Headers (## h2, ### h3). Process line-by-line again because the
+  // heading regex anchors on the start of a line.
+  const headingLines = s.split('\n');
+  for (let i = 0; i < headingLines.length; i++) {
+    const h = headingLines[i].match(/^(#{1,3}) (.+)$/);
+    if (h) {
+      const level = h[1].length;
+      const tag = 'h' + level;
+      headingLines[i] = '<' + tag + '>' + h[2] + '</' + tag + '>';
+    }
+  }
+  s = headingLines.join('\n');
+
+  // Links ([text](url))
+  s = s.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s\)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+
+  // Newlines are preserved by the parent's white-space: pre-wrap CSS,
+  // so we don't convert \n to <br> here. The result is a string with
+  // inline markup + raw newlines, rendered as innerHTML.
+  return s;
+}
 function fileIcon(type) {
   // returns SVG string for file-type icon
   const stroke = type === 'jsx' ? '#3ab7f0' : type === 'json' ? '#a855f7' : '#f0883e';
@@ -571,8 +642,17 @@ function renderMessage(m) {
       for (let i = 0; i < 3; i++) dots.appendChild(el('span'));
       working.appendChild(dots);
       body.appendChild(working);
-    } else {
-      body.appendChild(el('div', { class: 'msg__text' }, m.text));
+    }
+    // Jul 13 ~18:50 ET: render preamble (text before any tool_use) as a
+    // small italic "thinking" indicator at the TOP. Render response (text
+    // after all tool_uses complete) as formatted markdown at the BOTTOM
+    // (after chips). Vellum-style chat layout -- no plain text at the
+    // top above the code executions. white-space: pre-wrap preserves
+    // newlines (the prior plain text rendering collapsed them).
+    if (!m.working && m.preambleText && m.preambleText.trim()) {
+      const thinking = el('div', { class: 'msg__text msg__text--thinking' });
+      thinking.innerHTML = renderText(m.preambleText);
+      body.appendChild(thinking);
     }
 
     // Render any inline UI surfaces (task_progress, choice, copy_block, etc.)
@@ -644,7 +724,7 @@ function renderMessage(m) {
             body.appendChild(errDiv);
           }
           const meta = el('div', { class: 'chip__term-meta' });
-          meta.textContent = 'exit ' + (run.exitCode ?? '?') + (run.pipedToTerminal ? ' · piped to terminal' : '');
+          meta.textContent = 'exit ' + (run.exitCode ?? '?');
           body.appendChild(meta);
           // Replace the inner span with a div so the body can be a block element
           chip.style.display = 'block';
@@ -658,6 +738,17 @@ function renderMessage(m) {
       const check = el('div', { class: 'chip chip--check' });
       check.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg><span>Verified against check — all confirmed working.</span>';
       body.appendChild(check);
+    }
+
+    // Jul 13 ~18:50 ET: render the response text (text after all tool_uses
+    // completed) at the BOTTOM as formatted markdown. Uses renderText()
+    // for basic bold/italic/code/lists + white-space: pre-wrap preserves
+    // newlines. Vellum-style chat layout -- the model's answer appears
+    // after the code executions, not before them.
+    if (!m.working && m.responseText && m.responseText.trim()) {
+      const response = el('div', { class: 'msg__text msg__text--response' });
+      response.innerHTML = renderText(m.responseText);
+      body.appendChild(response);
     }
 
     return el('div', { class: 'msg' }, avatar, body);
@@ -8607,16 +8698,33 @@ async function sendChatMessage() {
           tools,
         }, (chunk) => {
           if (chunk.type === 'text_delta') {
-            agentMsg.text = (agentMsg.text || '') + (chunk.text || '');
+            const deltaText = chunk.text || '';
+            // Jul 13 ~18:50 ET: split text into preamble (before any tool_use)
+            // and response (after tools complete). Preamble becomes a small
+            // italic "thinking" indicator at the TOP of the message; response
+            // becomes the formatted markdown text at the BOTTOM (after chips).
+            // Vellum-style chat layout -- text doesn't appear at the top
+            // above the code executions.
+            if (agentMsg._hasSeenToolUse) {
+              agentMsg.responseText = (agentMsg.responseText || '') + deltaText;
+            } else {
+              agentMsg.preambleText = (agentMsg.preambleText || '') + deltaText;
+            }
+            // Keep m.text as the concatenated view for backward compat (history
+            // saves, etc.). renderMessage uses preambleText + responseText.
+            agentMsg.text = (agentMsg.preambleText || '') + (agentMsg.responseText || '');
             scheduleRender();
             // Forward text chunk to companion so it streams incrementally
             sendChatEventToCompanions('chat:delta', {
               messageId: agentMsgId,
-              delta: chunk.text || '',
+              delta: deltaText,
             });
           } else if (chunk.type === 'block_start') {
             const block = chunk.block || {};
             if (block.type === 'tool_use') {
+              // Once we've seen a tool_use, subsequent text goes to responseText
+              // (the formatted answer at the bottom), not preambleText.
+              agentMsg._hasSeenToolUse = true;
               agentMsg.working = true;
               agentMsg.workingLabel = `Preparing ${block.name || 'tool'}…`;
               scheduleRender();
@@ -8747,13 +8855,16 @@ async function sendChatMessage() {
           resultContent = JSON.stringify(toolRes.files || [], null, 2);
         } else if (tu.name === 'run_command') {
           resultContent = (toolRes.stdout || '') + (toolRes.stderr ? '\nstderr: ' + toolRes.stderr : '') + `\nexit ${toolRes.exitCode}`;
-          // Capture output for the terminal chip + visual switch
+          // Capture output for the terminal chip. Long requested that chat-agent
+          // commands stay in chat -- no panel switch, no second execution in the
+          // PTY. The exec() in main.js handles the actual run; its stdout/stderr
+          // is rendered inline by the chip's chip__term-body below (see renderChat
+          // ~line 630).
           agentMsg.runOutputs = [...(agentMsg.runOutputs || []), {
             command: tu.input?.command,
             stdout: toolRes.stdout || '',
             stderr: toolRes.stderr || '',
             exitCode: toolRes.exitCode,
-            pipedToTerminal: !!toolRes.pipedToTerminal,
           }];
           updateAgentMsg({
             chips: [
@@ -8765,8 +8876,6 @@ async function sendChatMessage() {
               },
             ],
           });
-          // Switch to terminal tab so the user sees the command run live
-          if (state.leftPanel !== 'terminal') switchLeftPanel('terminal');
         } else if (tu.name === 'memory_recall') {
           resultContent = toolRes.result || 'No memory matches.';
         } else {

@@ -657,6 +657,79 @@ button { font-family: inherit; cursor: pointer; }
   border-radius: 4px; padding: 1px 5px;
 }
 .msg__text { font-size: 13px; line-height: 1.55; color: #c8ccd2; }
+/* Jul 13 ~18:50 ET: Vellum-style chat layout — preamble text (model's
+   text before any tool_use) becomes a small italic "thinking" indicator
+   at the top of the agent message; response text (after tools) renders
+   as formatted markdown at the bottom. white-space: pre-wrap preserves
+   newlines — the prior plain text rendering collapsed them. */
+.msg__text--thinking {
+  font-size: 12px;
+  font-style: italic;
+  line-height: 1.5;
+  color: #80848e;
+  background: #16171a;
+  border-left: 2px solid #404552;
+  border-radius: 4px;
+  padding: 6px 10px;
+  margin-bottom: 8px;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+.msg__text--response {
+  font-size: 13px;
+  line-height: 1.55;
+  color: #c8ccd2;
+  margin-top: 9px;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+/* Markdown elements rendered by renderText() inside .msg__text--response */
+.msg__text--response code,
+.msg__text--thinking code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: #c8ccd2;
+  background: #1f2023;
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+.msg__text--response strong { font-weight: 600; color: #e8eaed; }
+.msg__text--response em { font-style: italic; }
+.msg__text--response pre {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  background: #16171a;
+  border: 1px solid #2d2f33;
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 6px 0;
+  overflow-x: auto;
+  white-space: pre;
+}
+.msg__text--response pre code {
+  background: transparent;
+  padding: 0;
+  border-radius: 0;
+}
+.msg__text--response ul,
+.msg__text--response ol {
+  padding-left: 22px;
+  margin: 6px 0;
+}
+.msg__text--response li { margin: 3px 0; }
+.msg__text--response a {
+  color: #7fbfff;
+  text-decoration: underline;
+}
+.msg__text--response h1,
+.msg__text--response h2,
+.msg__text--response h3 {
+  margin: 10px 0 6px;
+  color: #e8eaed;
+}
+.msg__text--response h1 { font-size: 17px; }
+.msg__text--response h2 { font-size: 15px; }
+.msg__text--response h3 { font-size: 14px; }
 .msg__chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
 .chip {
   display: inline-flex; align-items: center; gap: 5px;

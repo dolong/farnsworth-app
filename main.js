@@ -3315,7 +3315,18 @@ async function executeAgentTool(name, input) {
     return { ok: true, files: filtered.slice(0, 200).map(e => ({ path: e.path, type: e.type })) };
   }
   if (name === 'run_command') {
-    return await runShellCommand(input.command);
+    // Chat-agent commands run silently in exec() — no PTY write, no panel
+    // switch. The agent already has the captured output and the chat chip
+    // renders it inline. Re-executing via the active PTY would be a side-
+    // effect hazard for commands like `npm install`, `git commit`, etc.
+    // Jul 13 ~17:35 ET: also wrap in nono Seatbelt via farnsworth-chat-run
+    // profile so a prompt-injected agent can't read ~/.aws/credentials
+    // or write outside the workspace folder. Falls back to plain exec
+    // (with a console warning) if nono isn't installed.
+    return await runShellCommand(input.command, {
+      pipeToActiveTerminal: false,
+      sandboxProfile: 'farnsworth-chat-run',
+    });
   }
   // -------------------------------------------------------------------
   // Test View tools (Jul 11 ~18:50 ET) — wire the chat agent to the
@@ -4544,24 +4555,90 @@ function getActiveTerminalPty() {
   return best;
 }
 
-async function runShellCommand(command) {
+async function runShellCommand(command, opts = {}) {
   const folder = db.getSetting('currentFolder');
   if (!folder) return { ok: false, error: 'no_folder', message: 'No workspace folder open' };
   if (!command || typeof command !== 'string') return { ok: false, error: 'bad_input', message: 'command required' };
+  const pipeToActiveTerminal = opts.pipeToActiveTerminal !== false;
+  const sandboxProfile = opts.sandboxProfile || null;
+  // If a sandbox profile is requested, spawn through nono wrap so the
+  // command runs under Seatbelt. This is the chat-agent run_command
+  // path -- without it, an LLM could prompt-inject into reading
+  // ~/.aws/credentials or exfiltrating via curl. Profile selection
+  // decides what's allowed (see ~/.config/nono/profiles/).
+  // Verified Jul 13 ~17:35 ET: farnsworth-chat-run profile blocks reads
+  // on ~/.aws/.ssh/.gnupg/.config/gh + outside-cwd writes; cwd is rw;
+  // shells run. Network allowlist is best-effort in nono v0.66 profile
+  // field (CLI flag enforces strictly, profile field doesn't).
+  if (sandboxProfile) {
+    const nonoBin = findNonoPath();
+    if (nonoBin) {
+      return await runSandboxedCommand(nonoBin, sandboxProfile, command, folder);
+    }
+    console.warn('[runShellCommand] sandbox profile requested but nono not found, running unsandboxed');
+  }
   const { exec } = require('child_process');
+  // pipeToActiveTerminal defaults true to preserve the prior
+  // terminal:runCommand IPC behavior. The chat agent's executeTool path
+  // passes { pipeToActiveTerminal: false } because the agent already has
+  // the captured stdout/stderr and re-typing the command into the PTY would
+  // (a) be visually noisy (it switches the user to the terminal panel) and
+  // (b) re-execute side-effecting commands a second time. The terminal chip
+  // in the chat message renders the captured output inline.
   return await new Promise((resolve) => {
     exec(command, { cwd: folder, maxBuffer: 1024 * 1024, timeout: 30000 }, (err, stdout, stderr) => {
-      // Pipe the command into the active terminal PTY for visual feedback
-      const activePty = getActiveTerminalPty();
-      if (activePty) {
-        try { activePty.write(command + '\n'); } catch {}
+      if (pipeToActiveTerminal) {
+        const activePty = getActiveTerminalPty();
+        if (activePty) {
+          try { activePty.write(command + '\n'); } catch {}
+        }
       }
       resolve({
         ok: !err || err.code === 0,
         stdout: stdout || '',
         stderr: stderr || '',
         exitCode: err ? (typeof err.code === 'number' ? err.code : 1) : 0,
-        pipedToTerminal: !!activePty,
+      });
+    });
+  });
+}
+
+// Spawn a command under `nono wrap --profile <name> -- sh -c <command>`.
+// Captures stdout/stderr via streams + applies a 30s timeout to match
+// the plain exec() path. Returns the same shape as runShellCommand.
+async function runSandboxedCommand(nonoBin, profileName, command, folder) {
+  const { spawn } = require('child_process');
+  return await new Promise((resolve) => {
+    let stdout = '';
+    let stderr = '';
+    let timedOut = false;
+    const child = spawn(
+      nonoBin,
+      ['wrap', '--profile', profileName, '--', '/bin/sh', '-c', command],
+      { cwd: folder, env: { ...process.env } }
+    );
+    child.stdout.on('data', d => { stdout += d.toString(); });
+    child.stderr.on('data', d => { stderr += d.toString(); });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try { child.kill('SIGTERM'); } catch {}
+    }, 30000);
+    child.on('close', code => {
+      clearTimeout(timer);
+      resolve({
+        ok: code === 0 && !timedOut,
+        stdout,
+        stderr: timedOut ? stderr + '\ntimeout (30s)' : stderr,
+        exitCode: timedOut ? 124 : (typeof code === 'number' ? code : 1),
+      });
+    });
+    child.on('error', err => {
+      clearTimeout(timer);
+      resolve({
+        ok: false,
+        stdout,
+        stderr: stderr + '\nnono spawn error: ' + err.message,
+        exitCode: 1,
       });
     });
   });
