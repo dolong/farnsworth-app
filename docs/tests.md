@@ -83,6 +83,8 @@ Switching into Test View (or any preview change) tears down all existing WebCont
 
 **Small windows.** Test View auto-fits: it picks the largest zoom (up to 100%) where the whole layout — game canvas, test list, and header buttons — fits the canvas area, and re-fits when the window resizes. Zooming manually with the +/− controls turns auto-fit off until you switch preview modes. The canvas area also scrolls when the artboard is larger than the space. Display zoom never changes the game's logical viewport, so selectors, clicks, and screenshots behave identically at any zoom level.
 
+**Resizing.** Drag the artboard's corner handles to resize the whole Test View — the game canvas scales with it, exactly like the mobile/desktop previews. Unlike display zoom, this is a real resize: the game's viewport changes and it re-lays-out responsively. At the default 900 × 876 artboard the game canvas is the standard 390 × 844 phone.
+
 ---
 
 ## 4. Creating tests
