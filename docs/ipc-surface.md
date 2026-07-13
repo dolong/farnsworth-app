@@ -2,7 +2,7 @@
 
 **Source:** `app/preload.js` (auto-generated 1:1 — keep in sync when methods are added/removed/renamed).
 **Verified count:** 131 methods as of Jul 13, 2026.
-**Historical count:** 84 (post-Tier 1, Jul 5) → 91 (post-Tier 2, Jul 6 ~20:23 ET) → 121 (Jul 12 morning) → 124 (Jul 12 Tier 3: `memoryRoute`, `memoryRunConsolidation`, `memoryStageStats`) → 130 (Jul 12 companion v0.4 relay arc: `setDevvitProjectUser`, `setDevvitProjectSubreddit`, `canvasReloadPreview`, `chatSetModel`, `chatStopInference`, `runTest` — rows pending from that arc) → 131 (Jul 13 v3.1: `memoryRunRetrospective`). Earlier growth driven by Test View (5), canvas polish (3), relay (5), tab persistence (2), Devvit settings (8), chat conversations (5), Claude Code auth gate (2), and one-offs.
+**Historical count:** 84 (post-Tier 1, Jul 5) → 91 (post-Tier 2, Jul 6 ~20:23 ET) → 121 (Jul 12 morning) → 124 (Jul 12 Tier 3: `memoryRoute`, `memoryRunConsolidation`, `memoryStageStats`) → 130 (Jul 12 companion v0.4 relay arc: `setDevvitProjectUser`, `setDevvitProjectSubreddit`, `canvasReloadPreview`, `chatSetModel`, `chatStopInference`, `runTest` — rows closed Jul 13 ~08:00 ET) → 131 (Jul 13 v3.1: `memoryRunRetrospective`). Earlier growth driven by Test View (5), canvas polish (3), relay (5), tab persistence (2), Devvit settings (8), chat conversations (5), Claude Code auth gate (2), and one-offs.
 
 ## Conventions
 
@@ -55,6 +55,7 @@ Channels in `main.js` use colon-prefixed lowercase (`memory:code-watch`, `canvas
 26. [Folder watcher](#26-folder-watcher--3)
 27. [Memory — concept operations](#27-memory--concept-operations--2)
 28. [Relay (farnsworth-relay companion app)](#28-relay-farnsworth-relay-companion-app--5)
+29. [Companion v0.4 broadcast events](#29-companion-v04-broadcast-events--4)
 
 ---
 
@@ -85,7 +86,7 @@ Farnsworth backend dev server boot detection per app type (`devvit`, etc.).
 | `addRecent` | `recent:add` | `(folderPath: string)` | `Promise<{ok}>` |
 | `clearRecent` | `recent:clear` | `()` | `Promise<{ok}>` |
 
-### 4. Canvas live preview — 8
+### 4. Canvas live preview — 9
 
 `WebContentsView`-backed since Jul 9 ~18:55 ET (replaced `<webview>`-tag approach which couldn't propagate CSS-driven height changes).
 
@@ -99,6 +100,7 @@ Farnsworth backend dev server boot detection per app type (`devvit`, etc.).
 | `onCanvasSetPreview` | `canvas:setPreview` (event) | `(callback: (payload) => void)` | unsubscribe fn | Subscribe to programmatic preview switches. Renderer-side handler does the same as the size-toggle click — nukes views, sets `state.preview`, re-renders. Added Jul 11 ~18:50 ET. |
 | `canvasSetVisible` | `canvas:setVisible` | `(viewId: string, visible: boolean)` | `Promise<{ok}>` | Hide/show a view. **CSS `z-index` does NOT affect `WebContentsView`** — it's a separate composited layer. To make a popover appear on top, `setVisible(false)` the canvas view (Jul 10 ~11:18 ET). |
 | `canvasDebugView` | `canvas:debugView` | `(viewId: string)` | `Promise<object>` | Inspect a canvas view's webContents state. |
+| `canvasReloadPreview` | `canvas:reloadPreview` | `()` | `Promise<{ok}>` | **Companion v0.4.** Re-render the active canvas WebContentsView (companion v0.4 Preview sheet's reload button + cogwheel reload action). Forwards to the renderer as `canvas:reloadPreview` which the canvas manager listens for. |
 
 ### 5. Folder picker — 1
 
@@ -115,7 +117,7 @@ Reads/writes `<project>/.farnsworth/config.json`.
 | `loadWorkspaceConfig` | `workspace:loadConfig` | `(folderPath: string)` | `Promise<object \| null>` |
 | `saveWorkspaceConfig` | `workspace:saveConfig` | `(folderPath: string, config: object)` | `Promise<{ok}>` |
 
-### 7. Devvit emulator — 8
+### 7. Devvit emulator — 10
 
 User library + subreddit library are global (workspace-agnostic). The active selection is per-project (keyed by workspace_path).
 
@@ -129,6 +131,8 @@ User library + subreddit library are global (workspace-agnostic). The active sel
 | `devvitDeleteSubreddit` | `devvit:delete-subreddit` | `(id: string)` | `Promise<{ok}>` |
 | `devvitGetProjectSettings` | `devvit:get-project-settings` | `(workspacePath: string)` | `Promise<{userId, subId} \| null>` |
 | `devvitSetProjectSettings` | `devvit:set-project-settings` | `(workspacePath: string, userId: string, subId: string)` | `Promise<{ok}>` |
+| `setDevvitProjectUser` | `devvit:setProjectUser` | `({folder, userId})` | `Promise<{ok}>` | **Companion v0.4.** Updates `devvit_project_settings.current_user_id` + broadcasts `emulator:config {user, userId, folder}` via the relay. Renderer-side name drops the `devvit` prefix to match its single-purpose companion callers. |
+| `setDevvitProjectSubreddit` | `devvit:setProjectSubreddit` | `({folder, subredditId})` | `Promise<{ok}>` | **Companion v0.4.** Updates `devvit_project_settings.current_subreddit_id` + broadcasts `emulator:config {subreddit, subredditId, folder}` via the relay. |
 
 ### 8. File operations — 8
 
@@ -210,7 +214,7 @@ Persisted threads (multi-chat switcher in the UI).
 | `chatConvSave` | `chatConv:save` | `(payload: ChatConv)` | `Promise<{ok}>` |
 | `chatConvDelete` | `chatConv:delete` | `(id: string)` | `Promise<{ok}>` |
 
-### 16. Test scripts — 5
+### 16. Test scripts — 6
 
 NLP test creator (Jul 10 ~23:50 ET) + Test View (Jul 11). **Per-project convention**: tests live at `<project>/.farnsworth/devvit-tests/*.json` since Jul 11 ~18:38 ET.
 
@@ -221,8 +225,9 @@ NLP test creator (Jul 10 ~23:50 ET) + Test View (Jul 11). **Per-project conventi
 | `testList` | `test:list` | `({folder}?)` | `Promise<TestFile[]>` | |
 | `testRead` | `test:read` | `({folder, name})` | `Promise<{json, path}>` | |
 | `testDelete` | `test:delete` | `({folder, name})` | `Promise<{ok}>` | |
+| `runTest` | `test:run` | `(testPath: string)` | `Promise<{ok, output, exitCode}>` | **Companion v0.4.** Thin wrapper around `testRun` for the companion Test sheet Run button - the Test sheet listens for `test:state` broadcasts on the relay instead of awaiting the return value. |
 
-### 17. Inference — 4
+### 17. Inference — 6
 
 | Renderer method | Channel | Signature | Returns | Notes |
 |---|---|---|---|---|
@@ -230,6 +235,8 @@ NLP test creator (Jul 10 ~23:50 ET) + Test View (Jul 11). **Per-project conventi
 | `streamMessage` | `inference:stream` + `inference:chunk` | `(opts: SendOpts, onChunk: (payload) => void)` | `Promise<InferenceResult>` (resolves on `type:'done'`) | The streaming handler. **Tool-use blocks sanitized Jul 11 ~19:55 ET** — `src/app.js:8194` strips renderer-side accumulator fields (`inputJson`, `caller`) before pushing to API history. |
 | `executeTool` | `inference:toolExecute` | `(name: string, input: object)` | `Promise<any>` | |
 | `getAgentTools` | `inference:agentTools` | `()` | `Promise<Tool[]>` | Returns the 10-tool agent array. |
+| `chatSetModel` | `chat:setModel` | `({alias})` | `Promise<{ok}>` | **Companion v0.4.** Sets the per-conversation model alias + persists via `settings:set` + broadcasts `model:changed {alias, ts}` via the relay. Companion Settings sheet Model picker fires this. Aliases: `opus`->`claude-opus-4-8`, `sonnet`->`claude-sonnet-5` (default), `haiku`->`claude-haiku-4-5`. |
+| `chatStopInference` | `chat:stopInference` | `()` | `Promise<{ok}>` | **Companion v0.4.** Forwards to the renderer as a `chat:stopInference` event. The chat agent checks this flag on its next chunk; the companion composer shows a Stop button while a turn is in-flight. |
 
 ### 18. Tasks — 4
 
@@ -357,6 +364,17 @@ Outbound WS to `farnsworth-relay` for companion app connectivity (Jul 8 thin sli
 | (paired: `onMenuAction`) | `menu:action` (event) | `(callback: (payload) => void)` | unsubscribe fn | Native macOS menu bar sends `menu:action` events to the focused window. |
 
 ---
+
+### 29. Companion v0.4 broadcast events - 4
+
+Renderer-side events sent from main.js to the relay (and thus to the companion app). These are NOT on `window.farnsworth` - they're pushed via `relaySend` from main.js. The companion app's `wireRelay()` handler in `src/app.js` dispatches them into `state.*` and re-renders.
+
+| Event | Trigger | Payload | Companion handling |
+|---|---|---|---|
+| `test:list` | After `test:list` IPC completes | `{tests, dir, ts}` | Test sheet populates its list. |
+| `test:state` | Test starts / passes / fails / errors | `{testId, status, output?, error?, ts}` | Test sheet shows running/passed/failed indicator on the active row. |
+| `model:changed` | `chat:setModel` IPC | `{alias, ts}` | Chat header badge updates to new model. |
+| `emulator:config` | `devvit:setProjectUser` / `setProjectSubreddit` IPC | `{user?, userId?, subreddit?, subredditId?, folder, ts}` | Preview sheet's cogwheel pills update to the new user/subreddit. |
 
 ## Known bugs (current)
 
