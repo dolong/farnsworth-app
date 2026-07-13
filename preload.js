@@ -77,6 +77,16 @@ contextBridge.exposeInMainWorld('farnsworth', {
   devvitDeleteSubreddit: (id) => ipcRenderer.invoke('devvit:delete-subreddit', id),
   devvitGetProjectSettings: (workspacePath) => ipcRenderer.invoke('devvit:get-project-settings', workspacePath),
   devvitSetProjectSettings: (workspacePath, userId, subId) => ipcRenderer.invoke('devvit:set-project-settings', workspacePath, userId, subId),
+  // Companion v0.4 IPCs (Jul 13) — set project user/subreddit from the
+  // companion's Preview sheet cogwheel.
+  setDevvitProjectUser: (folder, userId) => ipcRenderer.invoke('devvit:setProjectUser', { folder, userId }),
+  setDevvitProjectSubreddit: (folder, subredditId) => ipcRenderer.invoke('devvit:setProjectSubreddit', { folder, subredditId }),
+  // Companion v0.4 IPCs (Jul 13) — canvas reload + chat stop/model.
+  canvasReloadPreview: () => ipcRenderer.invoke('canvas:reloadPreview'),
+  chatSetModel: (alias) => ipcRenderer.invoke('chat:setModel', { alias }),
+  chatStopInference: () => ipcRenderer.invoke('chat:stopInference'),
+  // Companion v0.4 IPC (Jul 13) — run a test by absolute path.
+  runTest: (testPath) => ipcRenderer.invoke('test:run', { path: testPath }),
 
   // File operations
   readDir: (folderPath, depth) => ipcRenderer.invoke('fs:readDir', folderPath, depth),

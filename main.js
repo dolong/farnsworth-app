@@ -997,6 +997,113 @@ ipcMain.handle('canvas:setPreview', (_event, { preview } = {}) => {
   }
 });
 
+// Reload the active canvas WebContentsView. Called from the companion v0.4
+// Preview sheet reload button. Jul 13 — same handler name as the companion
+// command (companion sends {type:'command', name:'reloadPreview'}).
+ipcMain.handle('canvas:reloadPreview', () => {
+  try {
+    const target = BrowserWindow.getFocusedWindow() || mainWindow || openWindows[0];
+    if (!target || target.isDestroyed()) return { ok: false, error: 'no_window' };
+    // Re-broadcast as a renderer-side event so the canvas manager reloads
+    // the active view. The canvas manager listens for 'canvas:reloadPreview'.
+    target.webContents.send('canvas:reloadPreview');
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
+
+// Set the active model alias for the chat composer. Called from the
+// companion v0.4 Settings sheet. Jul 13 — accepts {alias:'opus'|'sonnet'|'haiku'}
+// and persists via the settings:set IPC, then broadcasts model:changed.
+ipcMain.handle('chat:setModel', (_event, { alias } = {}) => {
+  try {
+    const allowed = ['opus', 'sonnet', 'haiku'];
+    if (!alias || !allowed.includes(alias)) {
+      return { ok: false, error: 'invalid_alias', allowed };
+    }
+    db.setSetting('model', alias);
+    // Broadcast to companions.
+    try {
+      const rc = getRelayClient();
+      if (rc && rc.status === 'connected') {
+        rc.send({ type: 'model:changed', alias, ts: Date.now() });
+      }
+    } catch {}
+    return { ok: true, alias };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
+
+// Signal the chat agent to stop the current inference run. Called from the
+// companion v0.4 Stop button. Jul 13 — broadcasts as a renderer-side event
+// that the chat panel listens for.
+ipcMain.handle('chat:stopInference', () => {
+  try {
+    const target = BrowserWindow.getFocusedWindow() || mainWindow || openWindows[0];
+    if (!target || target.isDestroyed()) return { ok: false, error: 'no_window' };
+    target.webContents.send('chat:stopInference');
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
+
+// Set the active Devvit emulator user for the current project. Called from
+// the companion v0.4 Preview sheet cogwheel. Jul 13 — persists to
+// devvit_project_settings.current_user_id, broadcasts emulator:config.
+ipcMain.handle('devvit:setProjectUser', async (_event, { folder, userId } = {}) => {
+  try {
+    if (!folder || typeof folder !== 'string') return { ok: false, error: 'missing_folder' };
+    if (!userId || typeof userId !== 'number') return { ok: false, error: 'missing_user_id' };
+    // Preserve the existing subreddit id when only updating the user.
+    const existing = db.devvitGetProjectSettings(folder);
+    db.devvitSetProjectSettings(folder, userId, existing?.current_subreddit_id || null);
+    // Look up the username for the broadcast.
+    const user = db.prepare('SELECT username, reddit_id FROM devvit_users WHERE id = ?').get(userId);
+    try {
+      const rc = getRelayClient();
+      if (rc && rc.status === 'connected') {
+        rc.send({
+          type: 'emulator:config',
+          user: user?.username || null,
+          userId, folder, ts: Date.now(),
+        });
+      }
+    } catch {}
+    return { ok: true, user: user?.username || null };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
+
+// Set the active Devvit emulator subreddit for the current project. Called
+// from the companion v0.4 Preview sheet cogwheel. Jul 13 — persists to
+// devvit_project_settings.current_subreddit_id, broadcasts emulator:config.
+ipcMain.handle('devvit:setProjectSubreddit', async (_event, { folder, subredditId } = {}) => {
+  try {
+    if (!folder || typeof folder !== 'string') return { ok: false, error: 'missing_folder' };
+    if (!subredditId || typeof subredditId !== 'number') return { ok: false, error: 'missing_subreddit_id' };
+    const existing = db.devvitGetProjectSettings(folder);
+    db.devvitSetProjectSettings(folder, existing?.current_user_id || null, subredditId);
+    const sub = db.prepare('SELECT name, reddit_id FROM devvit_subreddits WHERE id = ?').get(subredditId);
+    try {
+      const rc = getRelayClient();
+      if (rc && rc.status === 'connected') {
+        rc.send({
+          type: 'emulator:config',
+          subreddit: sub?.name || null,
+          subredditId, folder, ts: Date.now(),
+        });
+      }
+    } catch {}
+    return { ok: true, subreddit: sub?.name || null };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
+
 // Toggle visibility of a canvas WebContentsView without destroying it.
 // Used by modals/popovers that overlap the canvas region (e.g. the Devvit
 // emulator cogwheel popover) — the WebContentsView is a separate composited
@@ -1116,6 +1223,13 @@ ipcMain.handle('test:list', async (_event, { folder } = {}) => {
     }
     // Sort by name (stable for users — same order every load).
     tests.sort((a, b) => a.name.localeCompare(b.name));
+    // Broadcast to companions (Jul 13 — companion v0.4 Test sheet subscribes).
+    try {
+      const rc = getRelayClient();
+      if (rc && rc.status === 'connected') {
+        rc.send({ type: 'test:list', tests, dir, ts: Date.now() });
+      }
+    } catch {}
     return { ok: true, tests, dir };
   } catch (e) {
     return { ok: false, error: e.message };
@@ -1168,6 +1282,14 @@ ipcMain.handle('test:run', async (_event, { path: testPath }) => {
     }
     const testModel = testingModelApiId();
     if (testModel) runnerEnv.FARNSWORTH_TEST_MODEL = testModel;
+    // Broadcast test:state(running) to companions (Jul 13 — companion v0.4
+    // Test sheet subscribes and shows the running badge).
+    try {
+      const rc = getRelayClient();
+      if (rc && rc.status === 'connected') {
+        rc.send({ type: 'test:state', testId: testPath, status: 'running', ts: Date.now() });
+      }
+    } catch {}
     return await new Promise((resolve) => {
       const proc = spawn('python3', [TEST_RUNNER_PATH, testPath], {
         cwd: app.getAppPath(),
@@ -1180,8 +1302,21 @@ ipcMain.handle('test:run', async (_event, { path: testPath }) => {
       proc.on('close', code => {
         const failedMatch = stdout.match(/(\d+)\s+failed/);
         const failed = failedMatch ? Number(failedMatch[1]) : 0;
+        const passed = code === 0 && failed === 0;
+        // Broadcast test:state(passed/failed) to companions.
+        try {
+          const rc = getRelayClient();
+          if (rc && rc.status === 'connected') {
+            rc.send({
+              type: 'test:state',
+              testId: testPath,
+              status: passed ? 'passed' : 'failed',
+              code, failed, ts: Date.now(),
+            });
+          }
+        } catch {}
         resolve({
-          ok: code === 0 && failed === 0,
+          ok: passed,
           code,
           failed,
           stdout: stdout.slice(-4000),  // tail, in case of long output
@@ -1189,6 +1324,12 @@ ipcMain.handle('test:run', async (_event, { path: testPath }) => {
         });
       });
       proc.on('error', err => {
+        try {
+          const rc = getRelayClient();
+          if (rc && rc.status === 'connected') {
+            rc.send({ type: 'test:state', testId: testPath, status: 'failed', error: err.message, ts: Date.now() });
+          }
+        } catch {}
         resolve({ ok: false, error: err.message });
       });
     });

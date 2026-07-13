@@ -1329,6 +1329,53 @@ function wireRelay() {
           showAllCanvasViews?.();
         }
         renderCanvas();
+      } else if (name === 'reloadPreview') {
+        // Companion v0.4 reload button (Jul 13). Same as Cmd+R but
+        // dispatched from the mobile preview sheet.
+        window.farnsworth?.canvasRemoveAllViews?.();
+        renderCanvas();
+      } else if (name === 'setModel' && args.alias) {
+        // Companion v0.4 Settings sheet model picker (Jul 13).
+        state.model = args.alias;
+        // Persist via the single-key setting:set IPC.
+        window.farnsworth?.setSetting?.('model', args.alias);
+        renderSettings?.();
+      } else if (name === 'stopInference') {
+        // Companion v0.4 Stop button (Jul 13). The chat panel listens for
+        // 'chat:stopInference' IPC events; this is the in-renderer path
+        // for the same intent (when no companion is connected).
+        const stopBtn = document.querySelector('[data-action="stop-inference"]');
+        if (stopBtn) stopBtn.click();
+      } else if (name === 'setEmulatorUser' && args.user) {
+        // Companion v0.4 Preview sheet cogwheel user picker (Jul 13).
+        // Resolves the username to an ID via the devvit:list-users IPC,
+        // then calls devvit:setProjectUser. Fire-and-forget — the IPC
+        // broadcasts emulator:config back over the relay when it lands.
+        (async () => {
+          try {
+            const users = await window.farnsworth?.listDevvitUsers?.();
+            const user = (users || []).find(u => u.username === args.user);
+            if (user && state.folder) {
+              await window.farnsworth?.setDevvitProjectUser?.(state.folder, user.id);
+            }
+          } catch (e) { console.warn('[relay:command] setEmulatorUser failed:', e.message); }
+        })();
+      } else if (name === 'setEmulatorSubreddit' && args.subreddit) {
+        // Companion v0.4 Preview sheet cogwheel subreddit picker (Jul 13).
+        (async () => {
+          try {
+            const subs = await window.farnsworth?.listDevvitSubreddits?.();
+            const sub = (subs || []).find(s => s.name === args.subreddit);
+            if (sub && state.folder) {
+              await window.farnsworth?.setDevvitProjectSubreddit?.(state.folder, sub.id);
+            }
+          } catch (e) { console.warn('[relay:command] setEmulatorSubreddit failed:', e.message); }
+        })();
+      } else if (name === 'runTest' && args.testId) {
+        // Companion v0.4 Test sheet Run button (Jul 13).
+        window.farnsworth?.runTest?.(args.testId).catch((e) =>
+          console.warn('[relay:command] runTest failed:', e.message)
+        );
       }
     } else if (t === 'canvas:subscribe') {
       // Companion wants to receive canvas:state — push current snapshot
