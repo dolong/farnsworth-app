@@ -1,8 +1,8 @@
 # Farnsworth IPC Surface — Full Method Inventory
 
 **Source:** `app/preload.js` (auto-generated 1:1 — keep in sync when methods are added/removed/renamed).
-**Verified count:** 125 methods as of Jul 13, 2026.
-**Historical count:** 84 (post-Tier 1, Jul 5) → 91 (post-Tier 2, Jul 6 ~20:23 ET) → 121 (Jul 12 morning) → 124 (Jul 12 Tier 3: `memoryRoute`, `memoryRunConsolidation`, `memoryStageStats`) → 125 (Jul 13 v3.1: `memoryRunRetrospective`). Earlier growth driven by Test View (5), canvas polish (3), relay (5), tab persistence (2), Devvit settings (8), chat conversations (5), Claude Code auth gate (2), and one-offs.
+**Verified count:** 131 methods as of Jul 13, 2026.
+**Historical count:** 84 (post-Tier 1, Jul 5) → 91 (post-Tier 2, Jul 6 ~20:23 ET) → 121 (Jul 12 morning) → 124 (Jul 12 Tier 3: `memoryRoute`, `memoryRunConsolidation`, `memoryStageStats`) → 130 (Jul 12 companion v0.4 relay arc: `setDevvitProjectUser`, `setDevvitProjectSubreddit`, `canvasReloadPreview`, `chatSetModel`, `chatStopInference`, `runTest` — rows pending from that arc) → 131 (Jul 13 v3.1: `memoryRunRetrospective`). Earlier growth driven by Test View (5), canvas polish (3), relay (5), tab persistence (2), Devvit settings (8), chat conversations (5), Claude Code auth gate (2), and one-offs.
 
 ## Conventions
 
