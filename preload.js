@@ -53,6 +53,8 @@ contextBridge.exposeInMainWorld('farnsworth', {
   },
   canvasSetVisible: (viewId, visible) =>
     ipcRenderer.invoke('canvas:setVisible', { viewId, visible }),
+  canvasSetZoomFactor: (viewId, factor) =>
+    ipcRenderer.invoke('canvas:setZoomFactor', { viewId, factor }),
   // Debug: inspect a canvas BrowserView's webContents state.
   canvasDebugView: (viewId) =>
     ipcRenderer.invoke('canvas:debugView', { viewId }),

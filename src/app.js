@@ -698,6 +698,52 @@ function teardownCanvasBrowserViews() {
   });
 }
 
+// Recompute every WebContentsView's bounds from its placeholder rect,
+// clipped to the canvas-viewport so views never overflow onto adjacent UI.
+// Single source of truth for the two ResizeObservers, the stage scroll
+// listener, and updateZoom(). getBoundingClientRect reflects CSS transforms,
+// so zoomed placeholders produce correctly scaled bounds.
+function syncCanvasViewBounds() {
+  if (!window.farnsworth?.canvasUpdateViewBounds) return;
+  const vpEl = document.getElementById('canvas-viewport');
+  const vpR = vpEl?.getBoundingClientRect();
+  document.querySelectorAll('[data-canvas-view-id]').forEach(el => {
+    const viewId = el.dataset.canvasViewId;
+    if (!viewId) return;
+    const r = el.getBoundingClientRect();
+    let x = Math.round(r.left), y = Math.round(r.top);
+    let right = Math.round(r.right), bottom = Math.round(r.bottom);
+    if (vpR) {
+      x = Math.max(x, Math.round(vpR.left));
+      y = Math.max(y, Math.round(vpR.top));
+      right = Math.min(right, Math.round(vpR.right));
+      bottom = Math.min(bottom, Math.round(vpR.bottom));
+    }
+    window.farnsworth.canvasUpdateViewBounds(viewId, {
+      x, y, width: Math.max(0, right - x), height: Math.max(0, bottom - y),
+    });
+  });
+}
+
+// Fit-to-view for Test View: pick the largest zoom (≤100%) where the whole
+// artboard — phone canvas + test panel + header with + New — fits inside the
+// stage. Runs on render + viewport resize unless the user has manually
+// zoomed while in this preview (state._zoomManualFor). offsetWidth/Height
+// are layout sizes, unaffected by the current transform.
+function autoFitZoomToStage() {
+  const art = document.getElementById('canvas-artboard');
+  const stage = document.getElementById('canvas-stage');
+  if (!art || !stage) return;
+  const aw = art.offsetWidth, ah = art.offsetHeight;
+  const cs = getComputedStyle(stage);
+  const availW = stage.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+  const availH = stage.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom);
+  if (aw <= 0 || ah <= 0 || availW <= 0 || availH <= 0) return;
+  const fit = Math.min(availW / aw, availH / ah, 1);
+  state.zoom = Math.max(25, Math.min(100, Math.floor(fit * 100)));
+  updateZoom();
+}
+
 function setupCanvasBrowserViews() {
   // Find every [data-canvas-view] placeholder in the freshly-rendered
   // canvas (skipped ones that already have a viewId -- defensive against
@@ -722,30 +768,36 @@ function setupCanvasBrowserViews() {
   const viewport = document.getElementById('canvas-viewport');
   if (viewport && !viewport._canvasViewportRo) {
     const viewportRo = new ResizeObserver(() => {
-      // Clip placeholder bounds to the viewport rect so the WebContentsView
-      // doesn't overflow when the IDE window shrinks below the placeholder's
-      // natural size (e.g. mobile phone frame stays at 390x844 even when the
-      // canvas-viewport is only 364x679 -- the placeholder overflows the
-      // viewport and the WebContentsView follows, covering adjacent UI).
-      // Intersection with viewport bounds keeps the view contained.
-      const vpR = viewport.getBoundingClientRect();
-      document.querySelectorAll('[data-canvas-view-id]').forEach(el => {
-        const viewId = el.dataset.canvasViewId;
-        if (!viewId || !window.farnsworth?.canvasUpdateViewBounds) return;
-        const r = el.getBoundingClientRect();
-        const x = Math.max(Math.round(r.left), Math.round(vpR.left));
-        const y = Math.max(Math.round(r.top), Math.round(vpR.top));
-        const right = Math.min(Math.round(r.right), Math.round(vpR.right));
-        const bottom = Math.min(Math.round(r.bottom), Math.round(vpR.bottom));
-        const width = Math.max(0, right - x);
-        const height = Math.max(0, bottom - y);
-        window.farnsworth.canvasUpdateViewBounds(viewId, {
-          x, y, width, height,
-        });
-      });
+      // Clip placeholder bounds to the viewport rect (shared helper) so the
+      // WebContentsView doesn't overflow when the IDE window shrinks below
+      // the placeholder's natural size. On Test View, re-fit the zoom too —
+      // the window resize changes how much artboard fits (skipped when the
+      // user has manually zoomed in this preview). autoFit → updateZoom →
+      // syncCanvasViewBounds, so bounds stay correct either way. No RO loop:
+      // the zoom transform never resizes the viewport itself.
+      if (state.preview === 'testview' && state.canvasMode === 'live' && state._zoomManualFor !== 'testview') {
+        autoFitZoomToStage();
+      } else {
+        syncCanvasViewBounds();
+      }
     });
     viewportRo.observe(viewport);
     viewport._canvasViewportRo = viewportRo;
+  }
+
+  // Stage scroll — the stage is overflow:auto (Jul 13) so oversized
+  // artboards can be scrolled. Scrolling moves placeholder rects without
+  // firing any ResizeObserver; keep view bounds in lock-step (rAF-throttled).
+  const stageEl = document.getElementById('canvas-stage');
+  if (stageEl && !stageEl._canvasScrollSync) {
+    stageEl.addEventListener('scroll', () => {
+      if (stageEl._scrollRaf) return;
+      stageEl._scrollRaf = requestAnimationFrame(() => {
+        stageEl._scrollRaf = null;
+        syncCanvasViewBounds();
+      });
+    }, { passive: true });
+    stageEl._canvasScrollSync = true;
   }
 
   document.querySelectorAll('[data-canvas-view]').forEach(el => {
@@ -770,31 +822,19 @@ function setupCanvasBrowserViews() {
           return;
         }
         el.dataset.canvasViewId = viewId;
+        // If the canvas is currently zoomed, the freshly created view needs
+        // the matching content zoom factor (bounds come from the transformed
+        // placeholder rect; setZoomFactor keeps the game's CSS viewport at
+        // its logical size — 390x844 for Test View — so the test runner's
+        // screenshots and selectors are unaffected by display scale).
+        if (state.zoom !== 100 && window.farnsworth.canvasSetZoomFactor) {
+          window.farnsworth.canvasSetZoomFactor(viewId, state.zoom / 100);
+        }
+        syncCanvasViewBounds();
         const ro = new ResizeObserver(() => {
-          // Same viewport-clip as the viewport-level observer above — when
-          // the placeholder itself resizes (resolution preset change), it
-          // can also exceed the viewport when the window is small.
-          const vpEl = document.getElementById('canvas-viewport');
-          const vpR = vpEl?.getBoundingClientRect();
-          const r = el.getBoundingClientRect();
-          if (!vpR) {
-            window.farnsworth.canvasUpdateViewBounds(viewId, {
-              x: Math.round(r.left),
-              y: Math.round(r.top),
-              width: Math.round(r.width),
-              height: Math.round(r.height),
-            });
-            return;
-          }
-          const x = Math.max(Math.round(r.left), Math.round(vpR.left));
-          const y = Math.max(Math.round(r.top), Math.round(vpR.top));
-          const right = Math.min(Math.round(r.right), Math.round(vpR.right));
-          const bottom = Math.min(Math.round(r.bottom), Math.round(vpR.bottom));
-          const width = Math.max(0, right - x);
-          const height = Math.max(0, bottom - y);
-          window.farnsworth.canvasUpdateViewBounds(viewId, {
-            x, y, width, height,
-          });
+          // Placeholder resize (resolution preset change) — same shared
+          // viewport-clipped sync as everywhere else.
+          syncCanvasViewBounds();
         });
         ro.observe(el);
         el._browserViewRo = ro;
@@ -1184,7 +1224,17 @@ function renderCanvas() {
   // renderCanvas() destroys + recreates the artboard, so re-apply the
   // current zoom transform on the next paint. Without this, switching
   // preview modes or resolution presets snaps back to 100%.
-  requestAnimationFrame(() => updateZoom());
+  // Test View auto-fits instead (unless the user manually zoomed while in
+  // it — _zoomManualFor stops matching as soon as the preview switches, so
+  // auto-fit re-engages on the next visit). Runs after the calibrate rAF
+  // registered during artboard render, so it measures final layout sizes.
+  requestAnimationFrame(() => {
+    if (state.preview === 'testview' && state.canvasMode === 'live' && state._zoomManualFor !== 'testview') {
+      autoFitZoomToStage();
+    } else {
+      updateZoom();
+    }
+  });
 
   // Set up canvas BrowserViews for any [data-canvas-view] placeholders
   // in the freshly-rendered artboard. BrowserView.setBounds() is set in
@@ -7904,8 +7954,8 @@ function wire() {
   }));
 
   // Zoom
-  $('#zoom-in').addEventListener('click', () => { state.zoom = Math.min(200, state.zoom + 10); updateZoom(); });
-  $('#zoom-out').addEventListener('click', () => { state.zoom = Math.max(25, state.zoom - 10); updateZoom(); });
+  $('#zoom-in').addEventListener('click', () => { state.zoom = Math.min(200, state.zoom + 10); state._zoomManualFor = state.preview; updateZoom(); });
+  $('#zoom-out').addEventListener('click', () => { state.zoom = Math.max(25, state.zoom - 10); state._zoomManualFor = state.preview; updateZoom(); });
 
   // Settings
   $('#btn-settings').addEventListener('click', openSettings);
@@ -8159,10 +8209,35 @@ function updateZoom() {
   const art = $('#canvas-artboard');
   if (art) {
     const scale = state.zoom / 100;
+    // Origin top-left + negative right/bottom margin compensation makes the
+    // LAYOUT box track the visual size (transform alone never changes
+    // layout). Without this, a zoomed-out artboard still occupies its full
+    // unscaled box — flex centering centers the box, the visual drifts, and
+    // auto-fit "fits" while content hangs outside the stage (the Jul 13
+    // Test View + New clipping). Also fixes zoom >100%: the box grows, so
+    // the stage can scroll to the far edges.
+    const w = art.offsetWidth, h = art.offsetHeight;
     art.style.transform = `scale(${scale})`;
-    art.style.transformOrigin = 'center center';
-    art.style.transition = 'transform 120ms ease-out';
+    art.style.transformOrigin = 'top left';
+    art.style.transition = 'transform 120ms ease-out, margin 120ms ease-out';
+    art.style.marginRight = (-(w * (1 - scale))) + 'px';
+    art.style.marginBottom = (-(h * (1 - scale))) + 'px';
   }
+  // WebContentsViews don't follow CSS transforms (separate composited
+  // layer) and ResizeObservers don't fire on transforms — before Jul 13,
+  // zooming left every game view at its old screen rect with unscaled
+  // content. Scale the content via zoom factor (keeps the game's logical
+  // CSS viewport constant, e.g. 390x844) and re-clip bounds now + after
+  // the 120ms transform transition settles.
+  const vScale = state.zoom / 100;
+  document.querySelectorAll('[data-canvas-view-id]').forEach(el => {
+    const viewId = el.dataset.canvasViewId;
+    if (viewId && window.farnsworth?.canvasSetZoomFactor) {
+      window.farnsworth.canvasSetZoomFactor(viewId, vScale);
+    }
+  });
+  syncCanvasViewBounds();
+  setTimeout(syncCanvasViewBounds, 160);
 }
 
 // ============================================================================

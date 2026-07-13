@@ -1128,9 +1128,15 @@ button { font-family: inherit; cursor: pointer; }
 /* Canvas stage — artboards */
 .canvas__stage {
   position: relative;
-  display: flex; align-items: center; justify-content: center;
+  /* `safe center`: center when the artboard fits, fall back to flex-start
+     when it overflows so the top/left edges stay reachable via scroll.
+     Plain `center` overflows in BOTH directions and the start side becomes
+     unscrollable — that's how Test View's + New button got clipped off
+     small windows (Jul 13). */
+  display: flex; align-items: safe center; justify-content: safe center;
   width: 100%; height: 100%;
   padding: 60px 20px;
+  overflow: auto;
 }
 .artboard { position: relative; }
 .artboard--mobile { width: 360px; height: 692px; }

@@ -1119,6 +1119,25 @@ ipcMain.handle('canvas:setVisible', (_event, { viewId, visible }) => {
   }
 });
 
+// Scale a canvas view's CONTENT to match the renderer's zoom transform.
+// WebContentsViews don't follow CSS transforms; when the artboard is scaled
+// the renderer shrinks the view's bounds (transformed placeholder rect) and
+// calls this so the page inside renders at the same scale. factor is the
+// zoom scale (0.25-2.0); the page's logical CSS viewport stays constant
+// (bounds/factor), so test-runner selectors + screenshots are unaffected.
+ipcMain.handle('canvas:setZoomFactor', (_event, { viewId, factor }) => {
+  const view = canvasWebContentsViews.get(viewId);
+  if (!view) return { ok: false, error: 'view_not_found' };
+  const f = Number(factor);
+  if (!Number.isFinite(f) || f <= 0.05 || f > 5) return { ok: false, error: 'bad_factor' };
+  try {
+    view.webContents.setZoomFactor(f);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
+
 // Debug: inspect a canvas WebContentsView's state.
 ipcMain.handle('canvas:debugView', (_event, { viewId }) => {
   const view = canvasWebContentsViews.get(viewId);
