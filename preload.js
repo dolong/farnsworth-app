@@ -105,9 +105,10 @@ contextBridge.exposeInMainWorld('farnsworth', {
   delete: (folderPath, relPath) => ipcRenderer.invoke('fs:delete', folderPath, relPath),
 
   // Auth — manual API key
-  setApiKey: (key) => ipcRenderer.invoke('auth:setApiKey', key),
-  hasApiKey: () => ipcRenderer.invoke('auth:hasApiKey'),
-  clearApiKey: () => ipcRenderer.invoke('auth:clearApiKey'),
+  setApiKey: (key, provider) => ipcRenderer.invoke('auth:setApiKey', key, provider),
+  hasApiKey: (provider) => ipcRenderer.invoke('auth:hasApiKey', provider),
+  clearApiKey: (provider) => ipcRenderer.invoke('auth:clearApiKey', provider),
+  codexStatus: () => ipcRenderer.invoke('auth:codexStatus'),
 
   // Auth — Claude.ai OAuth (PKCE) — loopback flow
   oauthStart: () => ipcRenderer.invoke('auth:oauthStart'),
@@ -167,6 +168,7 @@ contextBridge.exposeInMainWorld('farnsworth', {
   // Inference — call Claude API with saved OAuth token or manual API key
   sendMessage: (opts) => ipcRenderer.invoke('inference:send', opts),
   // Git primitives for per-call-site AI commands (AI Commit / AI Review)
+  gitBranch: (opts) => ipcRenderer.invoke('git:branch', opts || {}),
   gitDiff: (opts) => ipcRenderer.invoke('git:diff', opts || {}),
   gitCommit: (opts) => ipcRenderer.invoke('git:commit', opts || {}),
   // Streaming — returns a Promise that resolves with the final result.

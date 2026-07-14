@@ -2496,28 +2496,53 @@ ipcMain.handle('fs:listFiles', async (_event, folderPath, opts = {}) => {
 });
 
 // ============================================================
-// IPC: Auth — manual API key (anthropic-console provider)
+// IPC: Auth — manual API keys (anthropic-console + openai-api providers)
+// Provider param added Jul 14 for the OpenAI section; omitted = anthropic
+// so every pre-existing caller keeps working unchanged.
 // ============================================================
-ipcMain.handle('auth:setApiKey', async (_event, key) => {
+const API_KEY_PROVIDERS = ['anthropic-console', 'openai-api'];
+function apiKeyProvider(p) {
+  return API_KEY_PROVIDERS.includes(p) ? p : 'anthropic-console';
+}
+
+ipcMain.handle('auth:setApiKey', async (_event, key, provider) => {
   try {
     if (!safeStorage.isEncryptionAvailable()) {
       return { ok: false, error: 'Encryption not available on this system' };
     }
-    db.setAuthToken('anthropic-console', key, null, null, { source: 'api_key' });
+    db.setAuthToken(apiKeyProvider(provider), key, null, null, { source: 'api_key' });
     return { ok: true };
   } catch (err) {
     return { ok: false, error: err.message };
   }
 });
 
-ipcMain.handle('auth:hasApiKey', async () => {
-  const t = db.getAuthToken('anthropic-console');
+ipcMain.handle('auth:hasApiKey', async (_event, provider) => {
+  const t = db.getAuthToken(apiKeyProvider(provider));
   return { ok: true, hasKey: !!(t && t.accessToken) };
 });
 
-ipcMain.handle('auth:clearApiKey', async () => {
-  db.deleteAuthToken('anthropic-console');
+ipcMain.handle('auth:clearApiKey', async (_event, provider) => {
+  db.deleteAuthToken(apiKeyProvider(provider));
   return { ok: true };
+});
+
+// Codex CLI login detection (~/.codex/auth.json). Read-only, same idea as
+// the Claude Code CLI Keychain detection: Farnsworth reports what the CLI
+// already stored. auth.json shapes seen in the wild: { OPENAI_API_KEY }
+// (API-key login) or { tokens: { id_token, access_token, account_id } }
+// (ChatGPT-subscription login).
+ipcMain.handle('auth:codexStatus', async () => {
+  try {
+    const p = path.join(os.homedir(), '.codex', 'auth.json');
+    if (!fsSync.existsSync(p)) return { ok: true, available: false };
+    const raw = JSON.parse(fsSync.readFileSync(p, 'utf8'));
+    const method = raw?.tokens?.access_token ? 'chatgpt'
+      : (raw?.OPENAI_API_KEY ? 'api_key' : null);
+    return { ok: true, available: !!method, method };
+  } catch (err) {
+    return { ok: true, available: false, error: err.message };
+  }
 });
 
 // ============================================================
@@ -3694,6 +3719,20 @@ function gitExec(cwd, args, timeoutMs = 15000) {
     });
   });
 }
+
+// Lightweight branch + dirty state for the status bar. Separate from
+// git:diff so the 60s status-bar poll never pays for a full diff.
+ipcMain.handle('git:branch', async (_e, opts = {}) => {
+  const cwd = resolveGitCwd(opts.cwd);
+  if (!cwd) return { ok: false, error: 'no_folder' };
+  const inside = await gitExec(cwd, ['rev-parse', '--is-inside-work-tree']);
+  if (inside.code !== 0 || !/true/.test(inside.stdout)) {
+    return { ok: false, error: 'not_a_repo' };
+  }
+  const branch = (await gitExec(cwd, ['rev-parse', '--abbrev-ref', 'HEAD'])).stdout.trim() || '(no branch)';
+  const dirty = !!(await gitExec(cwd, ['status', '--porcelain'])).stdout.trim();
+  return { ok: true, branch, dirty };
+});
 
 ipcMain.handle('git:diff', async (_e, opts = {}) => {
   const cwd = resolveGitCwd(opts.cwd);

@@ -354,28 +354,30 @@
     </div>
 
     <!-- ============ STATUS BAR ============ -->
+    <!-- Every value below is live (wired Jul 14): boot seeds them, IPC +
+         session events keep them fresh. No static placeholder text. -->
     <div class="statusbar">
-      <span class="statusbar__connected"><span class="statusbar__pulse"></span>Connected</span>
-      <span class="statusbar__sep">·</span>
-      <span class="statusbar__branch">
+      <span class="statusbar__connected" id="sb-conn"><span class="statusbar__pulse"></span><span id="sb-conn-label">…</span></span>
+      <span class="statusbar__sep" id="sb-branch-sep" hidden>·</span>
+      <span class="statusbar__branch" id="sb-branch" hidden>
         <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#6d7178" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="8" r="2.5"/><path d="M6 8.5v7M18 10.5c0 4-6 2-6 5.5"/></svg>
-        main
+        <span id="sb-branch-name"></span>
       </span>
-      <span class="statusbar__sep">·</span>
-      <span class="statusbar__path" id="status-path">screens/Matchmaking VS.html</span>
+      <span class="statusbar__sep" id="sb-path-sep" hidden>·</span>
+      <span class="statusbar__path" id="status-path"></span>
       <span class="statusbar__right">
-        <span class="statusbar__mem">mem: 6 stages</span>
+        <span class="statusbar__mem statusbar__chip" id="sb-mem"></span>
         <span class="statusbar__sep">·</span>
-        <span>router 3/turn</span>
+        <span class="statusbar__chip" id="sb-router"></span>
         <span class="statusbar__sep">·</span>
-        <span class="statusbar__ctx">ctx 42%</span>
+        <span class="statusbar__ctx" id="sb-ctx"></span>
         <span class="statusbar__sep">·</span>
-        <span class="statusbar__extracted">
+        <span class="statusbar__extracted statusbar__chip" id="sb-extracted">
           <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
-          7 extracted
+          <span id="sb-extracted-label"></span>
         </span>
         <span class="statusbar__sep">·</span>
-        <span class="statusbar__model">Opus 4.8 High</span>
+        <span class="statusbar__model statusbar__chip" id="sb-model"></span>
       </span>
     </div>
 

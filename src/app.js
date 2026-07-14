@@ -91,6 +91,17 @@ const state = {
     oauthAccountInfo: null,
     oauthInProgress: false,
     claudeCodeAvailable: false,
+    openaiKeySet: false,
+    codexAvailable: false,
+    codexMethod: null,
+  },
+
+  // Live status-bar sources (Jul 14 — the bar was static mock text before).
+  git: { branch: null, dirty: false },
+  session: {
+    routedCalls: 0,       // routedModelApiId() invocations this session
+    lastUsage: null,      // { input_tokens, output_tokens } from the last chat turn
+    memStats: null,       // { bufferCount, sectionsCount } from memory:stage-stats
   },
 
   // Settings — persisted via IPC
@@ -227,6 +238,10 @@ function routingRow(id) {
 }
 function routedModelApiId(id) {
   const row = routingRow(id);
+  // Status-bar counter: this function is only invoked at real call time
+  // (titles/commit/review call sites), never during render, so counting
+  // here counts actual routed model calls.
+  if (state?.session) { state.session.routedCalls++; queueMicrotask(() => { try { updateStatusBar(); } catch {} }); }
   return modelToApiId(row?.model || state.settings?.defaultModel);
 }
 
@@ -5796,6 +5811,115 @@ function renderLiveTickets(s) {
   return wrap;
 }
 
+// ============================================================
+// STATUS BAR (Jul 14) — was static mock HTML; now every chip is live.
+// Sources: state.auth (connection) · git:branch IPC (branch) ·
+// state.files.current (path) · settings.memory (stages) · state.session
+// (router count, last-turn usage, memory stats) · settings.defaultModel.
+// ============================================================
+function modelContextWindow(display) {
+  const opt = CHAT_MODEL_OPTIONS.find(o => o.display === display);
+  return opt && /1M/i.test(opt.desc || '') ? 1000000 : 200000;
+}
+
+function updateStatusBar() {
+  const $id = (i) => document.getElementById(i);
+  if (!$id('sb-conn')) return;
+
+  // Connection = whether Farnsworth can call Claude right now.
+  const a = state.auth || {};
+  const src = a.oauthConnected ? 'Claude.ai sign-in'
+    : (a.claudeCodeAvailable ? 'Claude Code CLI' : (a.apiKeySet ? 'API key' : null));
+  $id('sb-conn').classList.toggle('is-off', !src);
+  $id('sb-conn-label').textContent = src ? 'Connected' : 'No auth';
+  $id('sb-conn').title = src ? `Claude auth: ${src}` : 'No Claude credentials — open Settings → AI';
+
+  // Git branch (hidden when the open folder isn't a repo).
+  const g = state.git || {};
+  $id('sb-branch').hidden = !g.branch;
+  $id('sb-branch-sep').hidden = !g.branch;
+  if (g.branch) {
+    $id('sb-branch-name').textContent = g.branch + (g.dirty ? '*' : '');
+    $id('sb-branch').title = g.dirty ? `On ${g.branch} — uncommitted changes` : `On ${g.branch} — working tree clean`;
+  }
+
+  // Active file (hidden until a file is open).
+  const p = state.files?.current || '';
+  $id('status-path').textContent = p;
+  $id('sb-path-sep').hidden = !p;
+
+  // Memory pipeline: enabled stages / total.
+  const mem = state.settings?.memory || {};
+  const stages = Object.values(mem).filter(v => v && typeof v === 'object' && 'enabled' in v);
+  const on = stages.filter(v => v.enabled).length;
+  const ms = state.session.memStats;
+  $id('sb-mem').textContent = `mem: ${on}/${stages.length} stages`;
+  $id('sb-mem').title = `Memory pipeline: ${on} of ${stages.length} stages enabled`
+    + (ms ? ` · ${ms.sectionsCount} sections in store` : '') + ' — click for Memory settings';
+
+  // Routed model calls this session (titles/commit/review call sites).
+  $id('sb-router').textContent = `router: ${state.session.routedCalls} routed`;
+  $id('sb-router').title = 'Per-call-site routed model calls this session — click for AI settings';
+
+  // Context gauge: last chat turn vs the default model's window.
+  const u = state.session.lastUsage;
+  if (u) {
+    const win = modelContextWindow(state.settings?.defaultModel);
+    const used = (u.input_tokens || 0) + (u.output_tokens || 0);
+    const pct = Math.min(99, Math.max(1, Math.round(used / win * 100)));
+    $id('sb-ctx').textContent = `ctx ${pct}%`;
+    $id('sb-ctx').title = `Last chat turn: ${(u.input_tokens || 0).toLocaleString()} in + ${(u.output_tokens || 0).toLocaleString()} out · ${win.toLocaleString()}-token window`;
+  } else {
+    $id('sb-ctx').textContent = 'ctx —';
+    $id('sb-ctx').title = 'No chat turns yet this session';
+  }
+
+  // Extraction buffer: facts captured, awaiting consolidation.
+  $id('sb-extracted-label').textContent = ms ? `${ms.bufferCount} in buffer` : '…';
+  $id('sb-extracted').title = ms
+    ? `${ms.bufferCount} extracted memory items awaiting consolidation · ${ms.sectionsCount} consolidated sections — click for Memory settings`
+    : 'Memory stats loading…';
+
+  // Default chat model.
+  $id('sb-model').textContent = state.settings?.defaultModel || '—';
+  $id('sb-model').title = 'Default chat model — click for AI settings';
+
+  // Chat input model picker (Jul 14 ~09:20 ET) — the HTML is hardcoded
+  // with named spans .chat__model-name / .chat__model-tier, so we just
+  // rewrite their text. Runs on every updateStatusBar() so the chip
+  // stays synced with the settings default.
+  updateChatInputModelButton();
+}
+
+async function refreshGitBranch() {
+  if (!window.farnsworth?.gitBranch) return;
+  try {
+    const res = state.folder ? await window.farnsworth.gitBranch({ cwd: state.folder }) : { ok: false };
+    state.git = res.ok ? { branch: res.branch, dirty: res.dirty } : { branch: null, dirty: false };
+  } catch { state.git = { branch: null, dirty: false }; }
+  updateStatusBar();
+}
+
+async function refreshMemStats() {
+  if (!window.farnsworth?.memoryStageStats) return;
+  try {
+    const res = await window.farnsworth.memoryStageStats();
+    if (res?.ok) state.session.memStats = { bufferCount: res.bufferCount ?? 0, sectionsCount: res.sectionsCount ?? 0 };
+  } catch {}
+  updateStatusBar();
+}
+
+function wireStatusBar() {
+  const map = { 'sb-mem': 'memory', 'sb-extracted': 'memory', 'sb-router': 'ai', 'sb-model': 'ai' };
+  document.querySelector('.statusbar')?.addEventListener('click', (e) => {
+    const chip = e.target.closest('.statusbar__chip');
+    if (chip && map[chip.id]) openSettings(map[chip.id]);
+  });
+  // Cheap polls for the two sources that change outside renderer events.
+  setInterval(() => { refreshGitBranch(); refreshMemStats(); }, 60000);
+  window.addEventListener('focus', refreshGitBranch);
+}
+
 function openFile(f) {
   // Update current file marker
   state.files.entries.forEach(x => { if (x.type === 'file') x.current = false; });
@@ -5803,7 +5927,7 @@ function openFile(f) {
   state.files.current = f.path;
   state.codeFile = f.name;
   $('#canvas-file-name').textContent = f.name.replace(/\.(html|jsx|css|json|js|ts|tsx)$/, '');
-  $('#status-path').textContent = f.path;
+  updateStatusBar(); // status bar reads state.files.current (set above)
   // Switch to code mode and open the file in Monaco
   if (['html','htm','jsx','tsx','js','mjs','cjs','ts','css','scss','less','json','jsonc','md','mdx','py','go','rs','rb','java','c','cpp','cc','h','hpp','sh','bash','zsh','yaml','yml','toml','ini','xml','svg','sql','txt'].includes(f.ext)) {
     state.canvasMode = 'code';
@@ -5860,8 +5984,25 @@ function renderAISettings() {
     <div style="margin-bottom:24px;"><div class="settings-page__title">AI</div><div class="settings-page__sub">Authentication, the chat model, and per-call-site cost routing.</div></div>
 
     <div class="settings-section" id="ai-auth-section">
-      <div class="settings-section__title" style="margin-bottom:6px;">Claude authentication</div>
-      <div class="settings-section__desc" style="margin-bottom:13px;">How Farnsworth calls Claude. Credentials stay encrypted in the macOS Keychain.</div>
+      <div style="display:flex;align-items:center;gap:7px;margin-bottom:13px;">
+        <div class="settings-section__title" style="margin-bottom:0;">Anthropic</div>
+        <span class="settings-info-wrap">
+          <button class="settings-info-btn" data-info="How Farnsworth calls Claude. Credentials stay encrypted in the macOS Keychain and never leave this machine." title="About">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></svg>
+          </button>
+        </span>
+      </div>
+    </div>
+
+    <div class="settings-section" id="ai-openai-section">
+      <div style="display:flex;align-items:center;gap:7px;margin-bottom:13px;">
+        <div class="settings-section__title" style="margin-bottom:0;">OpenAI</div>
+        <span class="settings-info-wrap">
+          <button class="settings-info-btn" data-info="Credentials for ChatGPT/Codex integrations. Stored encrypted in the macOS Keychain. Chat inference currently runs on Claude — this key is picked up by OpenAI-powered features as they land." title="About">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></svg>
+          </button>
+        </span>
+      </div>
     </div>
 
     <div class="settings-section">
@@ -5967,6 +6108,47 @@ function renderAISettings() {
       `;
       authSection.appendChild(ccRow);
     }
+  }
+
+  // Build the OpenAI section content (Jul 14). Same honest rules as the
+  // Anthropic section: the key row stores a real encrypted credential
+  // (provider 'openai-api'), the Codex row reports a real ~/.codex/auth.json
+  // read — nothing decorative.
+  const openaiSection = wrap.querySelector('#ai-openai-section');
+  if (openaiSection) {
+    const oaKeyRow = el('div', { class: 'apikey-row' });
+    oaKeyRow.innerHTML = `
+      <div class="apikey-row__label">
+        <div class="apikey-row__label-main">OpenAI API key</div>
+        <div class="apikey-row__label-sub">platform.openai.com key for ChatGPT/Codex features.</div>
+      </div>
+      <div class="apikey-row__field">
+        <input type="password" id="ai-openai-key-input" class="apikey-input" placeholder="sk-…" autocomplete="off" />
+        <button class="btn btn--primary btn--sm" id="ai-openai-key-save">Save</button>
+        ${state.auth.openaiKeySet ? '<button class="btn btn--ghost btn--sm" id="ai-openai-key-clear">Remove</button>' : ''}
+      </div>
+      ${state.auth.openaiKeySet
+        ? '<div class="apikey-row__status is-set"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>API key saved</div>'
+        : '<div class="apikey-row__status is-missing"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16h.01"/></svg>No API key</div>'}
+    `;
+    openaiSection.appendChild(oaKeyRow);
+
+    const codexRow = el('div', { class: 'apikey-row' });
+    const codexLabel = state.auth.codexAvailable
+      ? ('Codex CLI logged in' + (state.auth.codexMethod === 'chatgpt' ? ' · ChatGPT account' : (state.auth.codexMethod === 'api_key' ? ' · API key' : '')))
+      : 'No Codex CLI login found';
+    codexRow.innerHTML = `
+      <div class="apikey-row__label">
+        <div class="apikey-row__label-main">Codex CLI auth</div>
+        <div class="apikey-row__label-sub">Detects an existing CLI login at <code>~/.codex/auth.json</code>.</div>
+      </div>
+      <div class="apikey-row__field">
+        ${state.auth.codexAvailable
+          ? `<div class="apikey-row__status is-set"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>${codexLabel}</div>`
+          : `<div class="apikey-row__status is-missing"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16h.01"/></svg>${codexLabel}</div>`}
+      </div>
+    `;
+    openaiSection.appendChild(codexRow);
   }
 
   const table = wrap.querySelector('.routing-table');
@@ -7032,6 +7214,7 @@ async function handleFolderPicked(folderPath) {
   // is actually visible (Long Jul 3 ~15:11 ET — boot lag spike).
   state.tasksLoadedForWs = null;
   state.files.loadedForFolder = null;
+  refreshGitBranch(); // status bar branch chip follows the open folder
   // Settings -> Canvas -> Default view modes (Jul 13): seed the vm
   // overlays for the freshly-opened workspace.
   const vmDefs = state.settings?.canvas?.defaults;
@@ -8152,6 +8335,14 @@ async function detectAuth() {
   if (!window.farnsworth) return;
   const keyRes = await window.farnsworth.hasApiKey();
   state.auth.apiKeySet = keyRes.ok && keyRes.hasKey;
+  // OpenAI credentials (stored key + Codex CLI login detection)
+  try {
+    const oaRes = await window.farnsworth.hasApiKey('openai-api');
+    state.auth.openaiKeySet = !!(oaRes.ok && oaRes.hasKey);
+    const cxRes = await window.farnsworth.codexStatus();
+    state.auth.codexAvailable = !!(cxRes.ok && cxRes.available);
+    state.auth.codexMethod = cxRes.method || null;
+  } catch {}
   const ccRes = await window.farnsworth.checkClaudeCode();
   state.auth.claudeCodeAvailable = ccRes.ok && ccRes.hasAuth;
   // Store Keychain details so the Settings panel can show them.
@@ -8181,6 +8372,7 @@ async function detectAuth() {
       }
     }
   } catch {}
+  updateStatusBar(); // connection chip reads state.auth
 }
 
 async function saveApiKey() {
@@ -8196,6 +8388,7 @@ async function saveApiKey() {
   if (res.ok) {
     state.auth.apiKeySet = true;
     renderSettings();
+    updateStatusBar();
   } else {
     alert('Could not save API key: ' + res.error);
   }
@@ -8205,6 +8398,60 @@ async function clearApiKey() {
   if (window.farnsworth) await window.farnsworth.clearApiKey();
   state.auth.apiKeySet = false;
   renderSettings();
+  updateStatusBar();
+}
+
+async function saveOpenaiKey() {
+  const input = $('#ai-openai-key-input');
+  if (!input) return;
+  const key = input.value.trim();
+  if (!key) return;
+  // OpenAI keys: sk-..., sk-proj-..., org-scoped variants — all start sk-.
+  // Reject Anthropic keys pasted in the wrong box (sk-ant- also starts
+  // with sk-, so check the specific prefix first).
+  if (key.startsWith('sk-ant-')) {
+    alert('That looks like an Anthropic key (sk-ant-…). Paste it in the Anthropic section above.');
+    return;
+  }
+  if (!key.startsWith('sk-')) {
+    alert('OpenAI API keys start with sk-. Check the value and try again.');
+    return;
+  }
+  const res = await window.farnsworth.setApiKey(key, 'openai-api');
+  if (res.ok) {
+    state.auth.openaiKeySet = true;
+    renderSettings();
+  } else {
+    alert('Could not save API key: ' + res.error);
+  }
+}
+
+async function clearOpenaiKey() {
+  if (window.farnsworth) await window.farnsworth.clearApiKey('openai-api');
+  state.auth.openaiKeySet = false;
+  renderSettings();
+}
+
+// Settings section ⓘ buttons (Jul 14) — headers carry an info button whose
+// explainer lives in data-info; one popover at a time, closes on outside
+// mousedown or a second click. Delegated because renderSettings() rebuilds
+// innerHTML on every call (the wire()-once gotcha).
+function toggleSettingsInfoPop(btn) {
+  const wrap = btn.closest('.settings-info-wrap');
+  if (!wrap) return;
+  const existing = wrap.querySelector('.settings-info-pop');
+  document.querySelectorAll('.settings-info-pop').forEach(p => p.remove());
+  if (existing) return; // second click on the same ⓘ = close
+  const pop = el('div', { class: 'settings-info-pop' });
+  pop.textContent = btn.dataset.info || '';
+  wrap.appendChild(pop);
+  const dismiss = (e) => {
+    if (!wrap.contains(e.target)) {
+      pop.remove();
+      document.removeEventListener('mousedown', dismiss, true);
+    }
+  };
+  document.addEventListener('mousedown', dismiss, true);
 }
 
 // ============================================================================
@@ -8728,12 +8975,18 @@ function wire() {
     settingsPane.addEventListener('click', (e) => {
       // Climb to the nearest element with an ID so clicks on SVG/text inside
       // a button still match the button's id.
+      // Section-header ⓘ buttons are class-matched (no ids — there's one
+      // per section and the explainer text rides in data-info).
+      const infoBtn = e.target.closest('.settings-info-btn');
+      if (infoBtn) { toggleSettingsInfoPop(infoBtn); return; }
       const target = e.target.closest('[id]') || e.target;
       const id = target.id;
       if (!id) return;
       switch (id) {
         case 'ai-apikey-save':       saveApiKey(); break;
         case 'ai-apikey-clear':      clearApiKey(); break;
+        case 'ai-openai-key-save':   saveOpenaiKey(); break;
+        case 'ai-openai-key-clear':  clearOpenaiKey(); break;
         case 'oauth-start-btn':      startOAuth(); break;
         case 'oauth-submit-btn':     submitOAuthCode(); break;
         case 'oauth-cancel-btn':     cancelOAuth(); break;
@@ -9350,6 +9603,9 @@ async function sendChatMessage() {
 
       // No tool_use blocks — final response, render and stop
       if (!res.toolUses || res.toolUses.length === 0) {
+        // Feed the status bar's ctx gauge: the chat thread is the context
+        // that matters (commit/review/title one-shots stay out of it).
+        if (res.usage) { state.session.lastUsage = res.usage; try { updateStatusBar(); } catch {} }
         const usageChip = res.usage ? { label: `${res.usage.input_tokens}→${res.usage.output_tokens} tok`, kind: 'read' } : null;
         updateAgentMsg({
           working: false,
@@ -10884,6 +11140,12 @@ async function init() {
   // became per-project (Jul 2).
   await detectAuth();
   wire();
+  // Status bar (Jul 14): seed every chip at boot, then let events/polls
+  // keep them live. detectAuth() above already painted the connection chip.
+  wireStatusBar();
+  updateStatusBar();
+  refreshGitBranch();
+  refreshMemStats();
   // Native macOS menu bridge — listen for actions from File / Edit / View
   // / Window menus. Each menu item in main.js sends 'menu:action' to the
   // focused window; we dispatch based on type. Replaces the old workflow
