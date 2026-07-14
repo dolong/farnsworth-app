@@ -294,6 +294,10 @@ function openModelPicker(anchorBtn, settingsKey = 'defaultModel', onPick = null,
       state.settings[settingsKey] = opt.display;
       persistSettings();
       renderSettings(); // re-render so the dropdown button shows the new value
+      // Jul 14 ~09:20 ET: keep the chat input chip in sync when the
+      // settings default changes (the settings dropdown lives in the
+      // overlay; the chat input chip is in the main UI).
+      if (settingsKey === 'defaultModel') updateChatInputModelButton();
     });
     pop.appendChild(row);
   }
@@ -758,7 +762,12 @@ function renderMessage(m) {
 
     const head = el('div', { class: 'msg__head' },
       el('span', { class: 'msg__name' }, 'Claude'),
-      el('span', { class: 'msg__model' }, 'Opus 4.8'),
+      // Jul 14 ~09:20 ET: was hardcoded "Opus 4.8" — chat bubbles always
+      // showed Opus even when the actual model was Fable 5 or whatever
+      // default the user picked. Each agent message stores its model on
+      // creation (see sendChatMessage ~line 9247); fall back to the
+      // current default for legacy bubbles from before this fix.
+      el('span', { class: 'msg__model' }, m.model || state.settings?.defaultModel || 'Opus 4.8'),
     );
     // Copy the whole message (m.text is the preamble+response concatenation
     // kept for history compat). Hidden while streaming — partial text.
@@ -6887,12 +6896,35 @@ function applyAppearanceSettings() {
   document.body.classList.toggle('density-compact', ap.density === 'Compact');
   root.style.setProperty('--font-sans', FONT_STACKS[ap.font] || FONT_STACKS['Hanken Grotesk']);
 }
+// Chat input model button — keep the bottom-of-input chip in sync with
+// state.settings.defaultModel. The HTML uses named spans
+// (.chat__model-name, .chat__model-tier) for the dynamic parts so this
+// is just text assignment. Jul 14 ~09:20 ET.
+function updateChatInputModelButton() {
+  const btn = document.getElementById('chat-model');
+  if (!btn) return;
+  const m = state.settings?.defaultModel || 'Opus 4.8 High';
+  const base = String(m).replace(/\s+High$/, '');
+  const tier = /\sHigh$/.test(m) ? 'High' : '';
+  const nameEl = btn.querySelector('.chat__model-name');
+  const tierEl = btn.querySelector('.chat__model-tier');
+  if (nameEl) nameEl.textContent = base;
+  if (tierEl) {
+    tierEl.textContent = tier;
+    tierEl.hidden = !tier;
+  }
+}
+
 async function loadSettings() {
   if (!window.farnsworth) return;
   try {
     const loaded = await window.farnsworth.getSettings();
     if (loaded) Object.assign(state.settings, loaded);
     reconcileHonestSettings(loaded);
+    // Jul 14 ~09:20 ET: keep the chat input's model chip in sync with
+    // whatever default the user picked. The HTML had "Opus 4.8" +
+    // "High" hardcoded; this rewrites the named spans in place.
+    updateChatInputModelButton();
     // Per-call-site routing reconciliation (Jul 13): the table only lists
     // call sites that exist in code (ROUTING_CALL_SITES). Persisted rows
     // keep the user's model/confirm choices for surviving ids; stale rows
@@ -9117,7 +9149,13 @@ async function sendChatMessage() {
   const history = [...prior, { role: 'user', content: userTextForAgent }];
 
   // Mutable copy of the agent placeholder so we can update its chips/working label as tools execute
-  let agentMsg = { id: agentMsgId, role: 'agent', working: true, workingLabel: 'Thinking', chips: [] };
+  let agentMsg = { id: agentMsgId, role: 'agent', working: true, workingLabel: 'Thinking', chips: [],
+    // Jul 14 ~09:20 ET: snapshot the model at message creation so the
+    // bubble header can show what was actually used, even after the
+    // user changes the default mid-conversation. See msg__model render
+    // ~line 776.
+    model: state.settings?.defaultModel || 'Opus 4.8',
+  };
   const updateAgentMsg = (patch) => {
     agentMsg = { ...agentMsg, ...patch };
     const idx = state.chatMessages.findIndex(m => m.id === agentMsgId);

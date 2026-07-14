@@ -3847,6 +3847,23 @@ ipcMain.on('inference:stream', async (event, opts = {}) => {
             if (!blocks[idx]) blocks[idx] = { type: 'tool_use', inputJson: '' };
             blocks[idx].inputJson = (blocks[idx].inputJson || '') + (delta.partial_json || '');
             send({ type: 'tool_use_delta', index: idx, partialJson: delta.partial_json || '' });
+          } else if (delta.type === 'thinking_delta') {
+            // Jul 14 ~09:20 ET: accumulate thinking text. Without this,
+            // blocks[idx] keeps the empty thinking field from
+            // content_block_start, the assistant message gets pushed to
+            // history with `thinking: ''`, and the next API call returns
+            // HTTP 400 with "messages.N.content.M.thinking: each thinking
+            // block must contain thinking". Triggered by switching the
+            // chat's default model to one with adaptive thinking
+            // enabled (Fable 5 / Opus 4.8 High).
+            if (!blocks[idx]) blocks[idx] = { type: 'thinking', thinking: '' };
+            blocks[idx].thinking = (blocks[idx].thinking || '') + (delta.thinking || '');
+          } else if (delta.type === 'signature_delta') {
+            // Jul 14 ~09:20 ET: capture the signature so the API can
+            // verify the thinking block on subsequent turns. Required
+            // (and unmodified) when a thinking block is echoed back.
+            if (!blocks[idx]) blocks[idx] = { type: 'thinking', thinking: '', signature: '' };
+            blocks[idx].signature = (blocks[idx].signature || '') + (delta.signature || '');
           }
         } else if (eventType === 'content_block_stop') {
           const idx = parsed.index;
