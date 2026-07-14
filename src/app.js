@@ -196,7 +196,7 @@ const state = {
   liveTicketsLoading: false,
   liveTicketsError: null,
   liveTimeoutSeconds: 15,   // configurable via Live cogwheel; backed by live.timeout_seconds SQLite setting
-  files: { loading: false, entries: [], loadedForFolder: null, collapsed: new Set(), filter: '', selected: null }, // loadedForFolder gates the tab-switch lazy walk (Jul 3 ~15:11 ET boot lag fix); collapsed tracks manually-toggled folder paths; filter is the live keyword; selected is the relPath of the focused row for F2 rename / context menu
+  files: { loading: false, entries: [], loadedForFolder: null, collapsed: new Set(), filter: '', selected: null, lazyLoaded: new Set() }, // loadedForFolder gates the tab-switch lazy walk (Jul 3 ~15:11 ET boot lag fix); collapsed tracks manually-toggled folder paths; filter is the live keyword; selected is the relPath of the focused row for F2 rename / context menu; lazyLoaded tracks deep folders fetched on-demand (Jul 14 lazy-expand fix)
   liveConfig: {              // per-project Live panel config, backed by .farnsworth/config.json's `live` subkey
     projectName: '',         // display name for the project (e.g. "Froggy Auto-RPG")
     subredditName: '',       // human-readable subreddit name (e.g. "SwordAndSupperGame")
@@ -3688,70 +3688,84 @@ function renderFiles() {
     : state.files.entries;
   const topLevel = entries.filter(e => !e.path.includes('/'));
   const collapsed = state.files.collapsed || new Set();
-  topLevel.forEach(entry => {
-    if (entry.type === 'dir') {
-      const children = state.files.entries.filter(e => e.path.startsWith(entry.path + '/') && e.path.split('/').length === entry.path.split('/').length + 1);
-      const isCollapsed = collapsed.has(entry.path);
-      const folderEl = el('div', { class: 'files__folder' + (isCollapsed ? ' is-collapsed' : '') + ((state.files.selected === entry.path) ? ' is-selected' : '') });
-      folderEl.innerHTML = `
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#6d7178" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
-        <svg width="15" height="15" viewBox="0 0 24 24" fill="#8b9099"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
-        <span class="files__folder-name">${entry.name}</span>
-        <span class="files__folder-count">${children.length}</span>
-      `;
-      folderEl.dataset.relPath = entry.path;
-      folderEl.dataset.role = 'folder';
-      // Header is the click target — chevron + icon + name + count.
-      folderEl.addEventListener('click', () => {
-        state.files.selected = entry.path;
-        if (collapsed.has(entry.path)) collapsed.delete(entry.path);
-        else collapsed.add(entry.path);
-        renderRightPanel();
-      });
-      folderEl.addEventListener('contextmenu', (ev) => {
-        ev.preventDefault();
-        state.files.selected = entry.path;
-        showFileContextMenu(entry, true, ev.clientX, ev.clientY);
-      });
-      tree.appendChild(folderEl);
-      // Children always rendered; CSS hides them when parent is collapsed.
-      const childrenWrap = el('div', { class: 'files__children' });
-      children.forEach(child => {
-        if (child.type === 'dir') {
-          const subChildren = state.files.entries.filter(e => e.path.startsWith(child.path + '/') && e.path.split('/').length === child.path.split('/').length + 1);
-          const subCollapsed = collapsed.has(child.path);
-          const sub = el('div', { class: 'files__folder files__folder--nested' + (subCollapsed ? ' is-collapsed' : '') + ((state.files.selected === child.path) ? ' is-selected' : '') });
-          sub.innerHTML = `
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#6d7178" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="#8b9099"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
-            <span class="files__folder-name">${child.name}</span>
-            <span class="files__folder-count">${subChildren.length}</span>
-          `;
-          sub.dataset.relPath = child.path;
-          sub.dataset.role = 'folder';
-          sub.addEventListener('click', () => {
-            state.files.selected = child.path;
-            if (collapsed.has(child.path)) collapsed.delete(child.path);
-            else collapsed.add(child.path);
-            renderRightPanel();
-          });
-          sub.addEventListener('contextmenu', (ev) => {
-            ev.preventDefault();
-            state.files.selected = child.path;
-            showFileContextMenu(child, true, ev.clientX, ev.clientY);
-          });
-          childrenWrap.appendChild(sub);
-          const subFilesWrap = el('div', { class: 'files__children' });
-          subChildren.forEach(c => c.type === 'file' && subFilesWrap.appendChild(makeFileEl(c)));
-          childrenWrap.appendChild(subFilesWrap);
-        } else {
-          childrenWrap.appendChild(makeFileEl(child));
-        }
-      });
-      tree.appendChild(childrenWrap);
-    } else {
-      tree.appendChild(makeFileEl(entry));
+  // -- Lazy deep-loading (Jul 14) --------------------------------
+  // The boot walk is depth-2 (Jul 3 boot-lag fix), so folders at
+  // depth >= 2 (e.g. story/dunkspin) appear in the tree with NO
+  // children loaded. Clicking such a folder used to expand to an
+  // empty list -- looked like the files were missing (Long, Jul 14).
+  // Now: first click on a never-walked folder fetches its subtree
+  // (depth 2) via fs:readDir and grafts it into the flat entries
+  // array with root-relative paths. The renderer below is fully
+  // recursive, so grafted levels render like everything else.
+  if (!(state.files.lazyLoaded instanceof Set)) state.files.lazyLoaded = new Set();
+
+  const directChildren = (dirPath) =>
+    state.files.entries.filter(e => e.path.startsWith(dirPath + '/') && e.path.split('/').length === dirPath.split('/').length + 1);
+
+  async function lazyLoadDir(entry) {
+    const abs = state.folder.replace(/\/+$/, '') + '/' + entry.path;
+    const res = await window.farnsworth.readDir(abs, 2);
+    state.files.lazyLoaded.add(entry.path);
+    if (res && res.ok && Array.isArray(res.entries)) {
+      // Drop stale entries under this dir, then graft the fresh
+      // subtree with paths re-based to the project root.
+      state.files.entries = state.files.entries.filter(e => !e.path.startsWith(entry.path + '/'));
+      res.entries.forEach(c => state.files.entries.push({ ...c, path: entry.path + '/' + c.path }));
     }
+    renderRightPanel();
+  }
+
+  function renderDirEntry(entry, container, nested) {
+    const children = directChildren(entry.path);
+    const isCollapsed = collapsed.has(entry.path);
+    // "Loaded" = we have children for it, or a lazy fetch already ran
+    // (which may have legitimately found none). Unloaded dirs show an
+    // ellipsis instead of a lying "0".
+    const isLoaded = children.length > 0 || state.files.lazyLoaded.has(entry.path);
+    const iconSize = nested ? 14 : 15;
+    const folderEl = el('div', { class: 'files__folder' + (nested ? ' files__folder--nested' : '') + (isCollapsed ? ' is-collapsed' : '') + ((state.files.selected === entry.path) ? ' is-selected' : '') });
+    folderEl.innerHTML = `
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#6d7178" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
+      <svg width="${iconSize}" height="${iconSize}" viewBox="0 0 24 24" fill="#8b9099"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+      <span class="files__folder-name">${entry.name}</span>
+      <span class="files__folder-count">${isLoaded ? children.length : '…'}</span>
+    `;
+    folderEl.dataset.relPath = entry.path;
+    folderEl.dataset.role = 'folder';
+    // Header is the click target -- chevron + icon + name + count.
+    folderEl.addEventListener('click', () => {
+      state.files.selected = entry.path;
+      if (!isLoaded) {
+        // Never walked this deep -- fetch children instead of toggling,
+        // and keep the folder expanded so the files land where the
+        // user just clicked.
+        collapsed.delete(entry.path);
+        lazyLoadDir(entry);
+        renderRightPanel();
+        return;
+      }
+      if (collapsed.has(entry.path)) collapsed.delete(entry.path);
+      else collapsed.add(entry.path);
+      renderRightPanel();
+    });
+    folderEl.addEventListener('contextmenu', (ev) => {
+      ev.preventDefault();
+      state.files.selected = entry.path;
+      showFileContextMenu(entry, true, ev.clientX, ev.clientY);
+    });
+    container.appendChild(folderEl);
+    // Children always rendered; CSS hides them when parent is collapsed.
+    const childrenWrap = el('div', { class: 'files__children' });
+    children.forEach(child => {
+      if (child.type === 'dir') renderDirEntry(child, childrenWrap, true);
+      else childrenWrap.appendChild(makeFileEl(child));
+    });
+    container.appendChild(childrenWrap);
+  }
+
+  topLevel.forEach(entry => {
+    if (entry.type === 'dir') renderDirEntry(entry, tree, false);
+    else tree.appendChild(makeFileEl(entry));
   });
 
   // Wire refresh + change folder buttons
@@ -5927,6 +5941,28 @@ function openFile(f) {
   state.files.current = f.path;
   state.codeFile = f.name;
   $('#canvas-file-name').textContent = f.name.replace(/\.(html|jsx|css|json|js|ts|tsx)$/, '');
+  // Jul 14: file-type tag + subline were static mock text ("HTML" / "screens/
+  // · 7 agents · edited 2m ago") left over from when the-last-draft was the
+  // only project. Show the real extension + folder-relative path; hide both
+  // when no file is open (see index.html defaults + closeFolder reset).
+  const typeEl = document.querySelector('.canvas__file-type');
+  if (typeEl) {
+    if (f.ext) {
+      typeEl.textContent = f.ext.toUpperCase();
+      typeEl.hidden = false;
+    } else {
+      typeEl.hidden = true;
+    }
+  }
+  const subEl = document.querySelector('.canvas__title-sub');
+  if (subEl) {
+    if (f.path) {
+      subEl.textContent = f.path;
+      subEl.hidden = false;
+    } else {
+      subEl.hidden = true;
+    }
+  }
   updateStatusBar(); // status bar reads state.files.current (set above)
   // Switch to code mode and open the file in Monaco
   if (['html','htm','jsx','tsx','js','mjs','cjs','ts','css','scss','less','json','jsonc','md','mdx','py','go','rs','rb','java','c','cpp','cc','h','hpp','sh','bash','zsh','yaml','yml','toml','ini','xml','svg','sql','txt'].includes(f.ext)) {
@@ -7498,6 +7534,9 @@ async function loadFolderFiles(folderPath, force = false) {
   state.files.loading = false;
   if (res.ok) {
     state.files.entries = res.entries;
+    // Fresh walk invalidates any on-demand deep loads (Jul 14 lazy-expand
+    // fix) -- folders re-fetch on next expand click.
+    state.files.lazyLoaded = new Set();
   } else {
     state.files.entries = [];
     console.warn('Failed to read folder:', res.error);
@@ -7669,6 +7708,15 @@ async function closeFolder() {
   state.appType = null;
   state.openFiles = [];
   state.activeFileIdx = -1;
+  state.codeFile = null;
+  state.files.current = null;
+  // Jul 14: reset the canvas title to the no-file-open state so we don't
+  // carry the previous file's name + type tag + subline into the next folder.
+  $('#canvas-file-name').textContent = '-';
+  const _closeTypeEl = document.querySelector('.canvas__file-type');
+  if (_closeTypeEl) _closeTypeEl.hidden = true;
+  const _closeSubEl = document.querySelector('.canvas__title-sub');
+  if (_closeSubEl) _closeSubEl.hidden = true;
   // Reset per-project live subreddit id so the next folder opened
   // doesn't inherit this project's subreddit. Falls back to the
   // default in getLiveGameId() until handleFolderPicked loads the
@@ -9837,6 +9885,44 @@ function nextClaudeCodeLabel() {
   return n === 1 ? 'claude' : 'claude ' + n;
 }
 
+// Derive a tab title from the user's first message in a Claude Code
+// session (Jul 14 ~13:00 ET). Trims to ~40 chars so the cctab pill
+// stays readable; collapses whitespace; strips leading Re:/Fwd:/>;
+// strips leading slashes so "/login" becomes "login". Returns
+// 'New chat' for empty input.
+function generateTitleFromMessage(msg) {
+  if (!msg || typeof msg !== 'string') return 'New chat';
+  const firstLine = msg.trim().split('\n').find(l => l.trim()) || '';
+  let collapsed = firstLine.replace(/\s+/g, ' ').trim();
+  // Strip prompt-prefix chars (Claude Code's "❯ ", "›", "> ") + leading
+  // slashes + Re:/Fwd: prefixes. xterm's line buffer includes whatever
+  // was rendered on the prompt line, including the prompt char.
+  collapsed = collapsed
+    .replace(/^[❯›>]\s*/, '')
+    .replace(/^(re|fwd|>>)\s*:\s*/i, '')
+    .replace(/^\/+/, '')
+    .trim();
+  // Strip conversational openers so the title reads like a topic instead
+  // of a raw question. Falls back to the original text if stripping makes
+  // it too short (e.g., "please" alone -> "please" kept). Verified Jul 14
+  // ~15:35 ET: Long expected topic-style titles, not raw first-message text.
+  const openerStripped = collapsed.replace(
+    /^(how (do|can|should|would|could) (i|you|we)|how to|what (is|are|were)|can you|could you|i (need|want) to|please|let's|let us)\s+/i,
+    ''
+  ).trim();
+  if (openerStripped.length >= 3) {
+    collapsed = openerStripped;
+  }
+  // Strip trailing question mark / period so titles don't read as questions.
+  collapsed = collapsed.replace(/[?.!]+\s*$/, '');
+  // Sentence-case (capitalize first letter only) -- title-case looks weird
+  // for code topics ("Use Async/await" -> "Use Async/Await").
+  collapsed = collapsed.charAt(0).toUpperCase() + collapsed.slice(1);
+  if (!collapsed) return 'New chat';
+  if (collapsed.length <= 40) return collapsed;
+  return collapsed.slice(0, 37) + '...';
+}
+
 function nextTerminalTabId() {
   terminalTabCounter++;
   return 'term-' + terminalTabCounter;
@@ -10139,12 +10225,43 @@ async function initClaudeCode(tabId) {
   // handles Shift+Enter separately; this brings the Claude Code panel to
   // parity. Scoped to this panel only — a plain shell has no use for
   // meta-CR, so the Terminal panel keeps stock behavior.
+  // First-message rename tracker (Jul 14 ~13:00 ET): when the user
+  // presses Enter on a non-empty line for the first time in this tab,
+  // capture the line text, generate a title, and send a rename to
+  // main.js which sends `/rename <title>` to the existing PTY (claude's
+  // slash command). Once sent, this tab never renames again. The keydown
+  // handler below sends data("\r") before rename so the user's first
+  // message submits normally, then /rename runs on the empty prompt.
+  let renameSent = false;
   term.attachCustomKeyEventHandler((ev) => {
     if (ev.key === 'Enter' && ev.shiftKey && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
       if (ev.type === 'keydown' && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: 'data', data: '\x1b\r' }));
       }
       return false; // swallow keydown/keypress/keyup so xterm never emits its own \r
+    }
+    if (!renameSent && ev.type === 'keydown' && ev.key === 'Enter'
+        && !ev.shiftKey && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
+      try {
+        const buf = term.buffer.active;
+        const line = buf.getLine(buf.cursorY);
+        const text = line ? line.translateToString(true).trim() : '';
+        if (text && ws.readyState === WebSocket.OPEN) {
+          const title = generateTitleFromMessage(text);
+          // Send data("\r") FIRST so the typed text submits as a normal
+          // message, then send rename so main's /rename runs on the now-
+          // empty prompt. Swallow xterm's own Enter (return false below)
+          // so we don't end up with "test\r/rename test\r\r" in the
+          // PTY input (which would treat the whole thing as one user
+          // message instead of a message followed by a slash command).
+          // Verified Jul 14 ~14:38 ET: the earlier kill+respawn lost the
+          // first message entirely; this approach keeps the PTY alive.
+          ws.send(JSON.stringify({ type: 'data', data: '\r' }));
+          ws.send(JSON.stringify({ type: 'rename', tabId, name: title }));
+          renameSent = true;
+          return false; // swallow xterm's Enter so no duplicate \r
+        }
+      } catch {}
     }
     return true;
   });
@@ -10183,6 +10300,20 @@ async function initClaudeCode(tabId) {
             claudeCodePersistedSessionsByTab.set(tabId, msg.sessionId);
             persistClaudeCodeTabs();
           }
+        }
+      } else if (msg.type === 'renamed' && msg.name) {
+        // main.js renamed the session after first user message; update
+        // our tab label so it shows the title (not 'claude N'). Note:
+        // msg.tabId in 'renamed' is the PTY tabId (from main's WS
+        // URL), not the Claude Code panel tabId -- we use the closure
+        // `tabId` from initClaudeCode instead, which IS the panel id
+        // stored in claudeCodeSessions. Verified Jul 14 ~13:15 ET via
+        // WS message log: main sends tabId=cc-<ptyuuid>, not cc-<panelid>.
+        const sess = claudeCodeSessions.get(tabId);
+        if (sess) {
+          sess.label = String(msg.name).slice(0, 80);
+          renderClaudeCodeTabs();
+          persistClaudeCodeTabs();
         }
       } else if (msg.type === 'data') {
         term.write(msg.data);

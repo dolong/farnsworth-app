@@ -2322,6 +2322,10 @@ pre:hover .code-copy { opacity: 1; }
   font-family: var(--font-mono); font-size: 9.5px; color: var(--text-faint);
 }
 .files__children { /* wrapper for folder children — hidden when parent is collapsed */ }
+/* Jul 14 lazy-expand fix: levels 3+ (previously unreachable — the walk
+   stopped at depth 2) compound indent per nesting level. Scoped to
+   triple-nesting so existing level-1/2 rows keep their exact indent. */
+.files__children .files__children .files__children { padding-left: 14px; }
 .files__file {
   display: flex; align-items: center; gap: 8px;
   padding: 5px 8px 5px 30px;
