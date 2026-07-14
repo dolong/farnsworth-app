@@ -6357,3 +6357,13 @@ pre:hover .code-copy { opacity: 1; }
 .diff-overlay__btn--reload { color: #f0883e; border-color: rgba(240, 136, 62, 0.5); }
 .diff-overlay__btn--reload:hover { background: rgba(240, 136, 62, 0.22); }
 .diff-overlay__body { flex: 1; min-height: 0; }
+
+/* --- Density: Compact (Settings -> Appearance, honest wiring Jul 13) --- */
+/* Applied as a body class by applyAppearanceSettings(). Tightens the     */
+/* highest-traffic surfaces: settings rows, chat messages, section gaps.  */
+body.density-compact .settings-section { margin-bottom: 20px; }
+body.density-compact .toggle-row { padding: 7px 0; }
+body.density-compact .behavior-row { padding: 7px 0; }
+body.density-compact .toggle-row__desc { display: none; }
+body.density-compact .msg { padding-top: 6px; padding-bottom: 6px; }
+body.density-compact .msg__body { font-size: 12.5px; }

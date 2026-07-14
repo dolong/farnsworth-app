@@ -119,11 +119,16 @@ const state = {
     canvas: {
       defaultZoom: 100, fitOnOpen: false,
       defaults: { markup: false, comments: false, tweaks: true },
-      engine: { devtools: true, cookieIsolation: true, network: true },
+      engine: { devtools: true, cookieIsolation: false, network: true },
     },
-    workspace: { storagePath: '~/ClaudeDesign/UX Screens MBA', access: 'Anyone with link · view', allowComments: true },
+    // canvasV/appearanceV 2 = honest-wiring migration (Jul 13). Pre-wiring
+    // persisted values were decorative seeds, not user choices, so they
+    // don't carry over (same rule as routingV). The old workspace/account
+    // seeds (fake storage path, sharing defaults, "Mara Blake") are gone --
+    // Workspace renders live folder/recents state, About renders app:info.
+    canvasV: 2,
+    appearanceV: 2,
     appearance: { theme: 'dark', density: 'Comfortable', accent: 'blurple', font: 'Hanken Grotesk' },
-    account: { name: 'Mara Blake', email: 'mara@studio.gg', plan: 'Farnsworth Pro', renews: 'Jul 1, 2026' },
   },
 
   chatMessages: [
@@ -1042,7 +1047,16 @@ function setupCanvasBrowserViews() {
     // actually have a BrowserView and which have a pending IPC.
     (async () => {
       try {
-        const result = await window.farnsworth.canvasCreateView(viewId, url, bounds);
+        // Engine settings -> view options (Settings -> Canvas, Jul 13).
+        // Computed at creation time; toggles apply on next preview load.
+        const eng = state.settings.canvas?.engine || {};
+        const viewOpts = {
+          devTools: eng.devtools !== false,
+          partitionKey: (eng.cookieIsolation && state.folder)
+            ? state.folder.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(-48)
+            : null,
+        };
+        const result = await window.farnsworth.canvasCreateView(viewId, url, bounds, viewOpts);
         if (!result?.ok) {
           console.error('[canvas:setup] createView failed for viewId=' + viewId + ':', result?.error);
           return;
@@ -1458,6 +1472,16 @@ function renderCanvas() {
     if (state.preview === 'testview' && state.canvasMode === 'live' && state._zoomManualFor !== 'testview') {
       autoFitZoomToStage();
     } else {
+      // Settings -> Canvas preview defaults (Jul 13): when the user hasn't
+      // manually zoomed in this preview, apply the configured default --
+      // fit-to-view when fitOnOpen is ON, else defaultZoom%. Manual zoom
+      // (zoom buttons set _zoomManualFor = state.preview) always wins.
+      const cs = state.settings?.canvas || {};
+      if (state._zoomManualFor !== state.preview && state.canvasMode === 'live') {
+        if (cs.fitOnOpen) { autoFitZoomToStage(); return; }
+        const dz = parseInt(cs.defaultZoom, 10);
+        if (Number.isFinite(dz) && dz >= 25 && dz <= 200) state.zoom = dz;
+      }
       updateZoom();
     }
   });
@@ -5817,7 +5841,7 @@ function renderSettings() {
   else if (state.settingsPage === 'canvas') pane.appendChild(renderCanvasSettings());
   else if (state.settingsPage === 'workspace') pane.appendChild(renderWorkspaceSettings());
   else if (state.settingsPage === 'appearance') pane.appendChild(renderAppearanceSettings());
-  else if (state.settingsPage === 'account') pane.appendChild(renderAccountSettings());
+  else if (state.settingsPage === 'account') pane.appendChild(renderAboutSettings());
 }
 
 function renderAISettings() {
@@ -6554,6 +6578,36 @@ function openStageModelPicker(anchorBtn, cfg) {
   }, 0);
 }
 
+// Tiny generic dropdown for settings rows (Jul 13). Same look as the
+// model picker, minus the model-specific chrome. onPick gets the chosen
+// option; caller persists + re-renders.
+function openMiniPicker(anchorBtn, options, current, onPick) {
+  const existing = document.querySelector('.mini-picker');
+  if (existing) existing.remove();
+  const pop = el('div', { class: 'mini-picker' });
+  pop.style.cssText = 'position:fixed;z-index:9999;background:#1f2024;border:1px solid #2a2c32;border-radius:11px;padding:6px;min-width:180px;box-shadow:0 12px 40px rgba(0,0,0,.55);font-size:13px;';
+  options.forEach(opt => {
+    const item = el('button', { style: 'display:block;width:100%;text-align:left;background:' + (String(opt) === String(current) ? '#2a2c32' : 'transparent') + ';border:none;border-radius:7px;padding:8px 11px;color:#dbdee1;font-size:12.5px;cursor:pointer;' }, String(opt));
+    item.addEventListener('mouseenter', () => { item.style.background = '#2a2c32'; });
+    item.addEventListener('mouseleave', () => { if (String(opt) !== String(current)) item.style.background = 'transparent'; });
+    item.addEventListener('click', () => { pop.remove(); onPick(opt); });
+    pop.appendChild(item);
+  });
+  document.body.appendChild(pop);
+  const r = anchorBtn.getBoundingClientRect();
+  pop.style.top = Math.min(r.bottom + 6, window.innerHeight - pop.offsetHeight - 8) + 'px';
+  pop.style.left = Math.max(8, Math.min(r.left, window.innerWidth - pop.offsetWidth - 8)) + 'px';
+  setTimeout(() => {
+    const close = (e) => { if (!pop.contains(e.target)) { pop.remove(); document.removeEventListener('mousedown', close); } };
+    document.addEventListener('mousedown', close);
+  }, 0);
+}
+
+// --- Settings -> Canvas (every control real as of Jul 13) ---
+// defaultZoom + fitOnOpen feed the zoom rAF in renderCanvas (manual zoom
+// wins, Test View always auto-fits); defaults.* seed state.vm at folder
+// open; engine.* configure the preview WebContentsViews (partition +
+// devTools at creation, network filter applied live).
 function renderCanvasSettings() {
   const s = state.settings.canvas;
   const wrap = el('div');
@@ -6565,13 +6619,21 @@ function renderCanvasSettings() {
   `;
   const sec1 = wrap.querySelector('.settings-section');
   const zoomRow = el('div', { class: 'behavior-row' });
-  zoomRow.appendChild(el('div', { class: 'behavior-row__label' }, 'Default zoom'));
-  zoomRow.appendChild(el('button', { class: 'model-dropdown', style: 'font-family:JetBrains Mono,monospace;font-size:12px;padding:6px 11px;' }, s.defaultZoom + '%'));
+  const zoomLabel = el('div', { class: 'behavior-row__label' }, 'Default zoom');
+  zoomLabel.appendChild(el('div', { style: 'font-size:11px;color:#80848e;margin-top:2px;font-weight:400;' }, 'Applied when a preview opens. Manual zoom wins; Test View auto-fits.'));
+  zoomRow.appendChild(zoomLabel);
+  const zoomBtn = el('button', { class: 'model-dropdown', style: 'font-family:JetBrains Mono,monospace;font-size:12px;padding:6px 11px;' }, s.defaultZoom + '%');
+  zoomBtn.addEventListener('click', () => openMiniPicker(zoomBtn, ['50%', '75%', '100%', '125%', '150%'], s.defaultZoom + '%', picked => {
+    s.defaultZoom = parseInt(picked, 10);
+    persistSettings();
+    renderSettings();
+  }));
+  zoomRow.appendChild(zoomBtn);
   sec1.appendChild(zoomRow);
-  sec1.appendChild(makeToggleRow('Fit to viewport on open', '', s.fitOnOpen, v => { s.fitOnOpen = v; persistSettings(); }));
+  sec1.appendChild(makeToggleRow('Fit to viewport on open', 'Auto-fit the artboard to the window instead of the default zoom.', s.fitOnOpen, v => { s.fitOnOpen = v; persistSettings(); }));
 
   const defaults = el('div', { class: 'settings-section' });
-  defaults.innerHTML = '<div class="settings-section__title" style="margin-bottom:6px;">Default view modes</div>';
+  defaults.innerHTML = '<div class="settings-section__title" style="margin-bottom:2px;">Default view modes</div><div style="font-size:11px;color:#80848e;margin-bottom:8px;">Overlays switched on when a folder opens.</div>';
   defaults.appendChild(makeToggleRow('Mark up', '', s.defaults.markup, v => { s.defaults.markup = v; persistSettings(); }));
   defaults.appendChild(makeToggleRow('Comments', '', s.defaults.comments, v => { s.defaults.comments = v; persistSettings(); }));
   defaults.appendChild(makeToggleRow('Show tweaks', '', s.defaults.tweaks, v => { s.defaults.tweaks = v; persistSettings(); }));
@@ -6579,60 +6641,86 @@ function renderCanvasSettings() {
 
   const engine = el('div', { class: 'settings-section' });
   engine.innerHTML = '<div class="settings-section__title" style="margin-bottom:6px;">Browser engine</div>';
-  engine.appendChild(makeToggleRow('Devtools access', 'Full Chromium devtools in the preview pane.', s.engine.devtools, v => { s.engine.devtools = v; persistSettings(); }));
-  engine.appendChild(makeToggleRow('Cookie isolation per file', '', s.engine.cookieIsolation, v => { s.engine.cookieIsolation = v; persistSettings(); }));
-  engine.appendChild(makeToggleRow('Network access from canvas', 'Allow the preview to make outbound requests (for the Live tab).', s.engine.network, v => { s.engine.network = v; persistSettings(); }));
+  engine.appendChild(makeToggleRow('Devtools access', 'Chromium devtools for the preview (⌘K → Canvas: Open Preview DevTools). Applies on next preview load.', s.engine.devtools, v => { s.engine.devtools = v; persistSettings(); }));
+  engine.appendChild(makeToggleRow('Cookie isolation per project', 'Each project gets its own cookies + localStorage. Applies on next preview load.', s.engine.cookieIsolation, v => { s.engine.cookieIsolation = v; persistSettings(); }));
+  engine.appendChild(makeToggleRow('Network access from canvas', 'Allow the preview to reach hosts beyond localhost. Applies immediately.', s.engine.network, v => { s.engine.network = v; persistSettings(); window.farnsworth?.canvasSetNetworkAccess?.(v); }));
   wrap.appendChild(engine);
 
   return wrap;
 }
 
+// --- Settings -> Workspace (rebuilt honest, Jul 13) ---
+// Live current-folder + recents from the real DB. The old page was a
+// design mock: fake storage path, decorative template cards, sharing
+// controls for a sharing feature that doesn't exist.
 function renderWorkspaceSettings() {
-  const s = state.settings.workspace;
   const wrap = el('div');
   wrap.innerHTML = `
-    <div style="margin-bottom:24px;"><div class="settings-page__title">Workspace</div><div class="settings-page__sub">Where projects live and how they're shared.</div></div>
+    <div style="margin-bottom:24px;"><div class="settings-page__title">Workspace</div><div class="settings-page__sub">The folder Farnsworth is working in.</div></div>
     <div class="settings-section">
-      <div class="settings-section__title" style="margin-bottom:13px;">File storage</div>
+      <div class="settings-section__title" style="margin-bottom:13px;">Current folder</div>
     </div>
   `;
   const sec1 = wrap.querySelector('.settings-section');
-  const storageRow = el('div', { style: 'display:flex;align-items:center;gap:10px;' });
-  storageRow.innerHTML = `
-    <div style="flex:1;display:flex;align-items:center;gap:9px;background:#1a1b1e;border:1px solid var(--border-default);border-radius:9px;padding:9px 12px;font-family:'JetBrains Mono',monospace;font-size:11.5px;color:#9aa0a8;">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#6d7178" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
-      ${s.storagePath}
-    </div>
-    <button class="btn">Change</button>
-  `;
-  sec1.appendChild(storageRow);
+  const folderRow = el('div', { style: 'display:flex;align-items:center;gap:10px;' });
+  const folderBox = el('div', { style: "flex:1;min-width:0;display:flex;align-items:center;gap:9px;background:#1a1b1e;border:1px solid var(--border-default);border-radius:9px;padding:9px 12px;font-family:'JetBrains Mono',monospace;font-size:11.5px;color:#9aa0a8;" });
+  folderBox.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#6d7178" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>';
+  folderBox.appendChild(el('span', { style: 'overflow:hidden;white-space:nowrap;text-overflow:ellipsis;' }, state.folder || 'No folder open'));
+  folderRow.appendChild(folderBox);
+  const changeBtn = el('button', { class: 'btn' }, state.folder ? 'Change' : 'Open…');
+  changeBtn.addEventListener('click', async () => { await openFolderPicker(); renderSettings(); });
+  folderRow.appendChild(changeBtn);
+  if (state.folder && window.farnsworth?.showInFinder) {
+    const revealBtn = el('button', { class: 'btn' }, 'Reveal');
+    revealBtn.addEventListener('click', () => window.farnsworth.showInFinder(state.folder));
+    folderRow.appendChild(revealBtn);
+  }
+  sec1.appendChild(folderRow);
 
-  const templates = el('div', { class: 'settings-section' });
-  templates.innerHTML = '<div class="settings-section__title" style="margin-bottom:13px;">Project templates</div><div style="display:flex;gap:11px;">' +
-    `<div style="flex:1;cursor:pointer;"><div style="height:78px;border-radius:10px;background:linear-gradient(135deg,#5865f2,#3ab7f0);border:1px solid #1f2023;"></div><div style="font-size:11.5px;font-weight:600;color:#dbdee1;margin-top:7px;">Game UI</div></div>` +
-    `<div style="flex:1;cursor:pointer;"><div style="height:78px;border-radius:10px;background:linear-gradient(135deg,#eb459e,#f0883e);border:1px solid #1f2023;"></div><div style="font-size:11.5px;font-weight:600;color:#dbdee1;margin-top:7px;">Landing page</div></div>` +
-    `<div style="flex:1;cursor:pointer;"><div style="height:78px;border-radius:10px;background:linear-gradient(135deg,#a855f7,#5865f2);border:1px solid #1f2023;"></div><div style="font-size:11.5px;font-weight:600;color:#dbdee1;margin-top:7px;">Dashboard</div></div>` +
-    `<div style="flex:1;cursor:pointer;"><div style="height:78px;border-radius:10px;background:#1a1b1e;border:1px dashed #3a3c42;display:flex;align-items:center;justify-content:center;color:#6d7178;"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg></div><div style="font-size:11.5px;font-weight:600;color:#80848e;margin-top:7px;">Blank</div></div>` +
-    `</div>`;
-  wrap.appendChild(templates);
+  const recents = el('div', { class: 'settings-section' });
+  const head = el('div', { style: 'display:flex;align-items:center;justify-content:space-between;margin-bottom:13px;' });
+  head.appendChild(el('div', { class: 'settings-section__title', style: 'margin-bottom:0;' }, 'Recent folders'));
+  const clearBtn = el('button', { class: 'btn', style: 'font-size:11.5px;padding:5px 10px;' }, 'Clear');
+  clearBtn.addEventListener('click', async () => {
+    await window.farnsworth?.clearRecent?.();
+    renderSettings();
+  });
+  head.appendChild(clearBtn);
+  recents.appendChild(head);
+  const list = el('div', { style: 'display:flex;flex-direction:column;gap:6px;' });
+  list.appendChild(el('div', { style: 'font-size:12px;color:#6d7178;' }, 'Loading…'));
+  recents.appendChild(list);
+  wrap.appendChild(recents);
 
-  const sharing = el('div', { class: 'settings-section' });
-  sharing.innerHTML = '<div class="settings-section__title" style="margin-bottom:13px;">Sharing defaults</div>';
-  const accessRow = el('div', { class: 'behavior-row' });
-  accessRow.appendChild(el('div', { class: 'behavior-row__label' }, 'New project access'));
-  accessRow.appendChild(el('button', { class: 'model-dropdown', style: 'font-size:12px;padding:7px 11px;' }, s.access));
-  sharing.appendChild(accessRow);
-  sharing.appendChild(makeToggleRow('Allow comments from viewers', '', s.allowComments, v => { s.allowComments = v; persistSettings(); }));
-  wrap.appendChild(sharing);
+  (async () => {
+    let rows = [];
+    try { rows = (await window.farnsworth?.getRecent?.()) || []; } catch {}
+    list.innerHTML = '';
+    if (!rows.length) {
+      list.appendChild(el('div', { style: 'font-size:12px;color:#6d7178;' }, 'No recent folders.'));
+      return;
+    }
+    rows.forEach(r => {
+      const row = el('button', { title: 'Open ' + r.path, style: 'display:flex;align-items:center;gap:9px;background:#1a1b1e;border:1px solid var(--border-default);border-radius:9px;padding:9px 12px;cursor:pointer;text-align:left;width:100%;min-width:0;' });
+      row.appendChild(el('span', { style: 'font-size:12.5px;font-weight:600;color:#dbdee1;flex-shrink:0;' }, r.name || ''));
+      row.appendChild(el('span', { style: "font-family:'JetBrains Mono',monospace;font-size:11px;color:#6d7178;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;" }, r.path));
+      row.addEventListener('click', () => { closeSettings(); handleFolderPicked(r.path); });
+      list.appendChild(row);
+    });
+  })();
 
   return wrap;
 }
 
+// --- Settings -> Appearance (wired live, Jul 13) ---
+// Every change routes through applyAppearanceSettings() -> CSS vars /
+// body class. Theme stays single-option (only a dark stylesheet exists;
+// Light/High-contrast honestly marked "soon").
 function renderAppearanceSettings() {
   const s = state.settings.appearance;
   const wrap = el('div');
   wrap.innerHTML = `
-    <div style="margin-bottom:24px;"><div class="settings-page__title">Appearance</div><div class="settings-page__sub">Theme, density and accent. Light mode is on the roadmap.</div></div>
+    <div style="margin-bottom:24px;"><div class="settings-page__title">Appearance</div><div class="settings-page__sub">Theme, density, accent and font — applied live.</div></div>
     <div class="settings-section"><div class="settings-section__title" style="margin-bottom:13px;">Theme</div></div>
   `;
   const themeSection = wrap.querySelector('.settings-section');
@@ -6650,7 +6738,7 @@ function renderAppearanceSettings() {
   const dSeg = el('div', { class: 'segmented' });
   ['Comfortable', 'Compact'].forEach(opt => {
     const btn = el('button', { class: 'segmented__btn' + (opt === s.density ? ' is-active' : '') }, opt);
-    btn.addEventListener('click', () => { state.settings.appearance.density = opt; persistSettings(); renderSettings(); });
+    btn.addEventListener('click', () => { state.settings.appearance.density = opt; persistSettings(); applyAppearanceSettings(); renderSettings(); });
     dSeg.appendChild(btn);
   });
   density.appendChild(dSeg);
@@ -6660,56 +6748,84 @@ function renderAppearanceSettings() {
   accent.innerHTML = '<div class="settings-section__title" style="margin-bottom:13px;">Accent color</div><div style="display:flex;gap:11px;"></div>';
   const swatches = ['#5865f2', '#3ab7f0', '#3ba55c', '#eb459e', '#f0883e', '#a855f7'];
   const swatchRow = accent.querySelector('div:last-child');
-  swatches.forEach(c => {
-    const sw = el('span', { style: `width:30px;height:30px;border-radius:50%;background:${c};cursor:pointer;${c === s.accent || (c === '#5865f2' && s.accent === 'blurple') ? 'box-shadow:0 0 0 2px #313338,0 0 0 4px '+c : ''}` });
-    sw.addEventListener('click', () => { state.settings.appearance.accent = c === '#5865f2' ? 'blurple' : c; persistSettings(); renderSettings(); });
+  swatches.forEach(cc => {
+    const sw = el('span', { style: `width:30px;height:30px;border-radius:50%;background:${cc};cursor:pointer;${cc === s.accent || (cc === '#5865f2' && s.accent === 'blurple') ? 'box-shadow:0 0 0 2px #313338,0 0 0 4px ' + cc : ''}` });
+    sw.addEventListener('click', () => { state.settings.appearance.accent = cc === '#5865f2' ? 'blurple' : cc; persistSettings(); applyAppearanceSettings(); renderSettings(); });
     swatchRow.appendChild(sw);
   });
   wrap.appendChild(accent);
 
   const font = el('div', { class: 'settings-section' });
   font.innerHTML = '<div class="settings-section__title" style="margin-bottom:13px;">Interface font</div>';
-  font.appendChild(el('button', { class: 'model-dropdown' }, s.font));
+  const fontBtn = el('button', { class: 'model-dropdown' }, s.font);
+  fontBtn.addEventListener('click', () => openMiniPicker(fontBtn, Object.keys(FONT_STACKS), s.font, picked => {
+    state.settings.appearance.font = picked;
+    persistSettings();
+    applyAppearanceSettings();
+    renderSettings();
+  }));
+  font.appendChild(fontBtn);
   wrap.appendChild(font);
 
   return wrap;
 }
 
-function renderAccountSettings() {
-  const s = state.settings.account;
+// --- Settings -> About (replaces the fake Account page, Jul 13) ---
+// "Mara Blake / mara@studio.gg / Farnsworth Pro $30/mo" was design-mock
+// data with dead Edit/Manage/Sign out buttons. There is no account system;
+// this page now shows real install facts (app:info IPC) + live auth state.
+function renderAboutSettings() {
   const wrap = el('div');
   wrap.innerHTML = `
-    <div style="margin-bottom:24px;"><div class="settings-page__title">Account</div><div class="settings-page__sub">Profile, plan and session.</div></div>
-    <div style="display:flex;align-items:center;gap:14px;background:#1a1b1e;border:1px solid var(--border-default);border-radius:12px;padding:16px;margin-bottom:24px;">
-      <div style="width:48px;height:48px;border-radius:50%;background:linear-gradient(135deg,#eb459e,#f0883e);display:flex;align-items:center;justify-content:center;font-size:17px;font-weight:700;color:#fff;">MB</div>
-      <div style="flex:1;">
-        <div style="display:flex;align-items:center;gap:8px;">
-          <span style="font-size:15px;font-weight:700;color:#f2f3f5;">${s.name}</span>
-          <span class="settings-pill settings-pill--v23">PRO</span>
-        </div>
-        <div style="font-size:12px;color:#80848e;margin-top:2px;">${s.email}</div>
-      </div>
-      <button class="btn">Edit</button>
-    </div>
-    <div class="settings-section"><div class="settings-section__title" style="margin-bottom:13px;">Plan</div></div>
+    <div style="margin-bottom:24px;"><div class="settings-page__title">About</div><div class="settings-page__sub">This install — versions, storage and auth.</div></div>
+    <div class="settings-section"><div class="settings-section__title" style="margin-bottom:13px;">Application</div><div id="about-app-rows" style="display:flex;flex-direction:column;gap:7px;"><div style="font-size:12px;color:#6d7178;">Loading…</div></div></div>
+    <div class="settings-section"><div class="settings-section__title" style="margin-bottom:13px;">Claude auth</div><div id="about-auth-row"></div></div>
   `;
-  const planSec = wrap.querySelector('.settings-section');
-  const planRow = el('div', { style: 'display:flex;align-items:center;justify-content:space-between;background:#1a1b1e;border:1px solid var(--border-default);border-radius:10px;padding:14px 16px;' });
-  planRow.innerHTML = `
-    <div>
-      <div style="font-size:13px;font-weight:600;color:#f2f3f5;">${s.plan}</div>
-      <div style="font-size:11.5px;color:#80848e;margin-top:2px;">Renews ${s.renews} · $30/mo</div>
-    </div>
-    <button class="btn">Manage</button>
-  `;
-  planSec.appendChild(planRow);
 
-  const signOut = el('button', { style: 'display:flex;align-items:center;gap:8px;background:transparent;border:1px solid rgba(242,63,67,.3);border-radius:8px;padding:9px 14px;color:#f23f43;font-size:12.5px;font-weight:600;cursor:pointer;margin-top:24px;' });
-  signOut.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></svg>Sign out';
-  wrap.appendChild(signOut);
+  const auth = state.auth || {};
+  const authText = auth.oauthConnected ? 'Signed in via Claude.ai OAuth'
+    : auth.claudeCodeAvailable ? 'Using Claude Code CLI credentials (Keychain)'
+    : auth.apiKeySet ? 'API key configured'
+    : 'Not signed in';
+  const authRow = el('div', { style: 'display:flex;align-items:center;justify-content:space-between;gap:10px;background:#1a1b1e;border:1px solid var(--border-default);border-radius:10px;padding:12px 14px;' });
+  authRow.appendChild(el('div', { style: 'font-size:12.5px;color:#dbdee1;' }, authText));
+  const aiBtn = el('button', { class: 'btn' }, 'AI settings');
+  aiBtn.addEventListener('click', () => { state.settingsPage = 'ai'; renderSettings(); });
+  authRow.appendChild(aiBtn);
+  wrap.querySelector('#about-auth-row').appendChild(authRow);
+
+  (async () => {
+    const host = wrap.querySelector('#about-app-rows');
+    let info = null;
+    try { info = await window.farnsworth?.appInfo?.(); } catch {}
+    host.innerHTML = '';
+    if (!info?.ok) {
+      host.appendChild(el('div', { style: 'font-size:12px;color:#6d7178;' }, 'App info unavailable.'));
+      return;
+    }
+    const fmtBytes = b => b > 1048576 ? (b / 1048576).toFixed(1) + ' MB' : Math.round(b / 1024) + ' KB';
+    const row = (label, value, mono) => {
+      const r = el('div', { style: 'display:flex;align-items:baseline;justify-content:space-between;gap:14px;background:#1a1b1e;border:1px solid var(--border-default);border-radius:9px;padding:9px 12px;min-width:0;' });
+      r.appendChild(el('span', { style: 'font-size:11.5px;color:#80848e;flex-shrink:0;' }, label));
+      r.appendChild(el('span', { title: value, style: 'font-size:' + (mono ? '11px' : '12px') + ';color:#dbdee1;' + (mono ? "font-family:'JetBrains Mono',monospace;" : '') + 'overflow:hidden;white-space:nowrap;text-overflow:ellipsis;' }, value));
+      return r;
+    };
+    host.appendChild(row('Farnsworth', 'v' + info.version));
+    host.appendChild(row('Electron', info.electron + ' · Chromium ' + info.chrome + ' · Node ' + info.node));
+    host.appendChild(row('Platform', info.platform));
+    host.appendChild(row('Data folder', info.userData, true));
+    host.appendChild(row('Database', info.dbPath ? info.dbPath + ' · ' + fmtBytes(info.dbSize) : 'not found', true));
+    if (info.dbPath && window.farnsworth?.showInFinder) {
+      const revealBtn = el('button', { class: 'btn', style: 'align-self:flex-start;margin-top:4px;' }, 'Reveal database in Finder');
+      const slash = info.dbPath.lastIndexOf('/');
+      revealBtn.addEventListener('click', () => window.farnsworth.showInFinder(info.dbPath.slice(0, slash), info.dbPath.slice(slash + 1)));
+      host.appendChild(revealBtn);
+    }
+  })();
 
   return wrap;
 }
+
 
 // ============================================================================
 // PERSISTENCE
@@ -6717,11 +6833,68 @@ function renderAccountSettings() {
 function persistSettings() {
   if (window.farnsworth) window.farnsworth.setSettings(state.settings);
 }
+
+// Canvas + Appearance honest-wiring migration (Jul 13). Persisted values
+// from the decorative era were seeds, not user choices -- reset once
+// (version flag), then honor user picks. Also drops the design-mock
+// workspace/account objects (no feature behind them).
+function reconcileHonestSettings(loaded) {
+  const CANVAS_DEFAULTS = {
+    defaultZoom: 100, fitOnOpen: false,
+    defaults: { markup: false, comments: false, tweaks: true },
+    engine: { devtools: true, cookieIsolation: false, network: true },
+  };
+  if (loaded?.canvasV === 2 && loaded.canvas) {
+    state.settings.canvas = {
+      ...CANVAS_DEFAULTS, ...loaded.canvas,
+      defaults: { ...CANVAS_DEFAULTS.defaults, ...(loaded.canvas.defaults || {}) },
+      engine: { ...CANVAS_DEFAULTS.engine, ...(loaded.canvas.engine || {}) },
+    };
+  } else {
+    state.settings.canvas = {
+      ...CANVAS_DEFAULTS,
+      defaults: { ...CANVAS_DEFAULTS.defaults },
+      engine: { ...CANVAS_DEFAULTS.engine },
+    };
+  }
+  state.settings.canvasV = 2;
+
+  const APPEARANCE_DEFAULTS = { theme: 'dark', density: 'Comfortable', accent: 'blurple', font: 'Hanken Grotesk' };
+  state.settings.appearance = (loaded?.appearanceV === 2 && loaded.appearance)
+    ? { ...APPEARANCE_DEFAULTS, ...loaded.appearance }
+    : { ...APPEARANCE_DEFAULTS };
+  state.settings.appearanceV = 2;
+
+  delete state.settings.workspace;
+  delete state.settings.account;
+}
+
+// Appearance -> live CSS (Jul 13). Accent recolors --accent-blurple (+glow),
+// density toggles body.density-compact, font swaps --font-sans. Only fonts
+// that are actually loaded (Google Fonts link in index.html) or system
+// stacks are offered -- no fake choices.
+const ACCENT_NAME_HEX = { blurple: '#5865f2' };
+const FONT_STACKS = {
+  'Hanken Grotesk': "'Hanken Grotesk', system-ui, -apple-system, sans-serif",
+  'System': "system-ui, -apple-system, 'Helvetica Neue', sans-serif",
+  'JetBrains Mono': "'JetBrains Mono', ui-monospace, SFMono-Regular, monospace",
+};
+function applyAppearanceSettings() {
+  const ap = state.settings.appearance || {};
+  const hex = ACCENT_NAME_HEX[ap.accent] || (typeof ap.accent === 'string' && ap.accent.startsWith('#') ? ap.accent : '#5865f2');
+  const root = document.documentElement;
+  root.style.setProperty('--accent-blurple', hex);
+  const n = parseInt(hex.slice(1), 16);
+  root.style.setProperty('--accent-blurple-glow', 'rgba(' + ((n >> 16) & 255) + ',' + ((n >> 8) & 255) + ',' + (n & 255) + ',.4)');
+  document.body.classList.toggle('density-compact', ap.density === 'Compact');
+  root.style.setProperty('--font-sans', FONT_STACKS[ap.font] || FONT_STACKS['Hanken Grotesk']);
+}
 async function loadSettings() {
   if (!window.farnsworth) return;
   try {
     const loaded = await window.farnsworth.getSettings();
     if (loaded) Object.assign(state.settings, loaded);
+    reconcileHonestSettings(loaded);
     // Per-call-site routing reconciliation (Jul 13): the table only lists
     // call sites that exist in code (ROUTING_CALL_SITES). Persisted rows
     // keep the user's model/confirm choices for surviving ids; stale rows
@@ -6829,6 +7002,14 @@ async function handleFolderPicked(folderPath) {
   // is actually visible (Long Jul 3 ~15:11 ET — boot lag spike).
   state.tasksLoadedForWs = null;
   state.files.loadedForFolder = null;
+  // Settings -> Canvas -> Default view modes (Jul 13): seed the vm
+  // overlays for the freshly-opened workspace.
+  const vmDefs = state.settings?.canvas?.defaults;
+  if (vmDefs) {
+    state.vm.markup = !!vmDefs.markup;
+    state.vm.comments = !!vmDefs.comments;
+    state.vm.tweaks = !!vmDefs.tweaks;
+  }
   if (window.farnsworth) await window.farnsworth.addRecent(folderPath);
   // Try to load existing config; if missing, prompt for app type
   let config = null;
@@ -7495,6 +7676,13 @@ function openCommandPalette() {
       { id: 'rename-file',     label: 'Rename File/Folder', shortcut: 'F2', run: () => renameSelectedFile() },
       { id: 'delete-file',     label: 'Delete File/Folder', shortcut: '⌫',   run: () => deleteSelectedFile() },
       { id: 'ai-commit',       label: 'AI: Commit Changes', shortcut: '',   run: () => aiCommitCommand() },
+      { id: 'canvas-devtools',  label: 'Canvas: Open Preview DevTools', shortcut: '', run: () => {
+        if (state.settings.canvas?.engine?.devtools === false) {
+          pushAgentTask('Canvas DevTools')({ working: false, text: 'DevTools are disabled in Settings → Canvas → Browser engine.' });
+          return;
+        }
+        window.farnsworth?.canvasOpenDevTools?.();
+      } },
       { id: 'ai-review',       label: 'AI: Review Changes', shortcut: '',   run: () => aiReviewCommand() },
     ];
     const recentItems = recents.map(r => ({
@@ -10632,6 +10820,12 @@ function initLeftPanelResize() {
 
 async function init() {
   await loadSettings();
+  // Appearance -> CSS vars/body class; canvas network policy -> main
+  // (main defaults to allowed, so only an explicit OFF needs pushing).
+  applyAppearanceSettings();
+  if (state.settings.canvas?.engine?.network === false) {
+    window.farnsworth?.canvasSetNetworkAccess?.(false);
+  }
   await loadFarnsworthDev();
   // Load the Live panel request timeout from settings (defaults to 15s
   // if never set). Backed by the SQLite settings table key

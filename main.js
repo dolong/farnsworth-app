@@ -2,7 +2,7 @@
 // Electron desktop shell. SQLite-backed persistence (db.js), folder-based workspace,
 // Claude auth (manual API key + OAuth PKCE via claude.ai), real file operations.
 
-const { app, BrowserWindow, BrowserView, WebContentsView, ipcMain, shell, dialog, safeStorage, Menu } = require('electron');
+const { app, BrowserWindow, BrowserView, WebContentsView, ipcMain, shell, dialog, safeStorage, Menu, session } = require('electron');
 const path = require('path');
 const os = require('os');
 // `fs` is fs/promises — used by 13 `await fs.xxx(...)` call sites in
@@ -778,6 +778,28 @@ ipcMain.handle('dev:farnsworth:stop', async (_event, appType = 'devvit') => {
 // IPC: Recent folders
 // ============================================================
 ipcMain.handle('recent:get', async () => db.getRecentFolders(10));
+
+// (recent:clear already exists further down — registering it twice crashes
+// main with "Attempted to register a second handler". Learned Jul 14 ~00:08.)
+
+// Real install facts for Settings -> About (Jul 13). The DB can live one
+// level deeper than userData (CFBundleName nesting) -- probe both.
+ipcMain.handle('app:info', async () => {
+  const userData = app.getPath('userData');
+  let dbPath = null, dbSize = 0;
+  for (const cand of [path.join(userData, 'farnsworth', 'farnsworth.db'), path.join(userData, 'farnsworth.db')]) {
+    try { const st = fsSync.statSync(cand); if (st.size > 0) { dbPath = cand; dbSize = st.size; break; } } catch {}
+  }
+  return {
+    ok: true,
+    version: app.getVersion(),
+    electron: process.versions.electron,
+    chrome: process.versions.chrome,
+    node: process.versions.node,
+    platform: process.platform + ' ' + process.arch,
+    userData, dbPath, dbSize,
+  };
+});
 ipcMain.handle('recent:add', async (_event, folderPath) => {
   db.addRecentFolder(folderPath, path.basename(folderPath));
   // Rebuild the menu so the Open Recent submenu picks up the new entry.
@@ -908,7 +930,52 @@ const canvasWebContentsViews = new Map();
 // We re-apply the desired factor on load-commit events instead.
 const canvasViewZoomFactors = new Map();
 
-ipcMain.handle('canvas:createView', async (_event, { viewId, url, bounds }) => {
+// --- Canvas engine settings (Settings -> Canvas -> Browser engine, Jul 13) ---
+// Network access: true = unrestricted (default). false = block outbound
+// requests whose host isn't local, so the Live preview's dev servers keep
+// working while external calls are denied. The filter is per-session
+// (= per partition); we track every partition a canvas view has used and
+// re-apply on live toggles via canvas:setNetworkAccess.
+let canvasNetworkAllowed = true;
+const canvasPartitions = new Set(['persist:farnsworth']);
+const CANVAS_LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1', '0.0.0.0']);
+function applyCanvasNetworkFilter(ses) {
+  try {
+    if (canvasNetworkAllowed) { ses.webRequest.onBeforeRequest(null); return; }
+    ses.webRequest.onBeforeRequest((details, callback) => {
+      try {
+        const u = new URL(details.url);
+        // Only police network protocols; devtools:/data:/blob:/file: pass.
+        if (u.protocol !== 'http:' && u.protocol !== 'https:' && u.protocol !== 'ws:' && u.protocol !== 'wss:') return callback({});
+        if (CANVAS_LOCAL_HOSTS.has(u.hostname)) return callback({});
+      } catch {}
+      callback({ cancel: true });
+    });
+  } catch (e) { console.error('[canvas:networkFilter]', e); }
+}
+
+ipcMain.handle('canvas:setNetworkAccess', (_event, { allowed }) => {
+  canvasNetworkAllowed = allowed !== false;
+  for (const part of canvasPartitions) {
+    try { applyCanvasNetworkFilter(session.fromPartition(part)); } catch {}
+  }
+  return { ok: true, allowed: canvasNetworkAllowed };
+});
+
+// Open Chromium devtools for a preview view (palette: Canvas: Open Preview
+// DevTools). Renderer gates on settings.canvas.engine.devtools; views
+// created while the toggle was OFF also have webPreferences.devTools=false,
+// so openDevTools is a no-op on them by construction.
+ipcMain.handle('canvas:openDevTools', (_event, args) => {
+  const wanted = args && args.viewId;
+  const view = wanted ? canvasWebContentsViews.get(wanted) : canvasWebContentsViews.values().next().value;
+  if (!view) return { ok: false, error: 'No preview open' };
+  try { view.webContents.openDevTools({ mode: 'detach' }); return { ok: true }; }
+  catch (e) { return { ok: false, error: String(e.message || e) }; }
+});
+
+
+ipcMain.handle('canvas:createView', async (_event, { viewId, url, bounds, opts }) => {
   try {
     // Re-create if a view with this ID already exists (defensive).
     if (canvasWebContentsViews.has(viewId)) {
@@ -917,12 +984,22 @@ ipcMain.handle('canvas:createView', async (_event, { viewId, url, bounds }) => {
       try { existing.webContents.loadURL(url); } catch {}
       return { ok: true, updated: true };
     }
+    // Engine settings (Settings -> Canvas, Jul 13): the renderer computes
+    // opts from state.settings.canvas.engine at creation time. partitionKey
+    // -> per-project cookie/localStorage isolation; devTools=false hard-
+    // disables Chromium devtools for this view.
+    const partition = (opts && opts.partitionKey)
+      ? 'persist:fw-' + String(opts.partitionKey).replace(/[^a-zA-Z0-9-]/g, '').slice(0, 48)
+      : 'persist:farnsworth';
+    canvasPartitions.add(partition);
+    applyCanvasNetworkFilter(session.fromPartition(partition));
     const view = new WebContentsView({
       webPreferences: {
-        partition: 'persist:farnsworth',
+        partition,
         nodeIntegration: false,
         contextIsolation: true,
         sandbox: false,
+        devTools: !opts || opts.devTools !== false,
       }
     });
     mainWindow.contentView.addChildView(view);

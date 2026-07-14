@@ -27,14 +27,18 @@ contextBridge.exposeInMainWorld('farnsworth', {
 
   // Recent folders
   getRecent: () => ipcRenderer.invoke('recent:get'),
+  clearRecent: () => ipcRenderer.invoke('recent:clear'),
+  appInfo: () => ipcRenderer.invoke('app:info'),
 
   // Canvas live preview — BrowserView-backed (Jul 9 ~18:20 ET).
   // Replaces the <webview>-tag approach which couldn't propagate CSS-driven
   // height changes to the inner viewport (the squished-150px bug).
   // viewId is a renderer-generated string used to track the BrowserView
   // between updates. bounds = {x, y, width, height} in window-content pixels.
-  canvasCreateView: (viewId, url, bounds) =>
-    ipcRenderer.invoke('canvas:createView', { viewId, url, bounds }),
+  canvasCreateView: (viewId, url, bounds, opts) =>
+    ipcRenderer.invoke('canvas:createView', { viewId, url, bounds, opts }),
+  canvasOpenDevTools: (viewId) => ipcRenderer.invoke('canvas:openDevTools', { viewId }),
+  canvasSetNetworkAccess: (allowed) => ipcRenderer.invoke('canvas:setNetworkAccess', { allowed }),
   canvasUpdateViewBounds: (viewId, bounds) =>
     ipcRenderer.invoke('canvas:updateViewBounds', { viewId, bounds }),
   canvasRemoveAllViews: () => ipcRenderer.invoke('canvas:removeAllViews'),
