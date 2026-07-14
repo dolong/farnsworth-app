@@ -5851,11 +5851,8 @@ function renderAISettings() {
     <div style="margin-bottom:24px;"><div class="settings-page__title">AI</div><div class="settings-page__sub">Authentication, the chat model, and per-call-site cost routing.</div></div>
 
     <div class="settings-section" id="ai-auth-section">
-      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
-        <div class="settings-section__title">Claude authentication</div>
-        <span class="settings-pill settings-pill--v23">PHASE 1</span>
-      </div>
-      <div class="settings-section__desc" style="margin-bottom:13px;">How Farnsworth calls Claude. The key is stored encrypted in the macOS Keychain.</div>
+      <div class="settings-section__title" style="margin-bottom:6px;">Claude authentication</div>
+      <div class="settings-section__desc" style="margin-bottom:13px;">How Farnsworth calls Claude. Credentials stay encrypted in the macOS Keychain.</div>
     </div>
 
     <div class="settings-section">
@@ -5909,14 +5906,10 @@ function renderAISettings() {
     oauthRow.innerHTML = `
       <div class="apikey-row__label">
         <div class="apikey-row__label-main">
-          Sign in with Claude.ai
+          Claude subscription
           <span class="settings-pill settings-pill--v23">RECOMMENDED</span>
         </div>
-        <div class="apikey-row__label-sub">${oauthConnected
-          ? 'Use your Claude Pro/Max subscription. Tokens auto-refresh.'
-          : (claudeCodeAuthed
-            ? 'Reading your Claude Code CLI Keychain token. Farnsworth can use this for inference even though the claude.ai OAuth flow is broken.'
-            : 'Use your Claude Pro/Max subscription. Tokens auto-refresh.')}</div>
+        <div class="apikey-row__label-sub">Use your Claude Pro/Max subscription. Tokens auto-refresh.</div>
       </div>
       <div class="apikey-row__field" id="oauth-field">
         ${state.auth.oauthInProgress
@@ -5942,24 +5935,29 @@ function renderAISettings() {
         <button class="btn btn--primary btn--sm" id="ai-apikey-save">Save</button>
         ${state.auth.apiKeySet ? '<button class="btn btn--ghost btn--sm" id="ai-apikey-clear">Remove</button>' : ''}
       </div>
-      ${state.auth.apiKeySet ? '<div class="apikey-row__status is-set"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>API key saved · encrypted in macOS Keychain</div>' : '<div class="apikey-row__status is-missing"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16h.01"/></svg>No API key · optional — only needed if not using subscription</div>'}
+      ${state.auth.apiKeySet ? '<div class="apikey-row__status is-set"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>API key saved</div>' : '<div class="apikey-row__status is-missing"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16h.01"/></svg>No API key · optional — only needed if not using subscription</div>'}
     `;
     authSection.appendChild(apiKeyRow);
 
-    // Section 3: Claude Code CLI detection (informational)
-    const ccRow = el('div', { class: 'apikey-row' });
-    ccRow.innerHTML = `
-      <div class="apikey-row__label">
-        <div class="apikey-row__label-main">Claude Code CLI auth</div>
-        <div class="apikey-row__label-sub">Detects existing login via macOS Keychain (Linux/Windows: ~/.claude/.credentials.json). Source of the auth token shown above when signed in via the CLI.</div>
-      </div>
-      <div class="apikey-row__field">
-        ${state.auth.claudeCodeAvailable
-          ? '<div class="apikey-row__status is-set"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>Claude Code CLI logged in</div>'
-          : '<div class="apikey-row__status is-missing"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16h.01"/></svg>No Claude Code CLI auth at ~/.claude/.credentials.json</div>'}
-      </div>
-    `;
-    authSection.appendChild(ccRow);
+    // Section 3: Claude Code CLI detection — only rendered when it adds
+    // information. When signed in VIA the CLI (claudeCodeAuthed), row 1's
+    // status already says "Signed in via Claude Code CLI"; repeating it
+    // here was pure duplication (Jul 14 copy-bloat trim).
+    if (!claudeCodeAuthed) {
+      const ccRow = el('div', { class: 'apikey-row' });
+      ccRow.innerHTML = `
+        <div class="apikey-row__label">
+          <div class="apikey-row__label-main">Claude Code CLI auth</div>
+          <div class="apikey-row__label-sub">Detects an existing CLI login in the OS credential store.</div>
+        </div>
+        <div class="apikey-row__field">
+          ${state.auth.claudeCodeAvailable
+            ? '<div class="apikey-row__status is-set"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>Claude Code CLI logged in</div>'
+            : '<div class="apikey-row__status is-missing"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16h.01"/></svg>No Claude Code CLI login found</div>'}
+        </div>
+      `;
+      authSection.appendChild(ccRow);
+    }
   }
 
   const table = wrap.querySelector('.routing-table');
@@ -8202,21 +8200,18 @@ function oauthConnectedHTML(expiresInSec) {
 // the same "is-set" status indicator with the subscription type from the
 // Keychain entry instead of the claude.ai OAuth expiry timer.
 function claudeCodeConnectedHTML(subscriptionType, expiresAt) {
+  // No expiry countdown here (Jul 14, Long: "why is there a lot of text").
+  // getValidAccessToken() silently refreshes the token within 60s of expiry
+  // on every inference call, so "expires in 1 min" was permanent-looking
+  // alarm noise about a value designed to go stale. expiresAt param kept
+  // for signature stability; state.auth still carries it for debugging.
   const sub = subscriptionType ? ` · ${subscriptionType}` : '';
-  const expiresLabel = expiresAt
-    ? (() => {
-        const ms = new Date(expiresAt) - new Date();
-        if (ms < 3600 * 1000) return ` · expires in ${Math.max(1, Math.floor(ms / 60000))} min`;
-        return ` · expires in ${Math.floor(ms / 3600000)} hours`;
-      })()
-    : '';
   return `
     <div style="flex:1;">
       <div class="apikey-row__status is-set">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>
-        Signed in via Claude Code CLI${sub}${expiresLabel}
+        Signed in via Claude Code CLI${sub}
       </div>
-      <div class="oauth-help" style="margin-top:8px;">OAuth token read from Keychain. The claude.ai OAuth flow itself is broken — the Keychain path is the working one.</div>
     </div>
     <button class="btn btn--ghost btn--sm" id="oauth-disconnect-btn">Disconnect</button>
   `;
@@ -8229,7 +8224,7 @@ function oauthDisconnectedHTML() {
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
         Sign in with Claude Code CLI
       </button>
-      <div class="oauth-help">Reads the OAuth token that Claude Code CLI stores in the OS credential store (Mac Keychain / Windows Credential Manager / Linux libsecret). Recommended — works around the broken claude.ai authorize flow.</div>
+      <div class="oauth-help">Uses the login Claude Code CLI already stored in your Keychain.</div>
       <div class="oauth-help" style="margin-top:10px;">Don't have Claude Code CLI? Install with <code>npm i -g @anthropic-ai/claude-code</code> and run <code>claude login</code> first, then click above.</div>
       <details style="margin-top:14px;">
         <summary style="cursor:pointer; font-size:12px; color:var(--text-dim); user-select:none;">Sign in with claude.ai directly (likely broken)</summary>
@@ -8238,7 +8233,7 @@ function oauthDisconnectedHTML() {
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4M10 17l5-5-5-5M15 12H3"/></svg>
             Try the claude.ai OAuth flow
           </button>
-          <div class="oauth-help">Opens claude.ai in your browser. Currently broken at Anthropic's side — the authorize page internally POSTs to a mutationFn endpoint that returns "Invalid request format" for every payload shape. Kept here in case Anthropic ships a fix.</div>
+          <div class="oauth-help">Opens claude.ai in your browser. The authorize flow is currently broken on Anthropic's side — kept here in case they ship a fix.</div>
         </div>
       </details>
     </div>
