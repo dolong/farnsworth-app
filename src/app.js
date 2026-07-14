@@ -24,6 +24,22 @@ function getLiveGameId() {
 // ============================================================================
 // STATE
 // ============================================================================
+// Per-call-site model routing (Jul 13 ~23:05 ET) — the cost-control surface.
+// Every row maps to a REAL call site in this file; decorative rows were
+// removed in the honest-wiring pass. Model choices persist per-row via
+// state.settings.perCallSiteRouting; routedModelApiId(id) resolves the
+// API model for a call site (falls back to defaultModel).
+//   titles → maybeGenerateConvTitle()  (fires after the first exchange)
+//   commit → aiCommitCommand()         (⌘K → AI: Commit Changes)
+//   review → aiReviewCommand()         (⌘K → AI: Review Changes)
+// Memory pipeline stage models are NOT here — they have their own pickers
+// on the Settings → Memory page (one source of truth per knob).
+const ROUTING_CALL_SITES = [
+  { id: 'titles', name: 'Conversation titles', model: 'Haiku 4.5', savings: 'saves ~50× vs Opus', desc: 'Auto-named after the first exchange' },
+  { id: 'commit', name: 'AI Commit message', model: 'Haiku 4.5', savings: 'saves ~50× vs Opus', desc: '⌘K → AI: Commit Changes', confirm: true },
+  { id: 'review', name: 'AI Code review', model: 'Sonnet 5', desc: '⌘K → AI: Review Changes' },
+];
+
 const state = {
   rightTab: 'files',          // files | tasks | live
   leftPanel: 'claudecode',    // chat | terminal | claudecode
@@ -84,16 +100,13 @@ const state = {
     // Injected into farnsworth-test.py as FARNSWORTH_TEST_MODEL by the
     // test:run spawns; a per-step "model" field still overrides. Jul 12.
     testingModel: 'Sonnet 5',
-    perCallSiteRouting: [
-      { id: 'commit', name: 'Commit messages', model: 'Haiku 4.5', savings: 'saves ~50× vs Opus', confirm: false },
-      { id: 'review', name: 'Code review', model: 'Sonnet 4.5', confirm: false },
-      { id: 'refactor', name: 'Refactor', model: 'Opus 4.8 High', confirm: true },
-      { id: 'preferences', name: 'Preference extraction', model: 'Haiku 4.5', savings: 'saves ~50× vs Opus', confirm: false },
-      { id: 'titles', name: 'Title generation', model: 'Haiku 4.5', confirm: false },
-    ],
-    behavior: { verbosity: 'Balanced', toolAggressiveness: 'Balanced', confirmation: 'Ask on risk' },
-    verification: { selfVerify: true, externalCheck: false },
-    streaming: true,
+    // Honest rows only — see ROUTING_CALL_SITES above for the id → call
+    // site mapping. behavior/verification/streaming were removed Jul 13
+    // (persisted with zero consumers since day 1 — dead-controls audit).
+    // routingV 2 = the honest-wiring migration; older persisted rows were
+    // decorative seeds, not user choices, so they don't carry over.
+    routingV: 2,
+    perCallSiteRouting: ROUTING_CALL_SITES.map(r => ({ ...r })),
     memory: {
       extraction: { enabled: true, model: 'Haiku 4.5', tier: 'speed', extract: ['Corrections', 'Preferences', 'Decisions'], noiseFilter: true },
       consolidation: { enabled: true, model: 'Sonnet 5', tier: 'balanced', schedule: 'Daily', autoOnBuffer: true, bufferThreshold: 50 },
@@ -123,6 +136,7 @@ const state = {
   chatActiveId: null,
   chatHistoryOpen: false,
   chatHistory: [], // [{ id, title, updated_at, preview }]
+  chatGeneratedTitles: {}, // convId → LLM-generated title (routing call site: 'titles')
   // NOTE: modelToApiId / CHAT_MODEL_OPTIONS / openModelPicker are declared
   // as standalone top-level functions BELOW (after the state object closes
   // at line ~262). They live outside the state object so they don't pollute
@@ -201,6 +215,16 @@ function modelToApiId(displayName) {
   return map[displayName] || displayName; // pass through if already an API id
 }
 
+// Per-call-site routing lookups (Jul 13 ~23:05 ET). See ROUTING_CALL_SITES
+// at the top of the file for the id → call site mapping.
+function routingRow(id) {
+  return (state.settings?.perCallSiteRouting || []).find(r => r && r.id === id) || null;
+}
+function routedModelApiId(id) {
+  const row = routingRow(id);
+  return modelToApiId(row?.model || state.settings?.defaultModel);
+}
+
 // The list of models Farnsworth's chat can pick. Used by the model picker
 // popover below. API ids come from modelToApiId() so the picker can stay in
 // display-name space.
@@ -218,7 +242,7 @@ const CHAT_MODEL_OPTIONS = [
 // Generic over the settings key it edits: 'defaultModel' (main chat thread)
 // or 'testingModel' (test-runner llm-steps). Picking an option updates
 // state.settings[settingsKey] and persists via persistSettings().
-function openModelPicker(anchorBtn, settingsKey = 'defaultModel') {
+function openModelPicker(anchorBtn, settingsKey = 'defaultModel', onPick = null, currentDisplay = null) {
   // Close any existing picker first.
   const existing = document.querySelector('.model-picker');
   if (existing) existing.remove();
@@ -237,7 +261,7 @@ function openModelPicker(anchorBtn, settingsKey = 'defaultModel') {
   pop.style.left = r.left + 'px';
 
   for (const opt of CHAT_MODEL_OPTIONS) {
-    const isCurrent = state.settings?.[settingsKey] === opt.display;
+    const isCurrent = (currentDisplay ?? state.settings?.[settingsKey]) === opt.display;
     const row = el('button', {
       class: 'model-picker__row' + (isCurrent ? ' is-current' : ''),
       style: `
@@ -257,9 +281,13 @@ function openModelPicker(anchorBtn, settingsKey = 'defaultModel') {
       <div style="font-size:11.5px;color:#949ba4;margin-top:2px;">${opt.desc}</div>
     `;
     row.addEventListener('click', () => {
+      pop.remove();
+      // Callback mode (per-call-site routing rows): the caller owns the
+      // write + persist + re-render. Key mode (defaultModel/testingModel):
+      // write the flat settings key directly.
+      if (typeof onPick === 'function') { onPick(opt.display); return; }
       state.settings[settingsKey] = opt.display;
       persistSettings();
-      pop.remove();
       renderSettings(); // re-render so the dropdown button shows the new value
     });
     pop.appendChild(row);
@@ -465,7 +493,15 @@ function scheduleChatHistorySave() {
 
 async function saveActiveConversation() {
   if (!state.chatActiveId) return;
-  const title = buildConversationTitle(state.chatMessages);
+  // Title preference (Jul 13, per-call-site 'titles'): LLM-generated title
+  // (this session) > preserved non-heuristic title from the DB row (survives
+  // restarts — if the stored title differs from the heuristic, it was
+  // generated) > heuristic first-user-message slice.
+  const heuristic = buildConversationTitle(state.chatMessages);
+  const generated = state.chatGeneratedTitles?.[state.chatActiveId];
+  const existing = (state.chatHistory || []).find(c => c.id === state.chatActiveId)?.title;
+  const title = generated
+    || ((existing && existing !== 'New chat' && existing !== heuristic) ? existing : heuristic);
   try {
     await window.farnsworth.chatConvSave({
       id: state.chatActiveId,
@@ -476,6 +512,56 @@ async function saveActiveConversation() {
     refreshChatHistoryList();
   } catch (e) {
     console.warn('[chat] save failed:', e.message);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Per-call-site 'titles' (Jul 13 ~23:05 ET): LLM-generated conversation
+// titles. Fires once per conversation after the first successful exchange,
+// on the routed model (Haiku by default — ~50× cheaper than Opus for a
+// 10-token title). Falls back silently to the heuristic title on any error.
+// ---------------------------------------------------------------------------
+const _titleGenAttempted = new Set();
+
+function sanitizeGeneratedTitle(raw) {
+  if (!raw) return '';
+  let t = String(raw).split('\n')[0].trim();
+  t = t.replace(/^["'`]+|["'`]+$/g, '').replace(/\.+$/, '').replace(/\s+/g, ' ').trim();
+  return t.slice(0, 60);
+}
+
+async function maybeGenerateConvTitle() {
+  try {
+    const convId = state.chatActiveId;
+    if (!convId || _titleGenAttempted.has(convId)) return;
+    if (!window.farnsworth?.sendMessage) return;
+    if (state.chatGeneratedTitles[convId]) return;
+    const firstUser = state.chatMessages.find(m => m.role === 'user' && m.text);
+    const firstAgent = state.chatMessages.find(m =>
+      m.role === 'agent' && m.text && !m.error && !m.working && !String(m.id).startsWith('welcome'));
+    if (!firstUser || !firstAgent) return;
+    // Only generate when the stored title is still the heuristic/default —
+    // never clobber a title the user (or a previous generation) set.
+    const heuristic = buildConversationTitle(state.chatMessages);
+    const existing = (state.chatHistory || []).find(c => c.id === convId)?.title;
+    if (existing && existing !== 'New chat' && existing !== heuristic) return;
+    _titleGenAttempted.add(convId);
+    const res = await window.farnsworth.sendMessage({
+      model: routedModelApiId('titles'),
+      maxTokens: 50,
+      system: 'You name conversations. Given the first exchange, reply with ONLY a concise 3-6 word title. No quotes, no trailing punctuation, no commentary.',
+      messages: [{
+        role: 'user',
+        content: `User: ${String(firstUser.text).slice(0, 500)}\n\nAssistant: ${String(firstAgent.text).slice(0, 500)}`,
+      }],
+    });
+    const title = sanitizeGeneratedTitle(res?.ok ? res.text : '');
+    if (!title) return; // heuristic stands
+    state.chatGeneratedTitles[convId] = title;
+    await saveActiveConversation();
+    updateWindowTitle();
+  } catch (e) {
+    console.warn('[titles] generation failed (heuristic stands):', e.message);
   }
 }
 
@@ -745,6 +831,12 @@ function renderMessage(m) {
           chip.addEventListener('click', () => {
             try { openSettings('ai'); } catch (e) { console.warn('[chat] openSettings(ai) failed:', e); }
           });
+        } else if (c.action === 'git-commit-run') {
+          // AI Commit confirm flow (per-call-site 'commit' row, confirm ON):
+          // the chip carries the model-written message as payload.
+          chip.addEventListener('click', () => runPendingGitCommit(m));
+        } else if (c.action === 'git-commit-cancel') {
+          chip.addEventListener('click', () => cancelPendingGitCommit(m));
         }
         chips.appendChild(chip);
 
@@ -5732,7 +5824,7 @@ function renderAISettings() {
   const s = state.settings;
   const wrap = el('div');
   wrap.innerHTML = `
-    <div style="margin-bottom:24px;"><div class="settings-page__title">AI</div><div class="settings-page__sub">How the chat agent thinks, routes work across models, and verifies itself.</div></div>
+    <div style="margin-bottom:24px;"><div class="settings-page__title">AI</div><div class="settings-page__sub">Authentication, the chat model, and per-call-site cost routing.</div></div>
 
     <div class="settings-section" id="ai-auth-section">
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
@@ -5771,15 +5863,11 @@ function renderAISettings() {
             <div class="settings-section__title">Per-call-site model routing</div>
             <span class="settings-pill settings-pill--cost">COST CONTROL</span>
           </div>
-          <div class="settings-section__desc">Route cheap classification tasks to small models. ~50× cost difference, negligible quality loss.</div>
+          <div class="settings-section__desc">Route small tasks to small models. ~50× cost difference vs Opus, negligible quality loss. Every row below is a real call site — memory pipeline stages have their own model pickers on the Memory page.</div>
         </div>
-        <button style="font-size:11.5px;font-weight:600;color:#3ab7f0;background:none;border:none;cursor:pointer;white-space:nowrap;">Reset defaults</button>
+        <button id="routing-reset-btn" style="font-size:11.5px;font-weight:600;color:#3ab7f0;background:none;border:none;cursor:pointer;white-space:nowrap;">Reset defaults</button>
       </div>
       <div class="routing-table"></div>
-    </div>
-
-    <div class="settings-section">
-      <div class="settings-section__title" style="margin-bottom:13px;">Behavior</div>
     </div>
   `;
 
@@ -5855,28 +5943,22 @@ function renderAISettings() {
   thead.innerHTML = '<span>CALL-SITE</span><span>MODEL</span><span>CONFIRM</span>';
   table.appendChild(thead);
   s.perCallSiteRouting.forEach(row => table.appendChild(makeRoutingRow(row)));
-  const addRow = el('button', { class: 'add-row' });
-  addRow.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>Add call-site';
-  table.appendChild(addRow);
+  // "Add call-site" removed (Jul 13): rows must map to real code paths —
+  // a user-added row would be decorative by definition.
 
-  // Behavior rows
-  const behaviorSection = wrap.querySelectorAll('.settings-section')[2];
-  behaviorSection.appendChild(makeBehaviorRow('Verbosity', s.behavior.verbosity, ['Terse', 'Balanced', 'Explanatory']));
-  behaviorSection.appendChild(makeBehaviorRow('Tool-call aggressiveness', s.behavior.toolAggressiveness, ['Conservative', 'Balanced', 'Aggressive']));
-  behaviorSection.appendChild(makeBehaviorRow('Confirmation prompts', s.behavior.confirmation, ['Auto', 'Ask on risk', 'Always']));
+  // Reset defaults — restore ROUTING_CALL_SITES models/confirm flags.
+  // Attached inside the render (rebuilt each renderSettings call), so the
+  // wire()-once gotcha doesn't apply here.
+  wrap.querySelector('#routing-reset-btn')?.addEventListener('click', () => {
+    state.settings.perCallSiteRouting = ROUTING_CALL_SITES.map(r => ({ ...r }));
+    persistSettings();
+    renderSettings();
+  });
 
-  // Verification
-  const verifySection = el('div', { class: 'settings-section' });
-  verifySection.innerHTML = '<div class="settings-section__title" style="margin-bottom:6px;">Verification</div>';
-  verifySection.appendChild(makeToggleRow('Self-verify after each edit batch', 'Runs an automated check and posts the result inline.', s.verification.selfVerify, v => { s.verification.selfVerify = v; persistSettings(); }));
-  verifySection.appendChild(makeToggleRow('Verify against external check', 'Cross-checks the result with a second pass.', s.verification.externalCheck, v => { s.verification.externalCheck = v; persistSettings(); }));
-  wrap.appendChild(verifySection);
-
-  // Streaming
-  const streamSection = el('div', { class: 'settings-section' });
-  streamSection.innerHTML = '<div class="settings-section__title" style="margin-bottom:6px;">Streaming</div>';
-  streamSection.appendChild(makeToggleRow('Live token streaming', 'Stream responses as they generate rather than batching.', s.streaming, v => { s.streaming = v; persistSettings(); }));
-  wrap.appendChild(streamSection);
+  // Behavior / Verification / Streaming sections removed Jul 13 — they
+  // persisted values with zero consumers since day 1 (dead-controls audit).
+  // The chat always streams; safety prompts live in nono + Claude Code's
+  // own trust dialog; verbosity is the model's job.
 
   return wrap;
 }
@@ -5888,42 +5970,52 @@ function makeRoutingRow(row) {
     <div class="routing-row__name">
       <div class="routing-row__name-main">${row.name}</div>
       ${row.savings ? '<div class="routing-row__name-save">' + row.savings + '</div>' : ''}
+      ${row.desc ? '<div class="routing-row__name-desc">' + row.desc + '</div>' : ''}
     </div>
     <div class="routing-row__model">
-      <button class="model-dropdown" style="width:148px;font-size:11.5px;padding:5px 9px;">
+      <button class="model-dropdown" data-routing-model="${row.id}" style="width:148px;font-size:11.5px;padding:5px 9px;">
         <span class="model-dropdown__dot" style="background:${modelColor}"></span>
         ${row.model}
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#80848e" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="margin-left:auto;"><path d="M6 9l6 6 6-6"/></svg>
       </button>
     </div>
-    <div class="routing-row__confirm">
-      <div class="toggle ${row.confirm ? 'is-on' : ''}" onClick="state.settings.perCallSiteRouting.find(r=>r.id==='${row.id}').confirm = !state.settings.perCallSiteRouting.find(r=>r.id==='${row.id}').confirm; renderSettings(); persistSettings();">
-        <div class="toggle__thumb"></div>
-      </div>
-    </div>
+    <div class="routing-row__confirm"></div>
   `;
-  return el2;
-}
-
-function makeBehaviorRow(label, current, options) {
-  const row = el('div', { class: 'behavior-row' });
-  row.appendChild(el('div', { class: 'behavior-row__label' }, label));
-  const seg = el('div', { class: 'segmented' });
-  options.forEach(opt => {
-    const btn = el('button', { class: 'segmented__btn' + (opt === current ? ' is-active' : '') }, opt);
-    btn.addEventListener('click', () => {
-      // Find which setting this corresponds to
-      if (label === 'Verbosity') state.settings.behavior.verbosity = opt;
-      else if (label === 'Tool-call aggressiveness') state.settings.behavior.toolAggressiveness = opt;
-      else if (label === 'Confirmation prompts') state.settings.behavior.confirmation = opt;
+  // Model dropdown — reuses the generic picker in callback mode; the row
+  // owns the write + persist + re-render.
+  const modelBtn = el2.querySelector('[data-routing-model]');
+  modelBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    openModelPicker(modelBtn, null, (display) => {
+      const live = routingRow(row.id);
+      if (live) live.model = display;
+      persistSettings();
+      renderSettings();
+    }, row.model);
+  });
+  // Confirm toggle only renders for call sites where it means something
+  // (commit: show the message + Commit/Cancel chips in chat before running
+  // `git commit`). Read-only call sites show a muted "auto".
+  const confirmCell = el2.querySelector('.routing-row__confirm');
+  if ('confirm' in row) {
+    const toggle = el('div', { class: 'toggle' + (row.confirm ? ' is-on' : '') });
+    toggle.appendChild(el('div', { class: 'toggle__thumb' }));
+    toggle.addEventListener('click', () => {
+      const live = routingRow(row.id);
+      if (live) live.confirm = !live.confirm;
       persistSettings();
       renderSettings();
     });
-    seg.appendChild(btn);
-  });
-  row.appendChild(seg);
-  return row;
+    confirmCell.appendChild(toggle);
+  } else {
+    confirmCell.appendChild(el('span', { class: 'routing-row__auto' }, 'auto'));
+  }
+  return el2;
 }
+
+// makeBehaviorRow removed Jul 13 — its only consumers were the decorative
+// Behavior verbosity/aggressiveness/confirmation rows (dead-controls audit).
+// makeToggleRow STAYS: Canvas + Workspace settings pages use it (8 sites).
 
 function makeToggleRow(title, desc, isOn, onChange) {
   const row = el('div', { class: 'toggle-row' });
@@ -6630,6 +6722,26 @@ async function loadSettings() {
   try {
     const loaded = await window.farnsworth.getSettings();
     if (loaded) Object.assign(state.settings, loaded);
+    // Per-call-site routing reconciliation (Jul 13): the table only lists
+    // call sites that exist in code (ROUTING_CALL_SITES). Persisted rows
+    // keep the user's model/confirm choices for surviving ids; stale rows
+    // from the decorative era (refactor, preferences) are dropped; new
+    // call sites appear with their defaults.
+    {
+      // routingV < 2 → pre-honest-wiring rows were decorative seeds, not
+      // user choices; start fresh from defaults. routingV 2 → user's
+      // model/confirm picks carry over for surviving call sites.
+      const migrated = loaded?.routingV === 2;
+      const saved = (migrated && Array.isArray(loaded?.perCallSiteRouting)) ? loaded.perCallSiteRouting : [];
+      state.settings.perCallSiteRouting = ROUTING_CALL_SITES.map(def => {
+        const s0 = saved.find(r => r && r.id === def.id) || {};
+        const row = { ...def };
+        if (typeof s0.model === 'string' && s0.model) row.model = s0.model;
+        if ('confirm' in def && typeof s0.confirm === 'boolean') row.confirm = s0.confirm;
+        return row;
+      });
+      state.settings.routingV = 2;
+    }
     // Memory pipeline settings: Object.assign is shallow, so a persisted
     // 'memory' object would shadow new per-stage defaults. Deep-merge each
     // stage, drop the legacy v2migration stage, and (one-time, v3 pipeline
@@ -7175,6 +7287,163 @@ async function closeFolder() {
   showWelcome();
 }
 
+// ---------------------------------------------------------------------------
+// Per-call-site AI commands (Jul 13 ~23:05 ET): AI Commit + AI Review.
+// Palette-invoked, run in the chat panel, use the routed models from
+// Settings → AI → per-call-site routing ('commit' / 'review' rows).
+// git plumbing is main-process (git:diff / git:commit IPCs, execFile arg
+// arrays — a model-written commit message can't shell-inject).
+// ---------------------------------------------------------------------------
+const AI_COMMIT_SYSTEM = 'You write git commit messages. Given a diff, output ONLY the commit message: an imperative subject line under 72 characters, optionally followed by a blank line and up to 4 short bullet points. No code fences, no quotes, no commentary.';
+const AI_REVIEW_SYSTEM = 'You are a senior code reviewer. Given a git diff, produce a concise markdown review: one-line verdict first, then "## Issues" (only real problems: bugs, security, correctness — say "None found" if clean), then "## Suggestions" (optional improvements, max 4 bullets). No preamble, no restating the diff.';
+
+function sanitizeCommitMessage(raw) {
+  if (!raw) return '';
+  let t = String(raw).trim();
+  // Strip a wrapping code fence if the model added one despite instructions.
+  t = t.replace(/^```[a-z]*\n([\s\S]*?)\n```$/m, '$1').trim();
+  t = t.replace(/\n{3,}/g, '\n\n');
+  return t.slice(0, 2000);
+}
+
+// Push an agent task message into the chat and return an in-place updater.
+// Shared by aiCommitCommand / aiReviewCommand — same shape as the chat
+// agent's updateAgentMsg but scoped to a standalone message.
+function pushAgentTask(label) {
+  const msgId = 'm' + Date.now() + '-' + Math.floor(Math.random() * 1e4);
+  state.chatMessages.push({ id: msgId, role: 'agent', working: true, workingLabel: label });
+  renderChat();
+  return (patch) => {
+    const i = state.chatMessages.findIndex(x => x.id === msgId);
+    if (i >= 0) {
+      state.chatMessages[i] = { ...state.chatMessages[i], ...patch };
+      renderChat();
+    }
+    return state.chatMessages[i];
+  };
+}
+
+async function aiCommitCommand() {
+  switchLeftTab('chat');
+  if (!state.folder) {
+    pushAgentTask('')({ working: false, text: 'AI Commit needs an open folder (⇧⌘O) with a git repository.', error: true });
+    return;
+  }
+  const upd = pushAgentTask('Reading git diff');
+  const d = await window.farnsworth.gitDiff({ cwd: state.folder });
+  if (!d?.ok) { upd({ working: false, text: 'AI Commit: ' + (d?.message || d?.error || 'git diff failed'), error: true }); return; }
+  if (d.clean) { upd({ working: false, text: 'Working tree clean — nothing to commit.', verified: true }); return; }
+  const row = routingRow('commit');
+  upd({ working: true, workingLabel: `Writing commit message (${row?.model || 'Haiku 4.5'})` });
+  const res = await window.farnsworth.sendMessage({
+    model: routedModelApiId('commit'),
+    maxTokens: 300,
+    system: AI_COMMIT_SYSTEM,
+    messages: [{ role: 'user', content: `Branch ${d.branch}, ${d.source} changes${d.truncated ? ' (diff truncated)' : ''}:\n\n${d.diff}` }],
+  });
+  if (!res?.ok || !res.text?.trim()) {
+    upd({ working: false, text: 'AI Commit: model call failed — ' + (res?.message || res?.error || 'empty response'), error: true });
+    return;
+  }
+  const message = sanitizeCommitMessage(res.text);
+  const addAll = d.source === 'working'; // nothing staged → stage all on commit
+  const usageChip = res.usage ? { label: `${res.usage.input_tokens}→${res.usage.output_tokens} tok`, kind: 'read' } : null;
+  if (row?.confirm) {
+    // Confirm-before-commit (the routing row's toggle): show the message
+    // with Commit/Cancel chips. The chip handlers live in renderMessage.
+    upd({
+      working: false,
+      preambleText: `Proposed commit on ${d.branch}${addAll ? ' (will stage all changes)' : ' (staged changes only)'}:`,
+      responseText: '```\n' + message + '\n```',
+      chips: [
+        { label: 'Commit', kind: 'check', action: 'git-commit-run', payload: message, addAll },
+        { label: 'Cancel', kind: 'edit', action: 'git-commit-cancel' },
+        ...(usageChip ? [usageChip] : []),
+      ],
+    });
+  } else {
+    upd({ working: true, workingLabel: 'Committing' });
+    const c = await window.farnsworth.gitCommit({ cwd: state.folder, message, addAll });
+    if (!c?.ok) { upd({ working: false, text: 'git commit failed: ' + (c?.message || c?.error), error: true }); return; }
+    upd({
+      working: false,
+      responseText: `Committed \`${c.hash}\` on ${c.branch}:\n\n\`\`\`\n${message}\n\`\`\``,
+      verified: true,
+      chips: usageChip ? [usageChip] : [],
+    });
+  }
+  scheduleChatHistorySave();
+}
+
+// Chip handlers for the confirm flow. m is the live message object from
+// state.chatMessages (renderMessage passes it through).
+async function runPendingGitCommit(m) {
+  if (m._commitDone) return;
+  const runChip = (m.chips || []).find(c => c.action === 'git-commit-run');
+  if (!runChip) return;
+  m._commitDone = true;
+  m.working = true;
+  m.workingLabel = 'Committing';
+  renderChat();
+  const c = await window.farnsworth.gitCommit({ cwd: state.folder, message: runChip.payload, addAll: !!runChip.addAll });
+  m.working = false;
+  if (c?.ok) {
+    m.preambleText = '';
+    m.responseText = `Committed \`${c.hash}\` on ${c.branch}:\n\n\`\`\`\n${runChip.payload}\n\`\`\``;
+    m.verified = true;
+    m.chips = (m.chips || []).filter(x => x.kind === 'read'); // keep usage chip
+  } else {
+    m._commitDone = false; // allow retry
+    m.responseText += '\n\ngit commit failed: ' + (c?.message || c?.error || 'unknown');
+    m.error = true;
+  }
+  renderChat();
+  scheduleChatHistorySave();
+}
+
+function cancelPendingGitCommit(m) {
+  if (m._commitDone) return;
+  m._commitDone = true;
+  m.preambleText = '';
+  m.responseText = 'Commit cancelled — nothing was committed.';
+  m.chips = [];
+  renderChat();
+  scheduleChatHistorySave();
+}
+
+async function aiReviewCommand() {
+  switchLeftTab('chat');
+  if (!state.folder) {
+    pushAgentTask('')({ working: false, text: 'AI Review needs an open folder (⇧⌘O) with a git repository.', error: true });
+    return;
+  }
+  const upd = pushAgentTask('Reading git diff');
+  const d = await window.farnsworth.gitDiff({ cwd: state.folder });
+  if (!d?.ok) { upd({ working: false, text: 'AI Review: ' + (d?.message || d?.error || 'git diff failed'), error: true }); return; }
+  if (d.clean) { upd({ working: false, text: 'Working tree clean — nothing to review.', verified: true }); return; }
+  const row = routingRow('review');
+  upd({ working: true, workingLabel: `Reviewing changes (${row?.model || 'Sonnet 5'})` });
+  const res = await window.farnsworth.sendMessage({
+    model: routedModelApiId('review'),
+    maxTokens: 1500,
+    system: AI_REVIEW_SYSTEM,
+    messages: [{ role: 'user', content: `Branch ${d.branch}, ${d.source} changes${d.truncated ? ' (diff truncated)' : ''}:\n\n${d.diff}` }],
+  });
+  if (!res?.ok || !res.text?.trim()) {
+    upd({ working: false, text: 'AI Review: model call failed — ' + (res?.message || res?.error || 'empty response'), error: true });
+    return;
+  }
+  const usageChip = res.usage ? { label: `${res.usage.input_tokens}→${res.usage.output_tokens} tok`, kind: 'read' } : null;
+  upd({
+    working: false,
+    preambleText: `Code review — ${d.branch} (${d.source} changes, ${row?.model || 'Sonnet 5'}):`,
+    responseText: res.text.trim(),
+    verified: true,
+    chips: usageChip ? [usageChip] : [],
+  });
+  scheduleChatHistorySave();
+}
+
 function openCommandPalette() {
   let overlay = document.getElementById('command-palette-overlay');
   if (!overlay) {
@@ -7225,6 +7494,8 @@ function openCommandPalette() {
       { id: 'find-file-by-name', label: 'Find File by Name…', shortcut: '⇧⌘P', run: () => openFileFinderOverlay() },
       { id: 'rename-file',     label: 'Rename File/Folder', shortcut: 'F2', run: () => renameSelectedFile() },
       { id: 'delete-file',     label: 'Delete File/Folder', shortcut: '⌫',   run: () => deleteSelectedFile() },
+      { id: 'ai-commit',       label: 'AI: Commit Changes', shortcut: '',   run: () => aiCommitCommand() },
+      { id: 'ai-review',       label: 'AI: Review Changes', shortcut: '',   run: () => aiReviewCommand() },
     ];
     const recentItems = recents.map(r => ({
       id: 'recent:' + r.path,
@@ -8970,6 +9241,9 @@ async function sendChatMessage() {
       if (userText) window.farnsworth.memoryRemember(userText, { kind: 'fact', source: 'chat.user', context: `conv=${state.chatActiveId}` });
       if (agentText && !finalAgent?.error) window.farnsworth.memoryRemember(agentText, { kind: 'fact', source: 'chat.agent', context: `conv=${state.chatActiveId}` });
     }
+    // Per-call-site 'titles': LLM-name the conversation after the first
+    // successful exchange. Fire-and-forget — never blocks the chat flow.
+    maybeGenerateConvTitle();
   }
   // chat:done was already sent on the error paths (inner catch + res.ok check).
   // For the success path, send it here so companion always gets exactly one

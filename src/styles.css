@@ -3039,6 +3039,14 @@ pre:hover .code-copy { opacity: 1; }
 .routing-row__name-save {
   font-size: 10.5px; color: var(--accent-green); margin-top: 1px;
 }
+/* Jul 13: per-call-site routing wired for real. desc = where the call site
+   fires (palette command / auto trigger); auto = confirm-less call sites. */
+.routing-row__name-desc {
+  font-size: 10.5px; color: #80848e; margin-top: 1px;
+}
+.routing-row__auto {
+  font-size: 10px; color: #5c6067; font-family: var(--font-mono);
+}
 .routing-row__model { width: 160px; }
 .routing-row__confirm { width: 64px; display: flex; justify-content: center; }
 

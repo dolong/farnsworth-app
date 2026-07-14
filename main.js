@@ -3591,6 +3591,76 @@ ipcMain.handle('inference:agentTools', async () => {
 });
 
 // ------------------------------------------------------------
+// Git IPCs for per-call-site AI commands (Jul 13 ~23:05 ET)
+// ------------------------------------------------------------
+// AI Commit / AI Review palette commands need a working-tree diff and a
+// commit primitive. execFile with argument arrays (never a shell string)
+// so model-generated commit messages can't inject. cwd resolves from the
+// renderer-passed folder, falling back to the persisted currentFolder.
+const GIT_DIFF_CHAR_LIMIT = 50000;
+
+function resolveGitCwd(explicit) {
+  const c = explicit || (db.getSetting && db.getSetting('currentFolder'));
+  return (typeof c === 'string' && c) ? c : null;
+}
+
+function gitExec(cwd, args, timeoutMs = 15000) {
+  return new Promise((resolve) => {
+    const { execFile } = require('child_process');
+    execFile('git', args, { cwd, timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
+      resolve({
+        code: err ? (typeof err.code === 'number' ? err.code : 1) : 0,
+        stdout: String(stdout || ''),
+        stderr: String(stderr || ''),
+        err: err ? String(err.message || err) : null,
+      });
+    });
+  });
+}
+
+ipcMain.handle('git:diff', async (_e, opts = {}) => {
+  const cwd = resolveGitCwd(opts.cwd);
+  if (!cwd) return { ok: false, error: 'no_folder', message: 'No folder open' };
+  const inside = await gitExec(cwd, ['rev-parse', '--is-inside-work-tree']);
+  if (inside.code !== 0 || !/true/.test(inside.stdout)) {
+    return { ok: false, error: 'not_a_repo', message: 'Folder is not a git repository' };
+  }
+  const branch = (await gitExec(cwd, ['rev-parse', '--abbrev-ref', 'HEAD'])).stdout.trim() || '(no branch)';
+  const status = (await gitExec(cwd, ['status', '--porcelain'])).stdout;
+  // Prefer the staged diff when something is staged; otherwise diff the
+  // working tree. Untracked files aren't in `git diff` — append their
+  // names so the model knows they exist (content stays out to keep the
+  // payload bounded).
+  let source = 'staged';
+  let diff = (await gitExec(cwd, ['diff', '--cached'])).stdout;
+  if (!diff.trim()) {
+    source = 'working';
+    diff = (await gitExec(cwd, ['diff'])).stdout;
+    const untracked = status.split('\n').filter(l => l.startsWith('??')).map(l => l.slice(3)).filter(Boolean);
+    if (untracked.length) diff += '\n# Untracked files:\n' + untracked.map(f => '#   ' + f).join('\n') + '\n';
+  }
+  let truncated = false;
+  if (diff.length > GIT_DIFF_CHAR_LIMIT) { diff = diff.slice(0, GIT_DIFF_CHAR_LIMIT); truncated = true; }
+  return { ok: true, branch, source, diff, status, truncated, clean: !status.trim() };
+});
+
+ipcMain.handle('git:commit', async (_e, opts = {}) => {
+  const cwd = resolveGitCwd(opts.cwd);
+  const message = typeof opts.message === 'string' ? opts.message.trim() : '';
+  if (!cwd) return { ok: false, error: 'no_folder', message: 'No folder open' };
+  if (!message) return { ok: false, error: 'empty_message', message: 'Empty commit message' };
+  if (opts.addAll) {
+    const add = await gitExec(cwd, ['add', '-A']);
+    if (add.code !== 0) return { ok: false, error: 'add_failed', message: (add.stderr || add.err || '').slice(0, 500) };
+  }
+  const commit = await gitExec(cwd, ['commit', '-m', message]);
+  if (commit.code !== 0) return { ok: false, error: 'commit_failed', message: (commit.stderr || commit.stdout || commit.err || '').slice(0, 500) };
+  const hash = (await gitExec(cwd, ['rev-parse', '--short', 'HEAD'])).stdout.trim();
+  const branch = (await gitExec(cwd, ['rev-parse', '--abbrev-ref', 'HEAD'])).stdout.trim();
+  return { ok: true, hash, branch, stdout: commit.stdout.slice(0, 500) };
+});
+
+// ------------------------------------------------------------
 // Streaming inference — SSE from api.anthropic.com/v1/messages
 // with stream: true. Forwards events to the renderer via
 // webContents.send('inference:chunk', { requestId, type, ... }).

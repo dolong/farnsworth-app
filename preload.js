@@ -162,6 +162,9 @@ contextBridge.exposeInMainWorld('farnsworth', {
   testDelete: ({ folder, name }) => ipcRenderer.invoke('test:delete', { folder, name }),
   // Inference — call Claude API with saved OAuth token or manual API key
   sendMessage: (opts) => ipcRenderer.invoke('inference:send', opts),
+  // Git primitives for per-call-site AI commands (AI Commit / AI Review)
+  gitDiff: (opts) => ipcRenderer.invoke('git:diff', opts || {}),
+  gitCommit: (opts) => ipcRenderer.invoke('git:commit', opts || {}),
   // Streaming — returns a Promise that resolves with the final result.
   // onChunk is called for each SSE event: { type: 'text_delta'|'tool_use_delta'|'block_stop'|..., ... }
   streamMessage: (opts, onChunk) => {
