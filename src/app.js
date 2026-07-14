@@ -1358,10 +1358,18 @@ function captureCanvasState() {
         html = `<pre style="font-family:monospace;padding:20px;color:#ddd;background:#1e1e1e;">${escapeHtml(activeFile.content || '')}</pre>`;
       }
     } else if (state.preview === 'mobile' || state.preview === 'desktop' || state.preview === 'fullscreen' || state.preview === 'testview') {
-      // Live game preview — use the dev server URL directly so the iframe
-      // can render the actual game. Companion's iframe src points to this.
-      const iframe = document.querySelector('#canvas-artboard iframe');
-      if (iframe && iframe.src) url = iframe.src;
+      // Live game preview — since the Jul 9 WebContentsView swap there is
+      // no DOM iframe; the placeholder div carries the exact URL the view
+      // loads in data-canvas-url (incl. ?view= param). Companion's iframe
+      // src points to this. Fall back to a real iframe (pre-swap DOM),
+      // then to the dev server root.
+      const holder = document.querySelector('[data-canvas-url]');
+      if (holder) url = holder.getAttribute('data-canvas-url') || null;
+      if (!url) {
+        const iframe = document.querySelector('#canvas-artboard iframe');
+        if (iframe && iframe.src) url = iframe.src;
+      }
+      if (!url && state.farnsworthDev?.available) url = state.farnsworthDev.url;
     } else if (state.canvasMode === 'storybook') {
       // Storybook — serialize the artboard's DOM (no nested game iframe)
       const artboard = document.getElementById('canvas-artboard');
