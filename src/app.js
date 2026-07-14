@@ -609,11 +609,48 @@ async function persistChatActiveId(id) {
   } catch {}
 }
 
+// Jul 13 ~22:40 ET: per-message copy-to-clipboard buttons (Long's request).
+// Ghost icon button, revealed on message hover, swaps to a green checkmark
+// for 1.2s after a successful copy. getText is lazy so the button copies
+// whatever the message holds at click time. Paired with the user-select
+// opt-in on .msg__body/.msg__bubble in styles.css (body has user-select:
+// none, which silently blocked drag-select + Cmd+C in chat).
+const MSG_COPY_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+const MSG_COPIED_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>';
+function makeMsgCopyBtn(getText, cls) {
+  const btn = el('button', { class: cls || 'msg__copy' });
+  btn.type = 'button';
+  btn.title = 'Copy to clipboard';
+  btn.innerHTML = MSG_COPY_ICON;
+  btn.addEventListener('click', async (ev) => {
+    ev.stopPropagation();
+    try {
+      await navigator.clipboard.writeText(getText() || '');
+      btn.innerHTML = MSG_COPIED_ICON;
+      btn.classList.add('is-copied');
+      setTimeout(() => { btn.innerHTML = MSG_COPY_ICON; btn.classList.remove('is-copied'); }, 1200);
+    } catch (e) {
+      console.warn('[chat] copy failed:', e);
+    }
+  });
+  return btn;
+}
+
+// Pin a hover copy button to each fenced code block inside a rendered
+// message text container. Reads the code text from the DOM at click time.
+function attachCodeCopyButtons(container) {
+  container.querySelectorAll('pre').forEach((pre) => {
+    if (pre.querySelector('.code-copy')) return;
+    pre.appendChild(makeMsgCopyBtn(() => (pre.querySelector('code') || pre).innerText, 'code-copy'));
+  });
+}
+
 function renderMessage(m) {
   if (m.role === 'user') {
-    return el('div', { class: 'msg msg--user' },
-      el('div', { class: 'msg__bubble' }, m.text)
-    );
+    const row = el('div', { class: 'msg msg--user' });
+    if ((m.text || '').trim()) row.appendChild(makeMsgCopyBtn(() => m.text, 'msg__copy msg__copy--user'));
+    row.appendChild(el('div', { class: 'msg__bubble' }, m.text));
+    return row;
   }
   if (m.role === 'context') {
     return el('div', { class: 'context-card' },
@@ -628,12 +665,16 @@ function renderMessage(m) {
     const avatar = el('div', { class: 'msg__avatar' + (m.working ? ' msg__avatar--working' : '') });
     avatar.innerHTML = '<svg width="15" height="15" viewBox="0 0 24 24" fill="#fff"><path d="M12 2l2.2 6.3L20.5 10l-6.3 1.7L12 18l-1.7-6.3L4 10l6.3-1.7z"/></svg>';
 
-    const body = el('div', { class: 'msg__body' },
-      el('div', { class: 'msg__head' },
-        el('span', { class: 'msg__name' }, 'Claude'),
-        el('span', { class: 'msg__model' }, 'Opus 4.8'),
-      ),
+    const head = el('div', { class: 'msg__head' },
+      el('span', { class: 'msg__name' }, 'Claude'),
+      el('span', { class: 'msg__model' }, 'Opus 4.8'),
     );
+    // Copy the whole message (m.text is the preamble+response concatenation
+    // kept for history compat). Hidden while streaming — partial text.
+    if (!m.working && (m.text || '').trim()) {
+      head.appendChild(makeMsgCopyBtn(() => m.text));
+    }
+    const body = el('div', { class: 'msg__body' }, head);
 
     if (m.working) {
       const working = el('div', { class: 'msg__working' });
@@ -652,6 +693,7 @@ function renderMessage(m) {
     if (!m.working && m.preambleText && m.preambleText.trim()) {
       const thinking = el('div', { class: 'msg__text msg__text--thinking' });
       thinking.innerHTML = renderText(m.preambleText);
+      attachCodeCopyButtons(thinking);
       body.appendChild(thinking);
     }
 
@@ -748,6 +790,7 @@ function renderMessage(m) {
     if (!m.working && m.responseText && m.responseText.trim()) {
       const response = el('div', { class: 'msg__text msg__text--response' });
       response.innerHTML = renderText(m.responseText);
+      attachCodeCopyButtons(response);
       body.appendChild(response);
     }
 

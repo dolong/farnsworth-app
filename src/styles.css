@@ -657,6 +657,39 @@ button { font-family: inherit; cursor: pointer; }
   border-radius: 4px; padding: 1px 5px;
 }
 .msg__text { font-size: 13px; line-height: 1.55; color: #c8ccd2; }
+/* Jul 13 ~22:40 ET: chat text is selectable + per-message copy buttons.
+   body has user-select: none (app chrome default), which silently blocked
+   drag-select and Cmd+C in chat. Message content opts back in; Cmd+C works
+   via the native Edit menu's copy role once a selection exists. */
+.msg__body, .msg__bubble, .context-card { user-select: text; }
+.msg__bubble { white-space: pre-wrap; } /* preserve newlines in user messages */
+.msg__copy {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; padding: 0; flex: 0 0 auto;
+  background: transparent; border: none; border-radius: 5px;
+  color: var(--text-muted);
+  opacity: 0; transition: opacity .12s ease, background .12s ease;
+}
+.msg__copy svg { width: 13px; height: 13px; }
+.msg__copy:hover { background: rgba(255,255,255,.08); color: #e8eaed; }
+.msg__copy.is-copied { color: #3ba55c; opacity: 1 !important; }
+.msg:hover .msg__head .msg__copy, .msg--user:hover .msg__copy--user { opacity: 1; }
+.msg__head .msg__copy { margin-left: auto; }
+.msg__copy--user { align-self: center; margin-right: 2px; }
+/* Fenced code blocks: copy button pinned top-right, shown on block hover */
+.msg__text--response pre, .msg__text--thinking pre { position: relative; }
+.code-copy {
+  position: absolute; top: 5px; right: 5px;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; padding: 0;
+  background: rgba(13,14,16,.85); border: 1px solid #2a2c31; border-radius: 5px;
+  color: var(--text-muted);
+  opacity: 0; transition: opacity .12s ease;
+}
+.code-copy svg { width: 12px; height: 12px; }
+.code-copy:hover { color: #e8eaed; }
+.code-copy.is-copied { color: #3ba55c; opacity: 1; }
+pre:hover .code-copy { opacity: 1; }
 /* Jul 13 ~18:50 ET: Vellum-style chat layout — preamble text (model's
    text before any tool_use) becomes a small italic "thinking" indicator
    at the top of the agent message; response text (after tools) renders
