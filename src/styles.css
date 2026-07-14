@@ -370,6 +370,14 @@ button { font-family: inherit; cursor: pointer; }
   position: absolute; inset: 0;
   padding: 6px 8px;
   overflow: hidden;
+  /* Jul 14: content-box so xterm's FitAddon measures the CONTENT area.
+     FitAddon reads getComputedStyle(parent).height, which under border-box
+     INCLUDES this pane's 12px vertical padding — so it computed 1-2 more
+     rows than actually fit, clipping the bottom row at window sizes where
+     the leftover remainder was < 12px (Long's cutoff report, Claude Code
+     panel). content-box makes computed height exclude padding; layout is
+     unchanged because the pane is inset-stretched, not height-set. */
+  box-sizing: content-box;
 }
 .termtab__pane[hidden] { display: none !important; }
 .termtab__pane .xterm,
@@ -439,6 +447,7 @@ button { font-family: inherit; cursor: pointer; }
   position: absolute; inset: 0;
   padding: 6px 8px;
   overflow: hidden;
+  box-sizing: content-box; /* Jul 14: see .termtab__pane — FitAddon row-count fix */
 }
 .cctab__pane[hidden] { display: none !important; }
 .cctab__pane .xterm,
@@ -2908,6 +2917,27 @@ pre:hover .code-copy { opacity: 1; }
 .statusbar__mem { color: var(--accent-purple); }
 .statusbar__ctx { color: var(--accent-yellow); }
 .statusbar__extracted { display: inline-flex; align-items: center; gap: 4px; color: var(--accent-green); }
+.statusbar__connected.is-off .statusbar__pulse { background: #6d7178; box-shadow: none; }
+.statusbar__chip { cursor: pointer; }
+.statusbar__chip:hover { filter: brightness(1.35); }
+
+/* Settings section info button + popover (Jul 14) — section headers carry
+   an ⓘ instead of an always-visible explainer line. */
+.settings-info-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 17px; height: 17px; padding: 0;
+  background: none; border: none; cursor: pointer;
+  color: #80848e; border-radius: 50%;
+}
+.settings-info-btn:hover { color: #dbdee1; }
+.settings-info-wrap { position: relative; display: inline-flex; }
+.settings-info-pop {
+  position: absolute; top: 22px; left: -8px; z-index: 30;
+  width: 300px; padding: 10px 12px;
+  background: #1e1f22; border: 1px solid var(--border-strong);
+  border-radius: 8px; box-shadow: 0 10px 32px rgba(0,0,0,.5);
+  font-size: 12px; line-height: 1.5; color: var(--text-secondary);
+}
 
 /* =================================================================
    SETTINGS OVERLAY
