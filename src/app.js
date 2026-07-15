@@ -42,7 +42,7 @@ const ROUTING_CALL_SITES = [
 
 const state = {
   rightTab: 'files',          // files | tasks | live
-  leftPanel: 'claudecode',    // chat | terminal | claudecode
+  leftPanel: 'claudecode',    // chat | terminal | claudecode | codex
   settingsOpen: false,
   settingsPage: 'ai',         // ai | memory | canvas | workspace | appearance | account
   vm: { markup: false, comments: false, edit: false, tweaks: true },
@@ -7931,6 +7931,7 @@ function openCommandPalette() {
       { id: 'toggle-right', label: 'Toggle Right Panel', shortcut: '⌥⌘R', run: () => toggleRightPanel() },
       { id: 'focus-term',   label: 'Focus Terminal', shortcut: '⌘`', run: () => switchLeftTab('terminal') },
       { id: 'focus-cc',     label: 'Focus Claude Code', shortcut: '⇧⌘`', run: () => switchLeftTab('claudecode') },
+      { id: 'focus-codex',  label: 'Focus Codex', run: () => switchLeftTab('codex') },
       { id: 'search-in-files', label: 'Search in Files…', shortcut: '⇧⌘F', run: () => openSearchOverlay() },
       { id: 'find-in-file',    label: 'Find in File…',    shortcut: '⌘F',  run: () => { state.codeFindOpen = true; renderCanvas(); } },
       { id: 'find-file-by-name', label: 'Find File by Name…', shortcut: '⇧⌘P', run: () => openFileFinderOverlay() },
@@ -8752,9 +8753,14 @@ function wire() {
   $('#lefttab-chat')?.addEventListener('click', () => switchLeftPanel('chat'));
   $('#lefttab-terminal')?.addEventListener('click', () => switchLeftPanel('terminal'));
   $('#lefttab-claudecode')?.addEventListener('click', () => switchLeftPanel('claudecode'));
+  $('#lefttab-codex')?.addEventListener('click', () => switchLeftPanel('codex'));
   $('#claude-code-new-tab')?.addEventListener('click', () => {
     if (state.leftPanel !== 'claudecode') switchLeftPanel('claudecode');
     addClaudeCodeTab();
+  });
+  $('#codex-new-tab')?.addEventListener('click', () => {
+    if (state.leftPanel !== 'codex') switchLeftPanel('codex');
+    addCodexTab();
   });
   $('#terminal-new-tab')?.addEventListener('click', addTerminalTab);
   // Initial active state
@@ -10412,6 +10418,419 @@ async function closeClaudeCodeTab(tabId) {
   persistClaudeCodeTabs();
 }
 
+// ============================================================================
+// CODEX PANEL (Jul 14) — mirrors the Claude Code panel for OpenAI's codex CLI
+// ============================================================================
+// Same architecture: session Map, tab pills, lazy PTY spawn over a WS bridge
+// (port 9225 in main), auth gate card when ~/.codex/auth.json is missing.
+// Deliberate differences from the Claude Code panel:
+//   - No sessionId persistence: codex has no `--session-id` pre-assignment /
+//     `--resume <uuid>` surface like claude's; `codex resume` picker is v2.
+//   - Shift+Enter sends \n (Ctrl+J) — codex's ratatui TUI binds Ctrl+J to
+//     insert-newline in non-kitty terminals (xterm.js is one); claude's TUI
+//     wants ESC+CR for the same gesture. Each panel speaks its TUI's dialect.
+//   - First-message tab titles are renderer-side only (codex has no /rename
+//     slash command to push a title into the session itself).
+
+const codexSessions = new Map(); // tabId -> { term, fit, ws, paneEl, label, createdAt, ptyTabId }
+let activeCodexTabId = null;
+let codexTabCounter = 0;
+
+let saveCodexTabsTimeout = null;
+function persistCodexTabs() {
+  if (!window.farnsworth?.codexSaveTabs) return;
+  clearTimeout(saveCodexTabsTimeout);
+  saveCodexTabsTimeout = setTimeout(() => {
+    const tabs = Array.from(codexSessions.entries())
+      .sort((a, b) => a[1].createdAt - b[1].createdAt)
+      .map(([id, sess]) => ({ id, label: sess.label, createdAt: sess.createdAt }));
+    window.farnsworth.codexSaveTabs({
+      tabs,
+      activeId: activeCodexTabId,
+    }).catch(() => {});
+  }, 200);
+}
+
+async function loadPersistedCodexTabs() {
+  if (!window.farnsworth?.codexListTabs) return { tabs: [], activeId: null };
+  try {
+    const r = await window.farnsworth.codexListTabs();
+    if (!r || !r.ok) return { tabs: [], activeId: null };
+    return { tabs: r.tabs || [], activeId: r.activeId || null };
+  } catch {
+    return { tabs: [], activeId: null };
+  }
+}
+
+function nextCodexTabId() {
+  codexTabCounter++;
+  return 'cx-' + codexTabCounter;
+}
+
+function nextCodexLabel() {
+  const n = codexTabCounter;
+  return n === 1 ? 'codex' : 'codex ' + n;
+}
+
+async function initCodex(tabId) {
+  const host = document.getElementById('codex-host');
+  if (!host || typeof Terminal === 'undefined') return;
+  if (codexSessions.has(tabId)) {
+    const sess = codexSessions.get(tabId);
+    if (sess.term && sess.term.element && sess.paneEl && sess.term.element.parentNode !== sess.paneEl) {
+      sess.paneEl.appendChild(sess.term.element);
+    }
+    setTimeout(() => { try { sess.fit && sess.fit.fit(); } catch {} }, 50);
+    return;
+  }
+
+  const paneEl = document.createElement('div');
+  paneEl.className = 'cxtab__pane';
+  paneEl.id = 'cxtab-pane-' + tabId;
+  paneEl.dataset.tabId = tabId;
+  host.appendChild(paneEl);
+
+  const label = nextCodexLabel();
+
+  // ---- Auth gate ----
+  // Check ~/.codex/auth.json (via main) before spawning anything. Covers
+  // both "CLI not installed" (login button disabled, install hint shown)
+  // and "installed but signed out" (login button spawns `codex login`).
+  let authRes = null;
+  try {
+    authRes = await window.farnsworth.codexCheckAuth();
+  } catch (e) {
+    authRes = { ok: false, hasAuth: false, message: 'Auth check failed: ' + e.message };
+  }
+
+  if (!authRes || !authRes.hasAuth) {
+    const card = document.createElement('div');
+    card.className = 'codexpanel__signin';
+    const reason = (authRes && authRes.message) || 'Codex CLI is not signed in.';
+    const noBinary = !!(authRes && authRes.source === 'no_binary');
+    card.innerHTML = `
+      <div class="codexpanel__signin-icon">
+        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+      </div>
+      <div class="codexpanel__signin-title">Sign in to Codex</div>
+      <div class="codexpanel__signin-sub">${escapeHtml(reason)}<br>${noBinary ? 'Install the CLI, then hit Re-check.' : 'Codex runs as a child process — login opens a browser tab on your Mac (ChatGPT account or API key).'}</div>
+      <button class="btn btn--primary codexpanel__signin-btn" data-act="login" ${noBinary ? 'disabled' : ''}>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4M10 17l5-5-5-5M15 12H3"/></svg>
+        Sign in with Codex CLI
+      </button>
+      <button class="btn btn--ghost codexpanel__signin-btn codexpanel__signin-btn--secondary" data-act="refresh" title="Re-check auth status">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7L21 8M21 3v5h-5"/></svg>
+        Re-check
+      </button>
+      <div class="codexpanel__signin-status" data-role="status"></div>
+    `;
+    paneEl.appendChild(card);
+
+    const btn = card.querySelector('[data-act="login"]');
+    const refreshBtn = card.querySelector('[data-act="refresh"]');
+    const statusEl = card.querySelector('[data-role="status"]');
+
+    const startLogin = async () => {
+      btn.disabled = true;
+      btn.classList.add('is-loading');
+      refreshBtn.disabled = true;
+      statusEl.className = 'codexpanel__signin-status is-loading';
+      statusEl.textContent = 'Opening browser for sign-in… complete the ChatGPT consent screen, then return here.';
+      try {
+        const res = await window.farnsworth.codexRunLogin();
+        if (res && res.ok) {
+          statusEl.className = 'codexpanel__signin-status is-success';
+          statusEl.textContent = 'Signed in. Starting Codex…';
+          setTimeout(() => {
+            try { card.remove(); } catch {}
+            codexSessions.delete(tabId);
+            initCodex(tabId);
+          }, 600);
+        } else {
+          statusEl.className = 'codexpanel__signin-status is-error';
+          statusEl.textContent = (res && res.message) || 'Sign-in failed. Try again or run `codex login` in Terminal.';
+          btn.disabled = false;
+          btn.classList.remove('is-loading');
+          refreshBtn.disabled = false;
+        }
+      } catch (e) {
+        statusEl.className = 'codexpanel__signin-status is-error';
+        statusEl.textContent = 'Sign-in error: ' + e.message;
+        btn.disabled = false;
+        btn.classList.remove('is-loading');
+        refreshBtn.disabled = false;
+      }
+    };
+
+    const refreshAuth = async () => {
+      refreshBtn.disabled = true;
+      statusEl.className = 'codexpanel__signin-status is-loading';
+      statusEl.textContent = 'Checking…';
+      try {
+        const res = await window.farnsworth.codexCheckAuth();
+        if (res && res.hasAuth) {
+          statusEl.className = 'codexpanel__signin-status is-success';
+          statusEl.textContent = 'Signed in. Starting Codex…';
+          setTimeout(() => {
+            try { card.remove(); } catch {}
+            codexSessions.delete(tabId);
+            initCodex(tabId);
+          }, 400);
+        } else {
+          statusEl.className = 'codexpanel__signin-status';
+          statusEl.textContent = 'Still not signed in.';
+          // If the binary appeared since the card rendered (user just
+          // installed it), un-disable the login button.
+          if (res && res.source !== 'no_binary') btn.disabled = false;
+          refreshBtn.disabled = false;
+        }
+      } catch (e) {
+        statusEl.className = 'codexpanel__signin-status is-error';
+        statusEl.textContent = 'Check failed: ' + e.message;
+        refreshBtn.disabled = false;
+      }
+    };
+
+    btn.addEventListener('click', startLogin);
+    refreshBtn.addEventListener('click', refreshAuth);
+
+    codexSessions.set(tabId, { term: null, fit: null, ws: null, paneEl, card, label, createdAt: Date.now(), ptyTabId: null, isSignIn: true });
+    activeCodexTabId = tabId;
+    renderCodexTabs();
+    for (const [id, sess] of codexSessions.entries()) {
+      if (sess.paneEl) sess.paneEl.hidden = (id !== tabId);
+    }
+    return;
+  }
+
+  // ---- Authenticated path: spawn xterm + WebSocket bridge to `codex` ----
+  const term = new Terminal({
+    cursorBlink: true,
+    fontFamily: 'ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, monospace',
+    fontSize: 13,
+    theme: {
+      background: '#0d0e10',
+      foreground: '#e5e7eb',
+      // OpenAI green cursor — Codex vs Claude Code (orange) vs Terminal
+      // (purple) read distinct at a glance.
+      cursor: '#10a37f',
+      cursorAccent: '#0d0e10',
+      selectionBackground: '#3b3d44',
+      black: '#0d0e10', red: '#f87171', green: '#4ade80', yellow: '#facc15',
+      blue: '#60a5fa', magenta: '#c084fc', cyan: '#22d3ee', white: '#e5e7eb',
+      brightBlack: '#6b7280', brightRed: '#fca5a5', brightGreen: '#86efac',
+      brightYellow: '#fde68a', brightBlue: '#93c5fd', brightMagenta: '#d8b4fe',
+      brightCyan: '#67e8f9', brightWhite: '#f9fafb',
+    },
+  });
+  const fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.loadAddon(new WebLinksAddon.WebLinksAddon());
+  term.open(paneEl);
+  fit.fit();
+
+  const wsUrl = await window.farnsworth.getCodexWsUrl();
+  const ws = new WebSocket(wsUrl);
+  ws.binaryType = 'arraybuffer';
+  let ptyTabId = tabId;
+
+  term.onData((data) => {
+    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'data', data }));
+  });
+  term.onResize(({ cols, rows }) => {
+    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'resize', cols, rows }));
+  });
+  // Shift+Enter inserts a newline instead of submitting. codex's TUI
+  // binds Ctrl+J (\n) to insert-newline in terminals without the kitty
+  // keyboard protocol; xterm.js emits plain \r for Shift+Enter, which
+  // would submit. Swallow the event and send \n instead.
+  // First-Enter title: derive a tab label from the first message, renderer-
+  // side only (unlike Claude Code, there's no /rename to sequence after, so
+  // we do NOT swallow the Enter — xterm's own \r submits normally).
+  let titleSet = false;
+  term.attachCustomKeyEventHandler((ev) => {
+    if (ev.key === 'Enter' && ev.shiftKey && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
+      if (ev.type === 'keydown' && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'data', data: '\n' }));
+      }
+      return false; // swallow keydown/keypress/keyup so xterm never emits its own \r
+    }
+    if (!titleSet && ev.type === 'keydown' && ev.key === 'Enter'
+        && !ev.shiftKey && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
+      try {
+        const buf = term.buffer.active;
+        const line = buf.getLine(buf.cursorY);
+        const text = line ? line.translateToString(true).trim() : '';
+        if (text) {
+          const sess = codexSessions.get(tabId);
+          if (sess) {
+            sess.label = generateTitleFromMessage(text);
+            renderCodexTabs();
+            persistCodexTabs();
+          }
+          titleSet = true;
+        }
+      } catch {}
+    }
+    return true;
+  });
+  ws.onopen = () => {
+    fit.fit();
+    // Same init protocol as the Claude Code panel: send the renderer's
+    // state.folder before spawn so the PTY lands in the project folder
+    // (see the Jul 5 cwd bug — mirrored here from day one).
+    ws.send(JSON.stringify({ type: 'init', cwd: state.folder || null }));
+    ws.send(JSON.stringify({ type: 'spawn', tabId }));
+    ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+  };
+  ws.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'ready' && msg.tabId) {
+        ptyTabId = msg.tabId;
+        const sess = codexSessions.get(tabId);
+        if (sess) sess.ptyTabId = ptyTabId;
+      } else if (msg.type === 'data') {
+        term.write(msg.data);
+      } else if (msg.type === 'exit') {
+        term.write('\r\n\x1b[2m[codex exited — click + to start a new session]\x1b[0m\r\n');
+      } else if (msg.type === 'error') {
+        term.write('\r\n\x1b[31m[error: ' + (msg.message || 'unknown') + ']\x1b[0m\r\n');
+      }
+    } catch {}
+  };
+  ws.onclose = () => {
+    term.write('\r\n\x1b[2m[disconnected]\x1b[0m\r\n');
+  };
+
+  const resizeObserver = new ResizeObserver(() => {
+    try { fit.fit(); ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows })); } catch {}
+  });
+  resizeObserver.observe(paneEl);
+
+  codexSessions.set(tabId, { term, fit, ws, paneEl, label, createdAt: Date.now(), ptyTabId });
+  activeCodexTabId = tabId;
+  renderCodexTabs();
+  for (const [id, sess] of codexSessions.entries()) {
+    if (sess.paneEl) sess.paneEl.hidden = (id !== tabId);
+  }
+}
+
+function renderCodexTabs() {
+  const container = document.getElementById('codex-tabs');
+  if (!container) return;
+  Array.from(container.querySelectorAll('.cxtab')).forEach(n => n.remove());
+  const tabs = Array.from(codexSessions.entries())
+    .sort((a, b) => a[1].createdAt - b[1].createdAt);
+  const newBtn = document.getElementById('codex-new-tab');
+  for (const [tabId, sess] of tabs) {
+    const pill = document.createElement('button');
+    pill.className = 'cxtab' + (tabId === activeCodexTabId ? ' is-active' : '');
+    pill.dataset.tabId = tabId;
+    pill.title = sess.label;
+    pill.innerHTML = `
+      <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+      <span class="cxtab__label">${escapeHtml(sess.label)}</span>
+      <span class="cxtab__close" data-close="${tabId}" title="Close Codex session">
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 6l12 12M18 6l-12 12"/></svg>
+      </span>
+    `;
+    pill.addEventListener('click', (ev) => {
+      if (ev.target.closest('.cxtab__close')) return;
+      switchCodexTab(tabId);
+    });
+    const closeBtn = pill.querySelector('.cxtab__close');
+    closeBtn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      closeCodexTab(tabId);
+    });
+    container.insertBefore(pill, newBtn);
+  }
+}
+
+function switchCodexTab(tabId) {
+  const sess = codexSessions.get(tabId);
+  if (!sess) return;
+  activeCodexTabId = tabId;
+  for (const [id, s] of codexSessions.entries()) {
+    if (s.paneEl) s.paneEl.hidden = (id !== tabId);
+  }
+  renderCodexTabs();
+  persistCodexTabs();
+  setTimeout(() => {
+    try { sess.fit.fit(); sess.term.focus(); } catch {}
+  }, 30);
+}
+
+async function closeCodexTab(tabId) {
+  const sess = codexSessions.get(tabId);
+  if (!sess) return;
+  try { await window.farnsworth.codexClose(sess.ptyTabId || tabId); } catch {}
+  try { sess.ws.close(); } catch {}
+  try { sess.term.dispose(); } catch {}
+  try { sess.paneEl.remove(); } catch {}
+  codexSessions.delete(tabId);
+  if (activeCodexTabId === tabId) {
+    const remaining = Array.from(codexSessions.keys()).sort((a, b) => {
+      return codexSessions.get(a).createdAt - codexSessions.get(b).createdAt;
+    });
+    activeCodexTabId = remaining[0] || null;
+    if (activeCodexTabId) {
+      const next = codexSessions.get(activeCodexTabId);
+      for (const [id, s] of codexSessions.entries()) {
+        if (s.paneEl) s.paneEl.hidden = (id !== activeCodexTabId);
+      }
+      setTimeout(() => { try { next.fit.fit(); next.term.focus(); } catch {} }, 30);
+    }
+  }
+  renderCodexTabs();
+  persistCodexTabs();
+}
+
+// Restore Codex tabs that were open at last shutdown. Same flow as
+// restoreClaudeCodeTabs minus sessionId seeding (fresh codex session per
+// restored tab; labels survive).
+async function restoreCodexTabs() {
+  const { tabs, activeId } = await loadPersistedCodexTabs();
+  if (!tabs.length) return false;
+  for (const t of tabs) {
+    const m = /^cx-(\d+)$/.exec(t.id);
+    if (m) {
+      const n = parseInt(m[1], 10);
+      if (n > codexTabCounter) codexTabCounter = n;
+    }
+  }
+  for (const t of tabs) {
+    await new Promise((resolve) => {
+      initCodex(t.id).then(() => {
+        const sess = codexSessions.get(t.id);
+        if (sess) {
+          if (t.label) sess.label = t.label;
+          if (t.createdAt) sess.createdAt = new Date(t.createdAt).getTime() || sess.createdAt;
+        }
+        resolve();
+      });
+    });
+  }
+  const targetId = (activeId && codexSessions.has(activeId)) ? activeId : tabs[0].id;
+  if (targetId) switchCodexTab(targetId);
+  else renderCodexTabs();
+  return true;
+}
+
+function addCodexTab() {
+  const tabId = nextCodexTabId();
+  initCodex(tabId).then(() => {
+    const sess = codexSessions.get(tabId);
+    if (sess) {
+      activeCodexTabId = tabId;
+      setTimeout(() => { try { sess.fit.fit(); sess.term.focus(); } catch {} }, 50);
+    }
+    renderCodexTabs();
+    persistCodexTabs();
+  });
+}
+
 function renderTerminalTabs() {
   const container = document.getElementById('terminal-tabs');
   if (!container) return;
@@ -10492,15 +10911,19 @@ function switchLeftPanel(tab) {
   const chatPane = $('#chat-pane');
   const termPane = $('#terminal-pane');
   const ccPane = $('#claude-code-pane');
+  const cxPane = $('#codex-pane');
   const chatTab = $('#lefttab-chat');
   const termTab = $('#lefttab-terminal');
   const ccTab = $('#lefttab-claudecode');
+  const cxTab = $('#lefttab-codex');
   if (chatPane) chatPane.hidden = (tab !== 'chat');
   if (termPane) termPane.hidden = (tab !== 'terminal');
   if (ccPane) ccPane.hidden = (tab !== 'claudecode');
+  if (cxPane) cxPane.hidden = (tab !== 'codex');
   chatTab && chatTab.classList.toggle('is-active', tab === 'chat');
   termTab && termTab.classList.toggle('is-active', tab === 'terminal');
   ccTab && ccTab.classList.toggle('is-active', tab === 'claudecode');
+  cxTab && cxTab.classList.toggle('is-active', tab === 'codex');
   if (tab === 'terminal') {
     // Lazily spawn the first tab if none exist yet.
     if (terminalSessions.size === 0) {
@@ -10524,6 +10947,19 @@ function switchLeftPanel(tab) {
       });
     } else if (activeClaudeCodeTabId) {
       const sess = claudeCodeSessions.get(activeClaudeCodeTabId);
+      setTimeout(() => { try { sess && sess.fit.fit(); sess && sess.term.focus(); } catch {} }, 50);
+    }
+  }
+  if (tab === 'codex') {
+    // Same lazy-spawn + restore pattern as the Claude Code panel.
+    if (codexSessions.size === 0) {
+      restoreCodexTabs().then((restored) => {
+        if (!restored) {
+          addCodexTab();
+        }
+      });
+    } else if (activeCodexTabId) {
+      const sess = codexSessions.get(activeCodexTabId);
       setTimeout(() => { try { sess && sess.fit.fit(); sess && sess.term.focus(); } catch {} }, 50);
     }
   }

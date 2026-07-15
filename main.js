@@ -77,6 +77,33 @@ function findClaudePath() {
   return null;
 }
 
+// Same as findClaudePath() but for OpenAI's `codex` CLI (the Codex panel,
+// Jul 14). Bundled Resources/bin/codex first, then PATH, then common
+// install locations. brew installs to /opt/homebrew/bin/codex on this Mac.
+function findCodexPath() {
+  const fs = require('fs');
+  const path = require('path');
+  const bundled = path.join(process.resourcesPath || '', 'bin', 'codex');
+  try { if (fs.existsSync(bundled)) return bundled; } catch {}
+  try {
+    const cmd = process.platform === 'win32' ? 'where codex.cmd' : 'which codex';
+    const out = require('child_process').execSync(cmd, { encoding: 'utf8', timeout: 5000 }).trim();
+    const found = out.split(/\r?\n/)[0].trim();
+    if (found) return found;
+  } catch {}
+  const candidates = [
+    '/opt/homebrew/bin/codex',
+    '/usr/local/bin/codex',
+    '/usr/bin/codex',
+    path.join(process.env.HOME || '', '.local', 'bin', 'codex'),
+    path.join(process.env.HOME || '', '.npm-global', 'bin', 'codex'),
+  ].filter(Boolean);
+  for (const p of candidates) {
+    try { if (fs.existsSync(p)) return p; } catch {}
+  }
+  return null;
+}
+
 // Same as findClaudePath() but for nono. Bundled Resources/bin/nono first.
 function findNonoPath() {
   const fs = require('fs');
@@ -495,6 +522,7 @@ function createWindow() {
       await mainWindow.webContents.executeJavaScript(
         '(async () => { try { if (typeof saveActiveConversation === "function") await saveActiveConversation(); ' +
         'if (typeof persistClaudeCodeTabs === "function") persistClaudeCodeTabs(); ' +
+        'if (typeof persistCodexTabs === "function") persistCodexTabs(); ' +
         'return { ok: true }; } catch (e) { return { ok: false, err: e.message }; } })()',
         true,
       ).catch(() => {});
@@ -4140,6 +4168,7 @@ app.whenReady().then(async () => {
   createWindow();
   startTerminalServer();
   startClaudeCodeServer();
+  startCodexServer();
 
   // Start the relay client (outbound WS to farnsworth-relay). No-op if
   // RELAY_DISABLED=1 or the relay isn't reachable — Farnsworth keeps
@@ -4749,6 +4778,257 @@ ipcMain.handle('claudeCode:runLogin', async () => {
     child.on('error', (err) => {
       clearTimeout(timeout);
       resolve({ ok: false, error: 'spawn_failed', message: '`claude login` child error: ' + err.message });
+    });
+  });
+});
+
+// ============================================================
+// Codex panel — WebSocket PTY server (mirrors the Claude Code panel)
+// ============================================================
+// Same architecture as startClaudeCodeServer: one WS server, one PTY per
+// connection, renderer drives spawn via the init/spawn protocol so the
+// cwd is always the project folder (mirrors the Jul 5 cwd fix on the
+// Claude Code panel from day one). Ports: terminal=9223, claude
+// code=9224, codex=9225.
+//
+// Isolation note: no nono wrap here (no farnsworth-codex profile yet).
+// codex ships its own macOS Seatbelt sandbox + approval modes — the TUI
+// defaults to workspace-write with approval prompts, which is the same
+// isolation class the nono wrap gives Claude Code. Revisit if we want a
+// nono profile layered on top.
+//
+// Session resume note: unlike claude, codex has no `--session-id <uuid>`
+// pre-assignment we can persist and `--resume` by. Tabs persist their
+// labels across restarts but each PTY starts a fresh codex session.
+// `codex resume` picker support is a v2 item.
+const CODEX_WS_PORT = 9225;
+let codexWss = null;
+
+function startCodexServer() {
+  if (!pty) {
+    console.error('[codex] node-pty unavailable; Codex panel disabled');
+    return;
+  }
+  // Mark the workspace trusted in ~/.codex/config.toml so codex's
+  // first-run "Do you trust this folder?" prompt is skipped — mirrors
+  // markWorkspaceTrusted on the Claude Code side (~/.claude.json).
+  // config.toml projects-table shape:
+  //   [projects."/Users/long/Documents/foo"]
+  //   trust_level = "trusted"
+  // String-level check + append (no TOML parser dep). Appending a
+  // top-level [projects."..."] table header at EOF is always valid TOML
+  // regardless of what table the file currently ends inside.
+  const markCodexTrusted = (cwd) => {
+    if (!cwd) return;
+    try {
+      const dir = path.join(os.homedir(), '.codex');
+      const cfgPath = path.join(dir, 'config.toml');
+      fsSync.mkdirSync(dir, { recursive: true });
+      let raw = '';
+      try { raw = fsSync.readFileSync(cfgPath, 'utf8'); } catch {}
+      if (raw.includes(`[projects."${cwd}"]`)) return; // already present
+      const block = `${raw && !raw.endsWith('\n') ? '\n' : ''}\n[projects."${cwd}"]\ntrust_level = "trusted"\n`;
+      fsSync.writeFileSync(cfgPath, raw + block, 'utf8');
+    } catch (e) {
+      console.warn('[codex] could not mark workspace trusted:', e.message);
+    }
+  };
+  markCodexTrusted((db.getSetting && db.getSetting('currentFolder')) || os.homedir());
+  if (codexWss) return;
+
+  const codexPathAtBoot = findCodexPath();
+  if (!codexPathAtBoot) {
+    console.error('[codex] codex binary not found on PATH or candidate paths; Codex panel will show the install/sign-in card');
+  } else {
+    console.log(`[codex] using codex at: ${codexPathAtBoot}`);
+  }
+
+  codexWss = new WebSocket.Server({ port: CODEX_WS_PORT });
+  codexWss.on('connection', (ws) => {
+    // cwd protocol mirrors the Claude Code panel: renderer sends `init`
+    // with state.folder before `spawn`, so the PTY lands in the project
+    // folder even when the panel mounts before a folder is opened.
+    let cwd = (db.getSetting && db.getSetting('currentFolder')) || os.homedir();
+    const tabId = 'cx-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6);
+    let term = null;
+    let spawned = false;
+    let initialized = false;
+    const send = (obj) => {
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+    };
+
+    ws.once('message', (raw) => {
+      if (initialized) return;
+      let msg;
+      try { msg = JSON.parse(raw.toString()); } catch { return; }
+      if (msg.type !== 'init') return;
+      initialized = true;
+      if (typeof msg.cwd === 'string' && msg.cwd.length > 0) {
+        cwd = msg.cwd;
+      }
+    });
+    setTimeout(() => { initialized = true; }, 2000);
+
+    const spawnFor = () => {
+      if (spawned) return;
+      spawned = true;
+      // Re-resolve at spawn time — the user may have installed codex
+      // after Farnsworth booted (the sign-in card's Re-check path).
+      const codexBin = findCodexPath() || 'codex';
+      markCodexTrusted(cwd);
+      try {
+        const bundledBin = path.join(process.resourcesPath || '', 'bin');
+        const newPath = [bundledBin, '/opt/homebrew/bin', '/usr/local/bin', process.env.PATH || '']
+          .filter(Boolean)
+          .join(':');
+        term = pty.spawn(codexBin, [], {
+          name: 'xterm-256color',
+          cols: 80,
+          rows: 24,
+          cwd,
+          env: { ...process.env, TERM: 'xterm-256color', PATH: newPath },
+        });
+      } catch (e) {
+        send({ type: 'error', message: 'codex pty.spawn failed: ' + e.message + ' — is `codex` on PATH? Install with `brew install codex`.' });
+        ws.close();
+        return;
+      }
+      term.onData((data) => send({ type: 'data', data }));
+      term.onExit(({ exitCode, signal }) => {
+        send({ type: 'exit', exitCode, signal });
+        ws.close();
+      });
+      send({ type: 'ready', tabId });
+    };
+
+    ws.on('message', (raw) => {
+      let msg;
+      try { msg = JSON.parse(raw.toString()); } catch { return; }
+      if (msg.type === 'spawn') {
+        spawnFor();
+      } else if (term && msg.type === 'data') {
+        term.write(msg.data);
+      } else if (term && msg.type === 'resize' && Number.isFinite(msg.cols) && Number.isFinite(msg.rows)) {
+        try { term.resize(msg.cols, msg.rows); } catch {}
+      } else if (term && msg.type === 'close') {
+        try { term.kill(); } catch {}
+      }
+    });
+    ws.on('close', () => {
+      try { term && term.kill(); } catch {}
+    });
+    ws.on('error', () => {
+      try { term && term.kill(); } catch {}
+    });
+  });
+  console.log(`[codex] WebSocket server listening on ws://localhost:${CODEX_WS_PORT}`);
+}
+
+ipcMain.handle('codex:getWsUrl', () => `ws://localhost:${CODEX_WS_PORT}`);
+ipcMain.handle('codex:close', async (_event, tabId) => {
+  // Symmetry with claudeCode:close — the WS close handler in main does
+  // the actual PTY cleanup.
+  return { ok: true, tabId };
+});
+
+// Codex panel tab persistence — same shape as `claudeCode.tabs` minus
+// sessionId (no resume surface, see the note on startCodexServer).
+// Shape stored at `codex.tabs`:
+//   { tabs: [{ id: 'cx-1', label: 'codex', createdAt: '...' }], activeId: 'cx-1' }
+ipcMain.handle('codex:listTabs', async () => {
+  try {
+    const raw = db.getSetting('codex.tabs');
+    if (!raw) return { ok: true, tabs: [], activeId: null };
+    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    return {
+      ok: true,
+      tabs: Array.isArray(parsed.tabs) ? parsed.tabs : [],
+      activeId: parsed.activeId || null,
+    };
+  } catch (e) {
+    return { ok: false, error: e.message, tabs: [], activeId: null };
+  }
+});
+
+ipcMain.handle('codex:saveTabs', async (_event, state) => {
+  try {
+    if (!state || !Array.isArray(state.tabs)) {
+      return { ok: false, error: 'tabs must be an array' };
+    }
+    db.setSetting('codex.tabs', {
+      tabs: state.tabs,
+      activeId: state.activeId || null,
+    });
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
+
+// Auth gate for the Codex panel — reads ~/.codex/auth.json (the same
+// source auth:codexStatus uses for the Settings → AI OpenAI section;
+// this handler adds the binary check + the panel-shaped response).
+// auth.json shapes seen in the wild: { OPENAI_API_KEY } (API-key login)
+// or { tokens: { id_token, access_token, account_id } } (ChatGPT login).
+ipcMain.handle('codex:checkAuth', async () => {
+  const codexPath = findCodexPath();
+  if (!codexPath) {
+    return { ok: false, hasAuth: false, source: 'no_binary', message: 'Codex CLI not found. Install with: brew install codex (or npm i -g @openai/codex)' };
+  }
+  try {
+    const p = path.join(os.homedir(), '.codex', 'auth.json');
+    if (!fsSync.existsSync(p)) {
+      return { ok: true, hasAuth: false, source: 'no_auth_json', message: 'Codex CLI is not signed in.' };
+    }
+    const raw = JSON.parse(fsSync.readFileSync(p, 'utf8'));
+    const method = raw?.tokens?.access_token ? 'chatgpt'
+      : (raw?.OPENAI_API_KEY ? 'api_key' : null);
+    if (method) return { ok: true, hasAuth: true, source: 'auth_json', method };
+    return { ok: true, hasAuth: false, source: 'auth_json_empty', message: 'auth.json exists but has no usable credentials.' };
+  } catch (e) {
+    return { ok: false, hasAuth: false, source: 'auth_json_error', message: 'auth.json read failed: ' + e.message };
+  }
+});
+
+ipcMain.handle('codex:runLogin', async () => {
+  // Spawns `codex login` (starts a localhost:1455 callback server + opens
+  // the browser for ChatGPT sign-in), waits for exit, then verifies
+  // ~/.codex/auth.json got written. Mirrors claudeCode:runLogin.
+  const { spawn } = require('child_process');
+  const codexPath = findCodexPath();
+  if (!codexPath) {
+    return { ok: false, error: 'codex_not_found', message: 'Codex CLI not found. Install with: brew install codex (or npm i -g @openai/codex)' };
+  }
+  return await new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(codexPath, ['login'], { stdio: 'ignore', detached: false });
+    } catch (e) {
+      return resolve({ ok: false, error: 'spawn_failed', message: 'Failed to spawn `codex login`: ' + e.message });
+    }
+    const timeout = setTimeout(() => {
+      try { child.kill('SIGTERM'); } catch {}
+      resolve({ ok: false, error: 'timeout', message: '`codex login` timed out after 5 minutes.' });
+    }, 5 * 60 * 1000);
+    child.on('exit', (code) => {
+      clearTimeout(timeout);
+      if (code !== 0) {
+        return resolve({ ok: false, error: 'codex_login_failed', message: '`codex login` exited with code ' + code });
+      }
+      try {
+        const p = path.join(os.homedir(), '.codex', 'auth.json');
+        if (fsSync.existsSync(p)) {
+          const raw = JSON.parse(fsSync.readFileSync(p, 'utf8'));
+          if (raw?.tokens?.access_token || raw?.OPENAI_API_KEY) {
+            return resolve({ ok: true, hasAuth: true, codexLoginRan: true });
+          }
+        }
+      } catch {}
+      resolve({ ok: false, error: 'no_auth_after_login', message: '`codex login` exited but ~/.codex/auth.json has no credentials.' });
+    });
+    child.on('error', (err) => {
+      clearTimeout(timeout);
+      resolve({ ok: false, error: 'spawn_failed', message: '`codex login` child error: ' + err.message });
     });
   });
 });

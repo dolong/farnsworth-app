@@ -241,6 +241,16 @@ contextBridge.exposeInMainWorld('farnsworth', {
   claudeCodeCheckAuth: () => ipcRenderer.invoke('claudeCode:checkAuth'),
   claudeCodeRunLogin: () => ipcRenderer.invoke('claudeCode:runLogin'),
 
+  // Codex panel (mirrors the Claude Code panel IPC surface, Jul 14).
+  // codexStatus (Settings → AI detection) already exists above; these are
+  // the panel's own lifecycle calls.
+  getCodexWsUrl: () => ipcRenderer.invoke('codex:getWsUrl'),
+  codexClose: (tabId) => ipcRenderer.invoke('codex:close', tabId),
+  codexListTabs: () => ipcRenderer.invoke('codex:listTabs'),
+  codexSaveTabs: (state) => ipcRenderer.invoke('codex:saveTabs', state),
+  codexCheckAuth: () => ipcRenderer.invoke('codex:checkAuth'),
+  codexRunLogin: () => ipcRenderer.invoke('codex:runLogin'),
+
   // Native menu bridge — the macOS menu bar sends 'menu:action' events to
   // the focused window. The renderer subscribes via onMenuAction(callback)
   // and reacts (openFolder, openFile, newWindow, etc.). Returns an

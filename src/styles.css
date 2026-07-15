@@ -522,6 +522,135 @@ button { font-family: inherit; cursor: pointer; }
 .claudecode__signin-status.is-success { color: #4ade80; }
 .claudecode__signin-status.is-error { color: #f87171; }
 
+/* Codex panel — mirrors the Claude Code panel for OpenAI's `codex` CLI.
+   Same structure (tabs row + host with absolute per-session panes);
+   OpenAI green (#10a37f) accent instead of Claude orange. */
+.codexpanel {
+  flex: 1; min-height: 0;
+  display: flex; flex-direction: column;
+  background: #0d0e10;
+}
+.codexpanel__tabs {
+  height: 30px; flex: 0 0 30px;
+  display: flex; align-items: center; gap: 2px;
+  padding: 0 6px;
+  border-bottom: 1px solid #1a1b1d;
+  background: #16181b;
+  overflow-x: auto;
+}
+.cxtab {
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 22px; padding: 0 6px 0 10px;
+  background: transparent; border: 1px solid transparent;
+  border-radius: 6px;
+  color: #9ca3af;
+  font-size: 11.5px; font-weight: 500;
+  font-family: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, monospace;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.cxtab:hover { color: #e5e7eb; background: rgba(255,255,255,.04); }
+.cxtab.is-active {
+  color: #e5e7eb;
+  background: #0d0e10;
+  border-color: #1f2023;
+}
+.cxtab__close {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 16px; height: 16px;
+  border-radius: 4px;
+  color: #6b7280;
+  cursor: pointer;
+  margin-left: 2px;
+}
+.cxtab__close:hover { color: #10a37f; background: rgba(16,163,127,.12); }
+.cxtab__new {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px;
+  background: transparent; border: 1px solid transparent;
+  border-radius: 6px;
+  color: #6b7280;
+  cursor: pointer;
+}
+.cxtab__new:hover { color: #e5e7eb; background: rgba(255,255,255,.04); }
+
+.codexpanel__host {
+  flex: 1; min-height: 0;
+  position: relative;
+  overflow: hidden;
+}
+.cxtab__pane {
+  position: absolute; inset: 0;
+  padding: 6px 8px;
+  overflow: hidden;
+  box-sizing: content-box; /* see .termtab__pane — FitAddon row-count fix (Jul 14) */
+}
+.cxtab__pane[hidden] { display: none !important; }
+.cxtab__pane .xterm,
+.cxtab__pane .xterm-viewport,
+.cxtab__pane .xterm-screen {
+  width: 100% !important; height: 100% !important;
+}
+/* Same belt-and-suspenders clip as .cctab__pane — codex's ratatui TUI
+   redraws full-width frames that would bleed past the pane edge when
+   cols exceed the pixel width. */
+.cxtab__pane .xterm-viewport { overflow: hidden !important; }
+.cxtab__pane .xterm-screen { overflow: hidden !important; }
+.cxtab__pane .xterm canvas { max-width: 100%; }
+
+/* Codex sign-in card — same shape as .claudecode__signin, green accent.
+   Shown when ~/.codex/auth.json is missing (or the CLI isn't installed). */
+.codexpanel__signin {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  gap: 14px;
+  padding: 32px 24px;
+  text-align: center;
+  background: #0d0e10;
+}
+.codexpanel__signin-icon {
+  width: 64px; height: 64px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 50%;
+  background: rgba(16,163,127,.10);
+  color: #10a37f;
+  margin-bottom: 4px;
+}
+.codexpanel__signin-title {
+  font-size: 16px; font-weight: 600;
+  color: #e5e7eb;
+  letter-spacing: -0.01em;
+}
+.codexpanel__signin-sub {
+  font-size: 12.5px; line-height: 1.5;
+  color: #9ca3af;
+  max-width: 360px;
+}
+.codexpanel__signin-btn {
+  margin-top: 6px;
+  min-width: 220px;
+}
+.codexpanel__signin-btn--secondary {
+  min-width: 140px;
+  font-size: 12px;
+  padding: 6px 12px;
+}
+.codexpanel__signin-btn.is-loading {
+  opacity: .6;
+  cursor: wait;
+}
+.codexpanel__signin-status {
+  font-size: 11.5px;
+  color: #6b7280;
+  min-height: 16px;
+  margin-top: 4px;
+  max-width: 380px;
+}
+.codexpanel__signin-status.is-loading { color: #10a37f; }
+.codexpanel__signin-status.is-success { color: #4ade80; }
+.codexpanel__signin-status.is-error { color: #f87171; }
+
 /* Chat history dropdown */
 .chathistory { position: relative; }
 .chathistory__panel {
