@@ -772,18 +772,30 @@ function renderMessage(m) {
     );
   }
   if (m.role === 'agent') {
-    const avatar = el('div', { class: 'msg__avatar' + (m.working ? ' msg__avatar--working' : '') });
-    avatar.innerHTML = '<svg width="15" height="15" viewBox="0 0 24 24" fill="#fff"><path d="M12 2l2.2 6.3L20.5 10l-6.3 1.7L12 18l-1.7-6.3L4 10l6.3-1.7z"/></svg>';
+    // Jul 14 ~22:55 ET (chat cleanup): avatar removed — model pill carries
+    // identity. Slim header: model (always) + status dot (hover) + copy btn (hover).
+    const head = el('div', { class: 'msg__head' });
+    // Jul 14 ~09:20 ET: was hardcoded "Opus 4.8" — chat bubbles always
+    // showed Opus even when the actual model was Fable 5 or whatever
+    // default the user picked. Each agent message stores its model on
+    // creation (see sendChatMessage ~line 9247); fall back to the
+    // current default for legacy bubbles from before this fix.
+    head.appendChild(el('span', { class: 'msg__model' }, m.model || state.settings?.defaultModel || 'Opus 4.8'));
 
-    const head = el('div', { class: 'msg__head' },
-      el('span', { class: 'msg__name' }, 'Claude'),
-      // Jul 14 ~09:20 ET: was hardcoded "Opus 4.8" — chat bubbles always
-      // showed Opus even when the actual model was Fable 5 or whatever
-      // default the user picked. Each agent message stores its model on
-      // creation (see sendChatMessage ~line 9247); fall back to the
-      // current default for legacy bubbles from before this fix.
-      el('span', { class: 'msg__model' }, m.model || state.settings?.defaultModel || 'Opus 4.8'),
-    );
+    // Status dot — replaces the old "Verified against check" chip. Hover-revealed,
+    // tiny. Green = ok, red = fail. Only renders if verification info exists.
+    if (m.verified === false) {
+      const status = el('span', { class: 'msg__status' });
+      status.appendChild(el('span', { class: 'msg__status-dot msg__status-dot--fail' }));
+      status.appendChild(document.createTextNode('failed'));
+      head.appendChild(status);
+    } else if (m.verified === true) {
+      const status = el('span', { class: 'msg__status' });
+      status.appendChild(el('span', { class: 'msg__status-dot' }));
+      status.appendChild(document.createTextNode('verified'));
+      head.appendChild(status);
+    }
+
     // Copy the whole message (m.text is the preamble+response concatenation
     // kept for history compat). Hidden while streaming — partial text.
     if (!m.working && (m.text || '').trim()) {
@@ -829,78 +841,101 @@ function renderMessage(m) {
       body.appendChild(surfacesWrap);
     }
 
-    if (m.chips && m.chips.length) {
-      const chips = el('div', { class: 'msg__chips' });
-      m.chips.forEach(c => {
-        const chip = el(c.action ? 'button' : 'span', { class: 'chip chip--' + c.kind + (c.action ? ' chip--action' : '') });
-        if (c.action) chip.type = 'button';
-        // chip icon
-        const iconSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-        iconSvg.setAttribute('class', 'chip__icon');
-        iconSvg.setAttribute('viewBox', '0 0 24 24');
-        iconSvg.setAttribute('fill', 'none');
-        iconSvg.setAttribute('stroke', c.kind === 'read' ? '#3ab7f0' : c.kind === 'search' ? '#f0b232' : c.kind === 'edit' ? '#eb459e' : c.kind === 'terminal' ? '#7e6bff' : c.kind === 'settings' ? '#fbbf24' : '#3ba55c');
-        iconSvg.setAttribute('stroke-width', '2');
-        iconSvg.setAttribute('stroke-linecap', 'round');
-        iconSvg.setAttribute('stroke-linejoin', 'round');
-        if (c.kind === 'read') iconSvg.innerHTML = '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>';
-        else if (c.kind === 'search') iconSvg.innerHTML = '<circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/>';
-        else if (c.kind === 'edit') iconSvg.innerHTML = '<path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/>';
-        else if (c.kind === 'check') {
-          iconSvg.innerHTML = '<circle cx="12" cy="12" r="9" fill="none"/><path d="M21 12a9 9 0 1 1-3-6.7" stroke-width="2.4" fill="none"/>';
-        } else if (c.kind === 'terminal') {
-          iconSvg.innerHTML = '<path d="M4 17l6-6-6-6M12 19h8"/>';
-        } else if (c.kind === 'settings') {
-          // Cogwheel — matches the Farnsworth settings cog in the Live cogwheel popover
-          iconSvg.innerHTML = '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>';
-        }
-        chip.appendChild(iconSvg);
-        chip.appendChild(document.createTextNode(' ' + c.label));
-        if (c.action === 'open-ai') {
-          chip.addEventListener('click', () => {
-            try { openSettings('ai'); } catch (e) { console.warn('[chat] openSettings(ai) failed:', e); }
-          });
-        } else if (c.action === 'git-commit-run') {
-          // AI Commit confirm flow (per-call-site 'commit' row, confirm ON):
-          // the chip carries the model-written message as payload.
-          chip.addEventListener('click', () => runPendingGitCommit(m));
-        } else if (c.action === 'git-commit-cancel') {
-          chip.addEventListener('click', () => cancelPendingGitCommit(m));
-        }
-        chips.appendChild(chip);
+    // Build chip nodes per-kind: action chips + terminal chips render
+    // directly; informational chips collapse into a "X steps" pill that
+    // expands on click. The verified chip block (Jul 14 ~22:55 ET cleanup)
+    // is gone — its info moved into the head status dot.
+    function renderChipNode(c) {
+      const chip = el(c.action ? 'button' : 'span', { class: 'chip chip--' + c.kind + (c.action ? ' chip--action' : '') });
+      if (c.action) chip.type = 'button';
+      // chip icon
+      const iconSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      iconSvg.setAttribute('class', 'chip__icon');
+      iconSvg.setAttribute('viewBox', '0 0 24 24');
+      iconSvg.setAttribute('fill', 'none');
+      iconSvg.setAttribute('stroke', c.kind === 'read' ? '#3ab7f0' : c.kind === 'search' ? '#f0b232' : c.kind === 'edit' ? '#eb459e' : c.kind === 'terminal' ? '#7e6bff' : c.kind === 'settings' ? '#fbbf24' : '#3ba55c');
+      iconSvg.setAttribute('stroke-width', '2');
+      iconSvg.setAttribute('stroke-linecap', 'round');
+      iconSvg.setAttribute('stroke-linejoin', 'round');
+      if (c.kind === 'read') iconSvg.innerHTML = '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>';
+      else if (c.kind === 'search') iconSvg.innerHTML = '<circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/>';
+      else if (c.kind === 'edit') iconSvg.innerHTML = '<path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/>';
+      else if (c.kind === 'terminal') {
+        iconSvg.innerHTML = '<path d="M4 17l6-6-6-6M12 19h8"/>';
+      } else if (c.kind === 'settings') {
+        // Cogwheel — matches the Farnsworth settings cog in the Live cogwheel popover
+        iconSvg.innerHTML = '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>';
+      }
+      chip.appendChild(iconSvg);
+      chip.appendChild(document.createTextNode(' ' + c.label));
+      if (c.action === 'open-ai') {
+        chip.addEventListener('click', () => {
+          try { openSettings('ai'); } catch (e) { console.warn('[chat] openSettings(ai) failed:', e); }
+        });
+      } else if (c.action === 'git-commit-run') {
+        // AI Commit confirm flow (per-call-site 'commit' row, confirm ON):
+        // the chip carries the model-written message as payload.
+        chip.addEventListener('click', () => runPendingGitCommit(m));
+      } else if (c.action === 'git-commit-cancel') {
+        chip.addEventListener('click', () => cancelPendingGitCommit(m));
+      }
 
-        // For terminal chips, append a body with the run output
-        if (c.kind === 'terminal' && m.runOutputs && m.runOutputs[c.runIndex]) {
-          const run = m.runOutputs[c.runIndex];
-          const body = el('div', { class: 'chip__term-body' });
-          const cmd = el('div', { class: 'chip__term-cmd' });
-          cmd.textContent = '$ ' + (run.command || '');
-          body.appendChild(cmd);
-          if (run.stdout) {
-            const out = el('div', {});
-            out.textContent = run.stdout;
-            body.appendChild(out);
-          }
-          if (run.stderr) {
-            const errDiv = el('div', { class: 'chip__term-stderr' });
-            errDiv.textContent = run.stderr;
-            body.appendChild(errDiv);
-          }
-          const meta = el('div', { class: 'chip__term-meta' });
-          meta.textContent = 'exit ' + (run.exitCode ?? '?');
-          body.appendChild(meta);
-          // Replace the inner span with a div so the body can be a block element
-          chip.style.display = 'block';
-          chip.appendChild(body);
+      // For terminal chips, append a body with the run output
+      if (c.kind === 'terminal' && m.runOutputs && m.runOutputs[c.runIndex]) {
+        const run = m.runOutputs[c.runIndex];
+        const body = el('div', { class: 'chip__term-body' });
+        const cmd = el('div', { class: 'chip__term-cmd' });
+        cmd.textContent = '$ ' + (run.command || '');
+        body.appendChild(cmd);
+        if (run.stdout) {
+          const out = el('div', {});
+          out.textContent = run.stdout;
+          body.appendChild(out);
         }
-      });
-      body.appendChild(chips);
+        if (run.stderr) {
+          const errDiv = el('div', { class: 'chip__term-stderr' });
+          errDiv.textContent = run.stderr;
+          body.appendChild(errDiv);
+        }
+        const meta = el('div', { class: 'chip__term-meta' });
+        meta.textContent = 'exit ' + (run.exitCode ?? '?');
+        body.appendChild(meta);
+        // Replace the inner span with a div so the body can be a block element
+        chip.style.display = 'block';
+        chip.appendChild(body);
+      }
+      return chip;
     }
 
-    if (m.verified) {
-      const check = el('div', { class: 'chip chip--check' });
-      check.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg><span>Verified against check — all confirmed working.</span>';
-      body.appendChild(check);
+    if (m.chips && m.chips.length) {
+      // 1. Action chips (open-ai, git-commit-*, etc.) — always render directly.
+      const actionChips = m.chips.filter(c => c.action);
+      for (const c of actionChips) body.appendChild(renderChipNode(c));
+
+      // 2. Terminal chips — always render directly (special block display).
+      const terminalChips = m.chips.filter(c => !c.action && c.kind === 'terminal');
+      for (const c of terminalChips) body.appendChild(renderChipNode(c));
+
+      // 3. Informational chips — collapse if >1, render single if ==1.
+      const infoChips = m.chips.filter(c => !c.action && c.kind !== 'terminal');
+      if (infoChips.length === 1) {
+        body.appendChild(renderChipNode(infoChips[0]));
+      } else if (infoChips.length > 1) {
+        const pill = el('button', { class: 'msg__steps-pill', type: 'button' });
+        pill.innerHTML = '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg><span>' + infoChips.length + ' steps</span>';
+        pill.title = 'Show tool calls';
+
+        const wrap = el('div', { class: 'msg__chips-wrap' });
+        for (const c of infoChips) wrap.appendChild(renderChipNode(c));
+
+        pill.addEventListener('click', () => {
+          const open = wrap.classList.toggle('msg__chips-wrap--open');
+          pill.classList.toggle('msg__steps-pill--open', open);
+        });
+
+        body.appendChild(pill);
+        body.appendChild(wrap);
+      }
     }
 
     // Jul 13 ~18:50 ET: render the response text (text after all tool_uses
@@ -915,7 +950,7 @@ function renderMessage(m) {
       body.appendChild(response);
     }
 
-    return el('div', { class: 'msg' }, avatar, body);
+    return el('div', { class: 'msg' }, body);
   }
   return null;
 }

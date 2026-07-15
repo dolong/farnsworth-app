@@ -751,50 +751,69 @@ button { font-family: inherit; cursor: pointer; }
 
 .chat__thread {
   flex: 1; overflow-y: auto;
-  padding: 18px 14px;
-  display: flex; flex-direction: column; gap: 20px;
+  padding: 14px 16px;
+  display: flex; flex-direction: column; gap: 14px;
   min-height: 0;
 }
 
 .msg {
-  display: flex; gap: 10px;
+  display: flex; gap: 6px;
 }
 .msg--user { justify-content: flex-end; }
 .msg__bubble {
   max-width: 88%;
-  background: #3b3d44;
-  border: 1px solid #1f2023;
-  border-radius: 14px 14px 4px 14px;
-  padding: 9px 13px;
-  font-size: 13px; line-height: 1.5;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  padding: 0;
+  font-size: 14px; line-height: 1.6;
   color: var(--text-primary);
 }
 .msg--user .msg__bubble {
-  background: #3b3d44;
-  border: 1px solid #1f2023;
+  background: transparent;
+  border: none;
 }
-.msg__avatar {
-  flex: 0 0 28px; width: 28px; height: 28px;
-  border-radius: var(--r-lg);
-  background: linear-gradient(135deg, var(--accent-blurple), var(--accent-blue));
-  display: flex; align-items: center; justify-content: center;
-  box-shadow: 0 2px 8px rgba(88,101,242,.3);
-  color: #fff;
+.msg--user:hover .msg__bubble {
+  background: rgba(255,255,255,.03);
+  border-radius: 8px;
+  padding: 4px 10px;
 }
+/* Avatar removed in chat cleanup — model pill + status dot carry identity */
+.msg__avatar { display: none; }
 .msg__avatar svg { width: 15px; height: 15px; }
 .msg__avatar--working { animation: glow 2s infinite; }
 .msg__body { flex: 1; min-width: 0; }
+/* Slim per-message header — model pill (always) + status dot (hover) + copy btn (hover) */
 .msg__head {
-  display: flex; align-items: center; gap: 7px; margin-bottom: 5px;
+  display: flex; align-items: center; gap: 6px;
+  margin-bottom: 4px;
+  min-height: 14px;
 }
 .msg__name { font-size: 12.5px; font-weight: 700; color: var(--text-primary); }
 .msg__model {
-  font-family: var(--font-mono); font-size: 9px;
+  font-family: var(--font-mono); font-size: 10px;
   color: var(--text-muted);
-  background: #1f2023;
-  border-radius: 4px; padding: 1px 5px;
+  background: transparent;
+  padding: 0;
+  letter-spacing: 0.2px;
 }
-.msg__text { font-size: 13px; line-height: 1.55; color: #c8ccd2; }
+/* Status dot — replaces the old "Verified against check" chip. Hover-reveal,
+   tiny, doesn't take vertical space when hidden. Green = ok, red = failed. */
+.msg__status {
+  margin-left: auto;
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 10px; color: var(--text-muted);
+  opacity: 0; transition: opacity .12s ease;
+}
+.msg:hover .msg__status { opacity: 1; }
+.msg__status-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--accent-green);
+  display: inline-block;
+}
+.msg__status-dot--fail { background: var(--accent-red); }
+.msg__status-dot--warn { background: #f0883e; }
+.msg__text { font-size: 14px; line-height: 1.6; color: #c8ccd2; }
 /* Jul 13 ~22:40 ET: chat text is selectable + per-message copy buttons.
    body has user-select: none (app chrome default), which silently blocked
    drag-select and Cmd+C in chat. Message content opts back in; Cmd+C works
@@ -834,23 +853,19 @@ pre:hover .code-copy { opacity: 1; }
    as formatted markdown at the bottom. white-space: pre-wrap preserves
    newlines — the prior plain text rendering collapsed them. */
 .msg__text--thinking {
-  font-size: 12px;
+  font-size: 12.5px;
   font-style: italic;
-  line-height: 1.5;
-  color: #80848e;
-  background: #16171a;
-  border-left: 2px solid #404552;
-  border-radius: 4px;
-  padding: 6px 10px;
-  margin-bottom: 8px;
+  line-height: 1.55;
+  color: #6d7178;
+  margin-bottom: 6px;
   white-space: pre-wrap;
   word-wrap: break-word;
 }
 .msg__text--response {
-  font-size: 13px;
-  line-height: 1.55;
+  font-size: 14px;
+  line-height: 1.6;
   color: #c8ccd2;
-  margin-top: 9px;
+  margin-top: 6px;
   white-space: pre-wrap;
   word-wrap: break-word;
 }
@@ -858,7 +873,7 @@ pre:hover .code-copy { opacity: 1; }
 .msg__text--response code,
 .msg__text--thinking code {
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 12.5px;
   color: #c8ccd2;
   background: #1f2023;
   border-radius: 4px;
@@ -868,12 +883,12 @@ pre:hover .code-copy { opacity: 1; }
 .msg__text--response em { font-style: italic; }
 .msg__text--response pre {
   font-family: var(--font-mono);
-  font-size: 12px;
-  background: #16171a;
-  border: 1px solid #2d2f33;
+  font-size: 12.5px;
+  background: #0d0e10;
+  border: none;
   border-radius: 6px;
-  padding: 8px 10px;
-  margin: 6px 0;
+  padding: 12px;
+  margin: 8px 0;
   overflow-x: auto;
   white-space: pre;
 }
@@ -902,6 +917,30 @@ pre:hover .code-copy { opacity: 1; }
 .msg__text--response h2 { font-size: 15px; }
 .msg__text--response h3 { font-size: 14px; }
 .msg__chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
+.msg__chips-wrap {
+  display: none;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+.msg__chips-wrap--open { display: flex; }
+/* "X steps" pill — collapsed-by-default affordance for informational chips.
+   Replaces always-visible chip rows with a Vellum-style steps pill that
+   expands on click to reveal the individual tool chips. */
+.msg__steps-pill {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-family: var(--font-mono); font-size: 10.5px;
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px solid #2d2f33;
+  border-radius: 6px; padding: 3px 8px;
+  margin-top: 8px;
+  cursor: pointer;
+  transition: background .12s ease, color .12s ease;
+}
+.msg__steps-pill:hover { background: rgba(255,255,255,.04); color: #c8ccd2; }
+.msg__steps-pill svg { transition: transform .12s ease; }
+.msg__steps-pill--open svg { transform: rotate(90deg); }
 .chip {
   display: inline-flex; align-items: center; gap: 5px;
   font-family: var(--font-mono); font-size: 10.5px;
