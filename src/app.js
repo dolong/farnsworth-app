@@ -851,13 +851,13 @@ function openTerminalModal(run) {
 
 function renderMessage(m) {
   if (m.role === 'user') {
-    const row = el('div', { class: 'msg msg--user' });
+    const row = el('div', { class: 'msg msg--user', dataset: { msgId: m.id } });
     if ((m.text || '').trim()) row.appendChild(makeMsgCopyBtn(() => m.text, 'msg__copy msg__copy--user'));
     row.appendChild(el('div', { class: 'msg__bubble' }, m.text));
     return row;
   }
   if (m.role === 'context') {
-    return el('div', { class: 'context-card' },
+    return el('div', { class: 'context-card', dataset: { msgId: m.id } },
       el('div', { class: 'context-card__head' },
         el('span', { class: 'context-card__type' }, 'SECTION'),
         el('span', { class: 'context-card__title' }, m.title),
@@ -1082,12 +1082,72 @@ function renderMessage(m) {
       const response = el('div', { class: 'msg__text msg__text--response' });
       response.innerHTML = renderText(m.responseText);
       attachCodeCopyButtons(response);
+      // Trigger word-by-word reveal for the final verdict (set on the message
+      // by sendChatMessage's success path). Skip short text, errors, and
+      // reduced-motion users. Idempotent via __verdictAnimated.
+      if (m.animatingVerdict && !m.__verdictAnimated && !m.error) {
+        m.__verdictAnimated = true;
+        requestAnimationFrame(() => animateFinalVerdict(m.id, m.responseText));
+      }
       body.appendChild(response);
     }
 
-    return el('div', { class: 'msg' }, body);
+    return el('div', { class: 'msg', dataset: { msgId: m.id } }, body);
   }
   return null;
+}
+
+// Word-by-word reveal for the final verdict of an agent turn. Splits the
+// rendered response text into word spans and fades them in sequentially
+// (400-1500ms total). Called from renderMessage when the message just
+// became finalized (animatingVerdict flag set on the success path of
+// sendChatMessage). Bails on short text, errors, reduced-motion, and DOM
+// wipes from re-renders.
+function animateFinalVerdict(msgId, fullText) {
+  if (!fullText || fullText.length < 20) return;
+  if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+
+  requestAnimationFrame(() => {
+    const textEl = document.querySelector('.msg[data-msg-id="' + msgId + '"] .msg__text--response');
+    if (!textEl || textEl.dataset.verdictAnimated === '1') return;
+    textEl.dataset.verdictAnimated = '1';
+
+    // Tokenize into words + trailing whitespace runs so spacing is preserved.
+    const parts = fullText.match(/\S+\s*|\s+/g) || [fullText];
+    textEl.innerHTML = '';
+    const spans = [];
+    for (const part of parts) {
+      const span = document.createElement('span');
+      span.className = 'verdict-word';
+      span.textContent = part;
+      textEl.appendChild(span);
+      spans.push(span);
+    }
+    textEl.dataset.verdictAnimating = '1';
+
+    // Total reveal window: 400ms floor, 1500ms cap, scaled by word count.
+    const totalMs = Math.min(1500, Math.max(400, parts.length * 25));
+    const perPart = Math.max(8, Math.floor(totalMs / parts.length));
+
+    let i = 0;
+    let cancelled = false;
+    const step = () => {
+      if (cancelled) return;
+      // Bail if the DOM got wiped by a re-render (text changed or message removed)
+      if (!textEl.isConnected || textEl.dataset.verdictAnimated !== '1') {
+        cancelled = true;
+        return;
+      }
+      if (i >= spans.length) {
+        delete textEl.dataset.verdictAnimating;
+        return;
+      }
+      spans[i].style.opacity = '1';
+      i++;
+      setTimeout(step, perPart);
+    };
+    step();
+  });
 }
 
 // ============================================================================
@@ -9929,6 +9989,7 @@ async function sendChatMessage() {
           working: false,
           text: res.text || '(empty response)',
           verified: true,
+          animatingVerdict: true,
           chips: [...(agentMsg.chips || []), ...(usageChip ? [usageChip] : [])],
         });
         // Final response (no tool use) - send chat:done here too so companion

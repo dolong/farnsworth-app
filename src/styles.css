@@ -814,6 +814,20 @@ button { font-family: inherit; cursor: pointer; }
 .msg__status-dot--fail { background: var(--accent-red); }
 .msg__status-dot--warn { background: #f0883e; }
 .msg__text { font-size: 14px; line-height: 1.6; color: #c8ccd2; }
+
+/* Word-by-word reveal for the final verdict. Each word is a span with
+   opacity:0; animateFinalVerdict() flips opacity:1 in sequence (400-1500ms
+   total). The blinking cursor rides on the container during the reveal. */
+.verdict-word { opacity: 0; transition: opacity 60ms ease-out; display: inline; }
+.msg__text--response[data-verdict-animating]::after {
+  content: '\258D'; /* right-half-block caret */
+  display: inline-block;
+  margin-left: 1px;
+  animation: verdict-cursor 0.8s steps(2) infinite;
+  color: #c8ccd2;
+  vertical-align: baseline;
+}
+@keyframes verdict-cursor { 0%, 50% { opacity: 1; } 50.01%, 100% { opacity: 0; } }
 /* Jul 13 ~22:40 ET: chat text is selectable + per-message copy buttons.
    body has user-select: none (app chrome default), which silently blocked
    drag-select and Cmd+C in chat. Message content opts back in; Cmd+C works
