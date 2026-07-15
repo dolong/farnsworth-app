@@ -1112,12 +1112,14 @@ function renderMessage(m) {
 }
 
 // Word-by-word reveal for the final verdict of an agent turn. Walks the
-// EXISTING rendered HTML (paragraphs, lists, etc. stay intact), wraps
-// each word in a span with display:none (no layout reserved), then
-// reveals them sequentially by switching to display:inline so the
-// container grows naturally as text appears. The chat auto-scrolls to
-// keep the latest word in view. Bails on short text, errors,
-// reduced-motion, and DOM wipes from re-renders.
+// EXISTING rendered HTML (paragraphs, lists, etc. stay intact) and
+// reveals content sequentially: prose words get hidden spans that flip
+// to display:inline one at a time, while each <li> is treated as a
+// SINGLE unit so its CSS-generated number marker reveals together with
+// its content (otherwise the "1. 2. 3." numbers appear on their own
+// lines before the typewriter starts). Container grows naturally as
+// units appear. Bails on short text, errors, reduced-motion, and DOM
+// wipes from re-renders.
 function animateFinalVerdict(msgId) {
   if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
 
@@ -1127,10 +1129,12 @@ function animateFinalVerdict(msgId) {
     if (textEl.textContent.trim().length < 20) return;
     textEl.dataset.verdictAnimated = '1';
 
-    // Walk the existing rendered HTML and wrap words in spans.
-    // PRESERVE block elements (p/ul/ol/h/pre) — only the text nodes get
-    // animated. Skip <pre> (code blocks) so they appear instantly.
-    const wordSpans = [];
+    // Walk the rendered HTML and collect animation units in document order.
+    // - Inside text nodes NOT in <li>: each \S+ token becomes a word span
+    // - Each <li>: the whole element is a unit (number marker + content
+    //   reveal together — fixes the "1. 2. 3. appear before text" bug)
+    // - <pre> blocks: skipped entirely (code blocks appear instantly)
+    const units = []; // [{type: 'word'|'li', el}]
     const SKIP_TAGS = new Set(['PRE']);
     function wrapText(node) {
       if (node.nodeType === Node.TEXT_NODE) {
@@ -1147,35 +1151,42 @@ function animateFinalVerdict(msgId) {
           // Pure-whitespace tokens stay visible so spacing is preserved.
           if (/\S/.test(part)) {
             span.style.display = 'none';
-            wordSpans.push(span);
+            units.push({type: 'word', el: span});
           }
           frag.appendChild(span);
         }
         if (node.parentNode) node.parentNode.replaceChild(frag, node);
       } else if (node.nodeType === Node.ELEMENT_NODE) {
         if (SKIP_TAGS.has(node.tagName)) return;
-        // Snapshot children — wrapText may replace the original node.
+        if (node.tagName === 'LI') {
+          // Treat the entire <li> as one unit — hide it; reveal it whole.
+          node.style.display = 'none';
+          units.push({type: 'li', el: node});
+          return; // don't recurse — children stay inside the hidden <li>
+        }
         const children = Array.from(node.childNodes);
         for (const child of children) wrapText(child);
       }
     }
     wrapText(textEl);
 
-    if (wordSpans.length === 0) return;
+    if (units.length === 0) return;
     textEl.dataset.verdictAnimating = '1';
 
-    // Total reveal window: 400ms floor, 1500ms cap, scaled by word count.
-    const totalMs = Math.min(1500, Math.max(400, wordSpans.length * 25));
-    const perPart = Math.max(8, Math.floor(totalMs / wordSpans.length));
+    // Speed: 50ms/unit (Jul 15 ~17:50 ET: half of the original 25ms/word),
+    // 800ms floor, 3000ms cap. Long asked for slower so each word lands
+    // visibly rather than rushing past.
+    const totalMs = Math.min(3000, Math.max(800, units.length * 50));
+    const perPart = Math.max(16, Math.floor(totalMs / units.length));
 
     let i = 0;
     let cancelled = false;
     let lastScrollTs = 0;
 
     function restore() {
-      // On cancel: show remaining words normally so the message reads clean.
-      for (let j = i; j < wordSpans.length; j++) {
-        wordSpans[j].style.display = '';
+      // On cancel: show remaining units normally so the message reads clean.
+      for (let j = i; j < units.length; j++) {
+        units[j].el.style.display = '';
       }
     }
 
@@ -1187,11 +1198,11 @@ function animateFinalVerdict(msgId) {
         restore();
         return;
       }
-      if (i >= wordSpans.length) {
+      if (i >= units.length) {
         delete textEl.dataset.verdictAnimating;
         return;
       }
-      wordSpans[i].style.display = '';
+      units[i].el.style.display = '';
       i++;
 
       // Throttled auto-scroll: keep the verdict message in view as it grows.
