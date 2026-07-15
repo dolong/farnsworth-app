@@ -969,6 +969,73 @@ pre:hover .code-copy { opacity: 1; }
   cursor: pointer;
 }
 .chip--terminal:hover { background: #16171a; border-color: rgba(126,107,255,.5); }
+/* Tool chip expand (Jul 15 ~00:45 ET) — Vellum-style click-to-reveal for
+   captured input + output. Chip stays compact; clicking expands an inline
+   block below showing full input + truncated output with a "Show full
+   output" toggle for long results. Each expandable chip is wrapped in
+   .chip-wrap (column-flex: chip on top, expand below) so the expand stays
+   paired with its specific chip rather than spanning all chips in the row. */
+.chip--expandable { cursor: pointer; }
+.chip--expandable:hover { background: #16171a; }
+.chip--expanded { background: #16171a; border-color: rgba(235,69,158,.35); }
+.chip-wrap {
+  display: flex; flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  min-width: 0;
+}
+.chip__expand {
+  display: none;
+  padding: 10px 12px;
+  background: #16171a;
+  border: 1px solid #2a2c31;
+  border-radius: 6px;
+  font-family: var(--font-mono);
+  color: #c8ccd2;
+  max-width: 100%;
+  width: 480px;
+  margin-left: 4px;
+  margin-top: 2px;
+}
+.chip__expand--open { display: block; }
+.chip__expand-label {
+  display: block;
+  color: var(--text-muted);
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 4px;
+  margin-top: 6px;
+}
+.chip__expand-label:first-of-type { margin-top: 0; }
+.chip__expand-pre {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  color: #d4d4d4;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 360px;
+  overflow-y: auto;
+}
+.chip__expand-pre--output { color: #c8ccd2; }
+.chip__show-full {
+  background: transparent;
+  border: 1px solid #2d2f33;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  margin-top: 8px;
+  transition: background .12s ease, color .12s ease;
+}
+.chip__show-full:hover {
+  background: rgba(255,255,255,.04);
+  color: #c8ccd2;
+}
 /* Terminal output modal — Vellum-style: click chip, see command+output
    in a centered overlay. Replaces the prior inline .chip__term-body block
    that stacked full command + stdout + stderr + exit code inside the

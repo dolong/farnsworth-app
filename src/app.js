@@ -913,8 +913,15 @@ function renderMessage(m) {
     // expands on click. The verified chip block (Jul 14 ~22:55 ET cleanup)
     // is gone — its info moved into the head status dot.
     function renderChipNode(c) {
-      const chip = el(c.action ? 'button' : 'span', { class: 'chip chip--' + c.kind + (c.action ? ' chip--action' : '') });
-      if (c.action) chip.type = 'button';
+      // Tool chips with captured input + output (Jul 15 ~00:45 ET) are
+      // expandable: clicking reveals an inline block with full input +
+      // output (truncated with a toggle for long results). Vellum-style
+      // click-to-reveal. expandability requires both: output captured,
+      // not an action chip (those have their own handlers), not a
+      // terminal chip (those open the centered modal instead).
+      const expandable = c.output !== undefined && !c.action && c.kind !== 'terminal';
+      const chip = el(c.action || expandable ? 'button' : 'span', { class: 'chip chip--' + c.kind + (c.action ? ' chip--action' : '') + (expandable ? ' chip--expandable' : '') });
+      if (c.action || expandable) chip.type = 'button';
       // chip icon
       const iconSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
       iconSvg.setAttribute('class', 'chip__icon');
@@ -954,6 +961,56 @@ function renderMessage(m) {
         const run = m.runOutputs[c.runIndex];
         chip.classList.add('chip--terminal-clickable');
         chip.addEventListener('click', () => openTerminalModal(run));
+      }
+
+      // Tool chips with captured input + output (Jul 15 ~00:45 ET) get an
+      // inline expand block below the chip. Vellum-style click-to-reveal:
+      // chip stays compact by default; click expands to show full input +
+      // output (truncated with "Show full output" toggle for long results).
+      if (expandable) {
+        const expand = el('div', { class: 'chip__expand' });
+        expand.appendChild(el('span', { class: 'chip__expand-label' }, 'INPUT'));
+        const inputPre = el('pre', { class: 'chip__expand-pre' });
+        try { inputPre.textContent = JSON.stringify(c.input, null, 2); }
+        catch (e) { inputPre.textContent = String(c.input); }
+        expand.appendChild(inputPre);
+
+        const outputStr = String(c.output == null ? '' : c.output);
+        const TRUNCATE_AT = 500;
+        const isLong = outputStr.length > TRUNCATE_AT;
+        expand.appendChild(el('span', { class: 'chip__expand-label' }, 'OUTPUT'));
+        const outputPre = el('pre', { class: 'chip__expand-pre chip__expand-pre--output' + (isLong ? ' chip__expand-pre--truncated' : '') });
+        outputPre.textContent = isLong ? outputStr.slice(0, TRUNCATE_AT) + '\n...' : outputStr;
+        expand.appendChild(outputPre);
+
+        let showFullBtn = null;
+        if (isLong) {
+          showFullBtn = el('button', { class: 'chip__show-full', type: 'button' }, 'Show full output');
+          showFullBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const truncated = outputPre.classList.toggle('chip__expand-pre--truncated');
+            if (truncated) {
+              outputPre.textContent = outputStr.slice(0, TRUNCATE_AT) + '\n...';
+              showFullBtn.textContent = 'Show full output';
+            } else {
+              outputPre.textContent = outputStr;
+              showFullBtn.textContent = 'Show less';
+            }
+          });
+          expand.appendChild(showFullBtn);
+        }
+
+        chip.addEventListener('click', (e) => {
+          // Ignore clicks on the show-full toggle (already handled above).
+          if (e.target && e.target.classList && e.target.classList.contains('chip__show-full')) return;
+          const open = expand.classList.toggle('chip__expand--open');
+          chip.classList.toggle('chip--expanded', open);
+        });
+
+        const wrap = el('div', { class: 'chip-wrap' });
+        wrap.appendChild(chip);
+        wrap.appendChild(expand);
+        return wrap;
       }
       return chip;
     }
@@ -9775,10 +9832,11 @@ async function sendChatMessage() {
           continue;
         }
         const preview = JSON.stringify(tu.input).slice(0, 60);
+        const newChip = { label: `${tu.name}(${preview})`, kind: 'edit', name: tu.name, input: tu.input };
         updateAgentMsg({
           working: true,
           workingLabel: `Running ${tu.name}…`,
-          chips: [...(agentMsg.chips || []), { label: `${tu.name}(${preview})`, kind: 'edit' }],
+          chips: [...(agentMsg.chips || []), newChip],
         });
         const toolRes = await window.farnsworth.executeTool(tu.name, tu.input);
         let resultContent;
@@ -9815,6 +9873,15 @@ async function sendChatMessage() {
           resultContent = toolRes.result || 'No memory matches.';
         } else {
           resultContent = toolRes.message || 'OK';
+        }
+        // Capture output on the chip so renderMessage can show it on expand
+        // (Vellum-style: chip is collapsed by default; click reveals input + output).
+        // agentMsg was reassigned by updateAgentMsg above, so agentMsg.chips is
+        // the latest array. Patch the last chip with its output.
+        const lastChips = (agentMsg.chips || []).slice();
+        if (lastChips.length) {
+          lastChips[lastChips.length - 1] = { ...lastChips[lastChips.length - 1], output: resultContent };
+          updateAgentMsg({ chips: lastChips });
         }
         toolResultBlocks.push({
           type: 'tool_result',
