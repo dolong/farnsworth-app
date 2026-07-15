@@ -596,6 +596,9 @@ async function refreshChatHistoryList() {
     state.chatHistory = [];
   }
   renderChatHistoryList();
+  // Keep companion conversation lists fresh (titles regenerate after first
+  // exchange; saves bump updated_at). Small payload — id/title/time only.
+  try { sendConversationListToCompanions(); } catch {}
 }
 
 function renderChatHistoryList() {
@@ -668,6 +671,8 @@ async function startNewConversation() {
   toggleChatHistory(false);
   // Jul 6 ~09:00 ET — refresh the chat header so the new conv title appears.
   updateWindowTitle();
+  // Companions mirror the active conversation — push the fresh one. (Jul 15 2026)
+  sendChatHistorySnapshot();
   const input = $('#chat-input');
   if (input) input.focus();
 }
@@ -691,6 +696,8 @@ async function switchConversation(id) {
   toggleChatHistory(false);
   // Jul 6 ~09:00 ET — refresh the chat header subline so the new conv title appears.
   updateWindowTitle();
+  // Companions mirror the active conversation — push the new one. (Jul 15 2026)
+  sendChatHistorySnapshot();
 }
 
 async function deleteConversation(id) {
@@ -1781,6 +1788,68 @@ function sendChatEventToCompanions(eventType, payload) {
   }
 }
 
+// When a companion-originated chat message triggers the agent, this holds the
+// companion's client message id so chat:start can echo it back (the companion
+// uses it to dedupe its own optimistic user-message copy). Set by wireRelay's
+// 'chat' handler immediately before calling sendChatMessage(). (Jul 15 2026)
+let pendingCompanionChatId = null;
+
+// --- Companion history sync (Jul 15 2026) -----------------------------------
+// The companion mirrors whatever conversation the desktop is viewing (one
+// active conversation, Vellum Mobile model). These helpers push snapshots:
+//   chat:history  — full normalized message list for the active conversation
+//   history:list  — the conversation list (id/title/updatedAt/active)
+// Companions request via chat:history:request / history:subscribe; local
+// switches broadcast unprompted from switchConversation/startNewConversation.
+
+// Normalize a renderer chat message into the small shape companions render.
+// Strips working placeholders, context cards, and chip input/output payloads
+// (expandable-chip data can carry entire file contents — too heavy for the
+// wire, and the companion doesn't render chip expansion).
+function companionMessageView(m) {
+  if (!m || m.working) return null;
+  if (m.role === 'user') return m.text ? { role: 'user', text: m.text } : null;
+  if (m.role === 'agent') {
+    const text = [m.preambleText, m.responseText].filter(Boolean).join('\n\n') || m.text || '';
+    if (!text) return null;
+    return {
+      role: 'assistant',
+      text,
+      model: m.model || null,
+      verified: !!m.verified,
+      error: !!m.error,
+      chips: (m.chips || []).slice(-30).map(c => ({ label: c.label, kind: c.kind })),
+    };
+  }
+  return null;
+}
+
+function sendConversationListToCompanions() {
+  const conversations = (state.chatHistory || []).slice(0, 50).map(c => ({
+    id: c.id,
+    title: c.title || 'Untitled',
+    updatedAt: c.updated_at || null,
+    active: c.id === state.chatActiveId,
+  }));
+  sendChatEventToCompanions('history:list', { conversations });
+}
+
+function sendChatHistorySnapshot() {
+  try {
+    const messages = (state.chatMessages || [])
+      .map(companionMessageView)
+      .filter(Boolean)
+      .slice(-100);
+    sendChatEventToCompanions('chat:history', {
+      title: currentConvTitle() || 'New conversation',
+      messages,
+    });
+    sendConversationListToCompanions();
+  } catch (e) {
+    console.warn('[chat-sync] snapshot failed:', e.message);
+  }
+}
+
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
@@ -1794,13 +1863,37 @@ function wireRelay() {
     const t = data.type;
     const payload = data.payload || data;
     if (t === 'chat') {
-      // Companion sent a chat message — append to active conversation
-      const text = payload.text || '';
-      if (text && state.chatActiveId && window.farnsworth.chatMessageAppend) {
-        window.farnsworth.chatMessageAppend(state.chatActiveId, {
-          role: 'user', text, ts: payload.ts || Date.now(),
-        }).then(() => refreshChatHistoryList());
+      // Companion sent a chat message — run it through the SAME path as a
+      // local composer send (memory preamble, agent tool loop, streaming
+      // broadcasts, persistence, title generation). Previously this only
+      // appended the text to the DB, so companion messages never got a
+      // reply. (Jul 15 2026, companion chat sync)
+      const text = String(payload.text || '').trim();
+      if (!text) return;
+      const busy = (state.chatMessages || []).some(m => m.working);
+      if (busy) {
+        sendChatEventToCompanions('error', {
+          message: 'Agent is busy with another message — try again in a moment.',
+        });
+        return;
       }
+      const input = $('#chat-input');
+      if (!input) return;
+      pendingCompanionChatId = payload.id || null;
+      input.value = text;
+      sendChatMessage();
+    } else if (t === 'chat:history:request' || t === 'history:subscribe' || t === 'companion:hello') {
+      // Companion connected or opened its conversation drawer — push the
+      // active conversation's messages + the conversation list.
+      sendChatHistorySnapshot();
+    } else if (t === 'chat:conversation:select') {
+      // Companion picked a conversation — desktop switches too (one active
+      // conversation, mirrored). switchConversation broadcasts the snapshot.
+      const id = payload.conversationId;
+      if (id) switchConversation(String(id));
+    } else if (t === 'chat:conversation:new') {
+      // Companion started a new chat — startNewConversation broadcasts.
+      startNewConversation();
     } else if (t === 'command') {
       // Companion ran a Farnsworth command
       const name = payload.name;
@@ -9466,6 +9559,11 @@ function handleDirectAction(action) {
 async function sendChatMessage() {
   const input = $('#chat-input');
   const text = input.value.trim();
+  // Capture + clear the companion origin id on EVERY call so a stale id from
+  // an aborted send can't leak into the next turn. Non-null only when this
+  // send was triggered by a companion 'chat' relay message. (Jul 15 2026)
+  const companionChatId = pendingCompanionChatId;
+  pendingCompanionChatId = null;
   if (!text) return;
   if (!window.farnsworth || !window.farnsworth.sendMessage) {
     state.chatMessages.push({ id: 'm' + Date.now(), role: 'agent', text: 'Inference not wired — preload missing sendMessage.', error: true });
@@ -9613,7 +9711,14 @@ async function sendChatMessage() {
 
   // Stream chat:start to companion so it can render an in-progress message bubble
   // immediately instead of waiting for the final 'chat' event at the end.
-  sendChatEventToCompanions('chat:start', { messageId: agentMsgId });
+  // userText lets the companion mirror desktop-typed messages; clientMsgId
+  // (echo of the companion's own message id) lets it skip its optimistic
+  // local copy when IT was the sender. (Jul 15 2026, companion chat sync)
+  sendChatEventToCompanions('chat:start', {
+    messageId: agentMsgId,
+    userText: text,
+    clientMsgId: companionChatId,
+  });
 
   try {
     // Tool-use loop — iterate up to 10 times (read_file → answer is the common path)

@@ -4176,26 +4176,16 @@ app.whenReady().then(async () => {
   try {
     const relayClient = getRelayClient();
     relayClient.start();
-    // Forward incoming companion chat messages to the renderer over IPC.
-    relayClient.on('chat', (msg) => {
+    // Forward ALL incoming relay messages to the renderer over IPC (wildcard).
+    // Previously this registered four specific types (chat / command /
+    // canvas:subscribe / canvas:state); the wildcard makes new protocol types
+    // (chat:history:request, chat:conversation:select, ...) renderer-only
+    // changes — no main.js edit or app restart needed per type. The renderer's
+    // wireRelay() switch ignores types it doesn't handle, so relay acks and
+    // hellos passing through are harmless. (Jul 15 2026, companion chat sync)
+    relayClient.on('*', (msg) => {
       if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('relay:message', { type: 'chat', payload: msg });
-      }
-    });
-    relayClient.on('command', (msg) => {
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('relay:message', { type: 'command', payload: msg });
-      }
-    });
-    relayClient.on('canvas:subscribe', (msg) => {
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('relay:message', { type: 'canvas:subscribe', payload: msg });
-      }
-    });
-    relayClient.on('canvas:state', (msg) => {
-      // canvas:state from companion (e.g. cursor/selection) — forward to renderer
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('relay:message', { type: 'canvas:state', payload: msg });
+        mainWindow.webContents.send('relay:message', { type: msg.type, payload: msg });
       }
     });
     relayClient.onStatus((status) => {
