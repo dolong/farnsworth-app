@@ -1087,7 +1087,7 @@ function renderMessage(m) {
       // reduced-motion users. Idempotent via __verdictAnimated.
       if (m.animatingVerdict && !m.__verdictAnimated && !m.error) {
         m.__verdictAnimated = true;
-        requestAnimationFrame(() => animateFinalVerdict(m.id, m.responseText));
+        requestAnimationFrame(() => animateFinalVerdict(m.id));
       }
       body.appendChild(response);
     }
@@ -1097,53 +1097,108 @@ function renderMessage(m) {
   return null;
 }
 
-// Word-by-word reveal for the final verdict of an agent turn. Splits the
-// rendered response text into word spans and fades them in sequentially
-// (400-1500ms total). Called from renderMessage when the message just
-// became finalized (animatingVerdict flag set on the success path of
-// sendChatMessage). Bails on short text, errors, reduced-motion, and DOM
-// wipes from re-renders.
-function animateFinalVerdict(msgId, fullText) {
-  if (!fullText || fullText.length < 20) return;
+// Word-by-word reveal for the final verdict of an agent turn. Walks the
+// EXISTING rendered HTML (paragraphs, lists, etc. stay intact), wraps
+// each word in a span with display:none (no layout reserved), then
+// reveals them sequentially by switching to display:inline so the
+// container grows naturally as text appears. The chat auto-scrolls to
+// keep the latest word in view. Bails on short text, errors,
+// reduced-motion, and DOM wipes from re-renders.
+function animateFinalVerdict(msgId) {
   if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
 
   requestAnimationFrame(() => {
     const textEl = document.querySelector('.msg[data-msg-id="' + msgId + '"] .msg__text--response');
     if (!textEl || textEl.dataset.verdictAnimated === '1') return;
+    if (textEl.textContent.trim().length < 20) return;
     textEl.dataset.verdictAnimated = '1';
 
-    // Tokenize into words + trailing whitespace runs so spacing is preserved.
-    const parts = fullText.match(/\S+\s*|\s+/g) || [fullText];
-    textEl.innerHTML = '';
-    const spans = [];
-    for (const part of parts) {
-      const span = document.createElement('span');
-      span.className = 'verdict-word';
-      span.textContent = part;
-      textEl.appendChild(span);
-      spans.push(span);
+    // Walk the existing rendered HTML and wrap words in spans.
+    // PRESERVE block elements (p/ul/ol/h/pre) — only the text nodes get
+    // animated. Skip <pre> (code blocks) so they appear instantly.
+    const wordSpans = [];
+    const SKIP_TAGS = new Set(['PRE']);
+    function wrapText(node) {
+      if (node.nodeType === Node.TEXT_NODE) {
+        const text = node.textContent;
+        if (!text.trim()) return;
+        const parts = text.match(/\S+\s*|\s+/g) || [];
+        if (!parts.length) return;
+        const frag = document.createDocumentFragment();
+        for (const part of parts) {
+          const span = document.createElement('span');
+          span.className = 'verdict-word';
+          span.textContent = part;
+          // Words start hidden (no layout reserved — container is collapsed).
+          // Pure-whitespace tokens stay visible so spacing is preserved.
+          if (/\S/.test(part)) {
+            span.style.display = 'none';
+            wordSpans.push(span);
+          }
+          frag.appendChild(span);
+        }
+        if (node.parentNode) node.parentNode.replaceChild(frag, node);
+      } else if (node.nodeType === Node.ELEMENT_NODE) {
+        if (SKIP_TAGS.has(node.tagName)) return;
+        // Snapshot children — wrapText may replace the original node.
+        const children = Array.from(node.childNodes);
+        for (const child of children) wrapText(child);
+      }
     }
+    wrapText(textEl);
+
+    if (wordSpans.length === 0) return;
     textEl.dataset.verdictAnimating = '1';
 
     // Total reveal window: 400ms floor, 1500ms cap, scaled by word count.
-    const totalMs = Math.min(1500, Math.max(400, parts.length * 25));
-    const perPart = Math.max(8, Math.floor(totalMs / parts.length));
+    const totalMs = Math.min(1500, Math.max(400, wordSpans.length * 25));
+    const perPart = Math.max(8, Math.floor(totalMs / wordSpans.length));
 
     let i = 0;
     let cancelled = false;
+    let lastScrollTs = 0;
+
+    function restore() {
+      // On cancel: show remaining words normally so the message reads clean.
+      for (let j = i; j < wordSpans.length; j++) {
+        wordSpans[j].style.display = '';
+      }
+    }
+
     const step = () => {
       if (cancelled) return;
       // Bail if the DOM got wiped by a re-render (text changed or message removed)
       if (!textEl.isConnected || textEl.dataset.verdictAnimated !== '1') {
         cancelled = true;
+        restore();
         return;
       }
-      if (i >= spans.length) {
+      if (i >= wordSpans.length) {
         delete textEl.dataset.verdictAnimating;
         return;
       }
-      spans[i].style.opacity = '1';
+      wordSpans[i].style.display = '';
       i++;
+
+      // Throttled auto-scroll: keep the verdict message in view as it grows.
+      // Skip if the user has scrolled the message off-screen — don't yank
+      // them away from whatever they're reading.
+      const now = performance.now();
+      if (now - lastScrollTs > 80) {
+        lastScrollTs = now;
+        const msgEl = textEl.closest('.msg');
+        const thread = msgEl && msgEl.closest('#chat-thread');
+        if (msgEl && thread) {
+          const msgRect = msgEl.getBoundingClientRect();
+          const threadRect = thread.getBoundingClientRect();
+          // Message is in/near the viewport — scroll thread to bottom so
+          // the growing message stays anchored.
+          if (msgRect.top < threadRect.bottom && msgRect.bottom > threadRect.top) {
+            thread.scrollTop = thread.scrollHeight;
+          }
+        }
+      }
+
       setTimeout(step, perPart);
     };
     step();

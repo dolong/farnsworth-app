@@ -815,10 +815,12 @@ button { font-family: inherit; cursor: pointer; }
 .msg__status-dot--warn { background: #f0883e; }
 .msg__text { font-size: 14px; line-height: 1.6; color: #c8ccd2; }
 
-/* Word-by-word reveal for the final verdict. Each word is a span with
-   opacity:0; animateFinalVerdict() flips opacity:1 in sequence (400-1500ms
-   total). The blinking cursor rides on the container during the reveal. */
-.verdict-word { opacity: 0; transition: opacity 60ms ease-out; display: inline; }
+/* Word-by-word reveal for the final verdict. Words start with display:none
+   so the container is collapsed; animateFinalVerdict() flips each one to
+   display:inline in sequence (400-1500ms total), making the container grow
+   naturally as text appears. The blinking caret rides on the container
+   during the reveal. */
+.verdict-word { display: inline; }
 .msg__text--response[data-verdict-animating]::after {
   content: '\258D'; /* right-half-block caret */
   display: inline-block;
