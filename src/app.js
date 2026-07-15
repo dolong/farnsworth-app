@@ -8997,10 +8997,6 @@ function wire() {
   $('#btn-new-chat').addEventListener('click', () => {
     startNewConversation();
   });
-  $('#btn-continue-here').addEventListener('click', () => {
-    // Reset to first state of fresh chat in same project
-    renderChat();
-  });
 
   // Model pickers — the dropdowns at Settings → AI (Default model + Testing
   // model). Wired via document-level delegation because renderSettings()
