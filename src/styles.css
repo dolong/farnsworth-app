@@ -858,7 +858,6 @@ pre:hover .code-copy { opacity: 1; }
   line-height: 1.55;
   color: #6d7178;
   margin-bottom: 6px;
-  white-space: pre-wrap;
   word-wrap: break-word;
 }
 .msg__text--response {
@@ -866,9 +865,18 @@ pre:hover .code-copy { opacity: 1; }
   line-height: 1.6;
   color: #c8ccd2;
   margin-top: 6px;
-  white-space: pre-wrap;
   word-wrap: break-word;
 }
+/* renderText() now emits real block elements (<p>/<ul>/<h2>/<pre>), so
+   spacing comes from margins — not from literal newlines under pre-wrap
+   (which double-counted every gap). Reset the outer edges so the block
+   sits flush inside the bubble. (Jul 15 2026) */
+.msg__text--response p { margin: 8px 0; }
+.msg__text--thinking p { margin: 4px 0; }
+.msg__text--response > *:first-child,
+.msg__text--thinking > *:first-child { margin-top: 0; }
+.msg__text--response > *:last-child,
+.msg__text--thinking > *:last-child { margin-bottom: 0; }
 /* Markdown elements rendered by renderText() inside .msg__text--response */
 .msg__text--response code,
 .msg__text--thinking code {

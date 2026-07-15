@@ -379,67 +379,87 @@ function svg(viewBox, paths) {
 // uses textContent for strings, so this function returns HTML for innerHTML.
 function renderText(text) {
   if (!text) return '';
-  // Escape HTML first so user content can't inject markup.
+  // Escape HTML first so model/user content can't inject markup.
   let s = text
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
 
-  // Process line-by-line for unordered lists. We do this BEFORE the other
-  // markdown passes because the inline patterns (bold, code, etc.) can
-  // appear inside list items and should be processed normally.
-  const lines = s.split('\n');
-  const out = [];
-  let inList = false;
-  for (const line of lines) {
-    const liMatch = line.match(/^[\-\*] (.+)$/);
-    if (liMatch) {
-      if (!inList) { out.push('<ul>'); inList = true; }
-      out.push('<li>' + liMatch[1] + '</li>');
-    } else {
-      if (inList) { out.push('</ul>'); inList = false; }
-      out.push(line);
-    }
-  }
-  if (inList) out.push('</ul>');
-  s = out.join('\n');
-
-  // Fenced code blocks (```lang\ncode\n```). Process before inline code
-  // so the block's content isn't touched by inline rules.
-  s = s.replace(/```(\w*)\n([\s\S]*?)```/g, (m, lang, code) => {
-    return '<pre><code>' + code + '</code></pre>';
+  // Pull fenced code blocks out first so their contents (and internal
+  // newlines) survive the block/inline passes untouched — restored at the end.
+  const codeBlocks = [];
+  s = s.replace(/```(\w*)\n?([\s\S]*?)```/g, (m, lang, code) => {
+    const i = codeBlocks.length;
+    codeBlocks.push('<pre><code>' + code.replace(/\n+$/, '') + '</code></pre>');
+    return `\u0000CB${i}\u0000`;
   });
 
-  // Inline code (`foo`)
-  s = s.replace(/`([^`\n]+)`/g, '<code>$1</code>');
+  // Inline passes — run across the whole string (they never touch the
+  // code-block placeholders, which contain no backticks/asterisks/brackets).
+  s = s
+    .replace(/`([^`\n]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/(?<![\w*])\*([^*\n]+)\*(?![\w*])/g, '<em>$1</em>')
+    .replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s\)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
 
-  // Bold (**text**). Non-greedy, single-line.
-  s = s.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
-
-  // Italic (*text*). Non-greedy, single-line, bounded by non-word chars
-  // so we don't match across ** boundaries (already consumed by bold).
-  s = s.replace(/(?<![\w*])\*([^*\n]+)\*(?![\w*])/g, '<em>$1</em>');
-
-  // Headers (## h2, ### h3). Process line-by-line again because the
-  // heading regex anchors on the start of a line.
-  const headingLines = s.split('\n');
-  for (let i = 0; i < headingLines.length; i++) {
-    const h = headingLines[i].match(/^(#{1,3}) (.+)$/);
-    if (h) {
-      const level = h[1].length;
-      const tag = 'h' + level;
-      headingLines[i] = '<' + tag + '>' + h[2] + '</' + tag + '>';
+  // Block structure (Jul 15 2026). Split on blank lines into blocks, then walk
+  // each block's lines grouping headings / list items / paragraph runs into
+  // real block elements. This replaces the old approach that relied on the
+  // parent's `white-space: pre-wrap` to show newlines — which double-counted
+  // every gap (literal blank line PLUS the block's own margin) and left stray
+  // newline text-nodes rendered as empty slivers between <ul>/<li>. Now the
+  // container uses white-space: normal and spacing comes only from margins.
+  const html = s.split(/\n{2,}/).map(block => {
+    if (!block.trim()) return '';
+    // A block that is exactly a fenced-code placeholder renders as-is.
+    if (/^\u0000CB\d+\u0000$/.test(block.trim())) return block.trim();
+    const parts = [];
+    let para = [];
+    let list = null; // { ordered: bool, items: [] }
+    const flushPara = () => {
+      if (para.length) { parts.push('<p>' + para.join('<br>') + '</p>'); para = []; }
+    };
+    const flushList = () => {
+      if (list && list.items.length) {
+        if (list.ordered) {
+          // Preserve the source number so "loose" lists (items separated by
+          // blank lines → separate blocks) still count up instead of every
+          // block restarting at 1. (Jul 15 2026)
+          const start = list.start > 1 ? ` start="${list.start}"` : '';
+          parts.push('<ol' + start + '>' + list.items.map(li => '<li>' + li + '</li>').join('') + '</ol>');
+        } else {
+          parts.push('<ul>' + list.items.map(li => '<li>' + li + '</li>').join('') + '</ul>');
+        }
+      }
+      list = null;
+    };
+    for (const line of block.split('\n')) {
+      const hm = line.match(/^(#{1,3}) (.+)$/);
+      const ulm = line.match(/^[\-\*] +(.+)$/);
+      const olm = line.match(/^(\d+)\. +(.+)$/);
+      if (hm) {
+        flushPara(); flushList();
+        const lv = hm[1].length;
+        parts.push('<h' + lv + '>' + hm[2] + '</h' + lv + '>');
+      } else if (ulm) {
+        flushPara();
+        if (!list || list.ordered) { flushList(); list = { ordered: false, items: [] }; }
+        list.items.push(ulm[1]);
+      } else if (olm) {
+        flushPara();
+        if (!list || !list.ordered) { flushList(); list = { ordered: true, items: [], start: parseInt(olm[1], 10) || 1 }; }
+        list.items.push(olm[2]);
+      } else {
+        flushList();
+        para.push(line);
+      }
     }
-  }
-  s = headingLines.join('\n');
+    flushPara(); flushList();
+    return parts.join('');
+  }).join('');
 
-  // Links ([text](url))
-  s = s.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s\)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
-
-  // Newlines are preserved by the parent's white-space: pre-wrap CSS,
-  // so we don't convert \n to <br> here. The result is a string with
-  // inline markup + raw newlines, rendered as innerHTML.
-  return s;
+  // Restore fenced code blocks.
+  return html.replace(/\u0000CB(\d+)\u0000/g, (m, i) => codeBlocks[+i]);
 }
 function fileIcon(type) {
   // returns SVG string for file-type icon
