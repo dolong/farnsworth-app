@@ -966,21 +966,103 @@ pre:hover .code-copy { opacity: 1; }
   color: #d4d4d4;
   max-width: 100%;
   overflow: hidden;
+  cursor: pointer;
 }
-.chip--terminal .chip__term-body {
-  margin-top: 6px;
-  padding: 8px 10px;
-  background: #16171a;
-  border-radius: 5px;
-  font-size: 11px;
+.chip--terminal:hover { background: #16171a; border-color: rgba(126,107,255,.5); }
+/* Terminal output modal — Vellum-style: click chip, see command+output
+   in a centered overlay. Replaces the prior inline .chip__term-body block
+   that stacked full command + stdout + stderr + exit code inside the
+   chat thread itself. */
+.terminal-modal {
+  position: fixed; inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  z-index: 9999;
+  display: flex; align-items: center; justify-content: center;
+  animation: cp-fade 120ms ease-out;
+}
+.terminal-modal__panel {
+  width: min(720px, 92vw);
+  max-height: 80vh;
+  background: #1a1b1f;
+  border: 1px solid #2a2c31;
+  border-radius: 12px;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.04);
+  display: flex; flex-direction: column;
+  overflow: hidden;
+  font-family: var(--font-mono);
+}
+.terminal-modal__head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 14px;
+  border-bottom: 1px solid #2a2c31;
+  background: #0d0e10;
+}
+.terminal-modal__title {
+  flex: 1;
+  font-size: 12px;
+  color: #c8ccd2;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.terminal-modal__title-cmd { color: #7e6bff; margin-right: 6px; }
+.terminal-modal__close {
+  background: transparent; border: none;
+  color: #6d7178;
+  font-size: 18px; cursor: pointer;
+  padding: 0; width: 24px; height: 24px;
+  border-radius: 4px;
+  display: inline-flex; align-items: center; justify-content: center;
+  transition: color .12s ease, background .12s ease;
+}
+.terminal-modal__close:hover { color: #e8eaed; background: rgba(255,255,255,.08); }
+.terminal-modal__body {
+  flex: 1; overflow: auto;
+  padding: 14px 16px;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: #c8ccd2;
+}
+.terminal-modal__cmd {
+  color: #7e6bff;
+  font-weight: 600;
+  margin-bottom: 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid #2a2c31;
   white-space: pre-wrap;
   word-break: break-word;
-  max-height: 180px;
-  overflow-y: auto;
 }
-.chip--terminal .chip__term-cmd { color: #7e6bff; font-weight: 600; }
-.chip--terminal .chip__term-stderr { color: #f0883e; }
-.chip--terminal .chip__term-meta { font-size: 10px; color: #6d7178; margin-top: 4px; }
+.terminal-modal__stdout {
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin-bottom: 12px;
+}
+.terminal-modal__stderr {
+  color: #f0883e;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin-bottom: 12px;
+}
+.terminal-modal__meta {
+  font-size: 10.5px;
+  color: #6d7178;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid #2a2c31;
+  font-family: var(--font-sans, sans-serif);
+}
+.terminal-modal__meta-exit { color: #c8ccd2; font-weight: 600; }
+.terminal-modal__meta-exit--fail { color: #f23f43; }
+.terminal-modal__empty {
+  color: #6d7178;
+  font-style: italic;
+  font-family: var(--font-sans, sans-serif);
+  text-align: center;
+  padding: 24px 0;
+}
 .msg__working {
   display: flex; align-items: center; gap: 9px;
   margin-bottom: 9px; font-size: 13px; color: #c8ccd2;

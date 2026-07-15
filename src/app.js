@@ -755,6 +755,73 @@ function attachCodeCopyButtons(container) {
   });
 }
 
+// ============================================================================
+// TERMINAL OUTPUT MODAL — Jul 15 ~00:14 ET
+// Click a terminal chip in chat → opens a centered overlay showing the
+// command, stdout, stderr, and exit code. Replaces the prior inline body
+// block that stacked output directly in the chat thread. Vellum pattern.
+// ============================================================================
+function openTerminalModal(run) {
+  // Replace any existing modal (only one at a time)
+  const existing = document.querySelector('.terminal-modal');
+  if (existing) existing.remove();
+
+  const modal = el('div', { class: 'terminal-modal' });
+  const panel = el('div', { class: 'terminal-modal__panel' });
+
+  // Header: title + close button
+  const head = el('div', { class: 'terminal-modal__head' });
+  const title = el('div', { class: 'terminal-modal__title' });
+  title.appendChild(el('span', { class: 'terminal-modal__title-cmd' }, '$'));
+  title.appendChild(document.createTextNode(' ' + (run.command || '')));
+  head.appendChild(title);
+  const close = el('button', { class: 'terminal-modal__close', type: 'button' });
+  close.textContent = '×';
+  close.title = 'Close (Esc)';
+  close.addEventListener('click', () => closeModal());
+  head.appendChild(close);
+  panel.appendChild(head);
+
+  // Body: command + stdout + stderr + meta
+  const body = el('div', { class: 'terminal-modal__body' });
+  body.appendChild(el('div', { class: 'terminal-modal__cmd' }, '$ ' + (run.command || '')));
+
+  const hasStdout = run.stdout && run.stdout.trim();
+  const hasStderr = run.stderr && run.stderr.trim();
+  if (!hasStdout && !hasStderr) {
+    body.appendChild(el('div', { class: 'terminal-modal__empty' }, '(no output)'));
+  } else {
+    if (hasStdout) {
+      body.appendChild(el('div', { class: 'terminal-modal__stdout' }, run.stdout));
+    }
+    if (hasStderr) {
+      body.appendChild(el('div', { class: 'terminal-modal__stderr' }, run.stderr));
+    }
+  }
+
+  const meta = el('div', { class: 'terminal-modal__meta' });
+  const exitSpan = el('span', { class: 'terminal-modal__meta-exit' + (run.exitCode && run.exitCode !== 0 ? ' terminal-modal__meta-exit--fail' : '') }, 'exit ' + (run.exitCode ?? '?'));
+  meta.appendChild(exitSpan);
+  body.appendChild(meta);
+  panel.appendChild(body);
+  modal.appendChild(panel);
+
+  // Close handlers: click backdrop, press Esc
+  function closeModal() {
+    modal.remove();
+    document.removeEventListener('keydown', onEsc);
+  }
+  modal.addEventListener('click', (e) => {
+    if (e.target === modal) closeModal();
+  });
+  function onEsc(e) {
+    if (e.key === 'Escape') closeModal();
+  }
+  document.addEventListener('keydown', onEsc);
+
+  document.body.appendChild(modal);
+}
+
 function renderMessage(m) {
   if (m.role === 'user') {
     const row = el('div', { class: 'msg msg--user' });
@@ -880,29 +947,13 @@ function renderMessage(m) {
         chip.addEventListener('click', () => cancelPendingGitCommit(m));
       }
 
-      // For terminal chips, append a body with the run output
+      // For terminal chips, open a centered modal on click (Vellum pattern).
+      // Replaces the prior inline .chip__term-body block that stacked full
+      // command + stdout + stderr + exit code inside the chat thread itself.
       if (c.kind === 'terminal' && m.runOutputs && m.runOutputs[c.runIndex]) {
         const run = m.runOutputs[c.runIndex];
-        const body = el('div', { class: 'chip__term-body' });
-        const cmd = el('div', { class: 'chip__term-cmd' });
-        cmd.textContent = '$ ' + (run.command || '');
-        body.appendChild(cmd);
-        if (run.stdout) {
-          const out = el('div', {});
-          out.textContent = run.stdout;
-          body.appendChild(out);
-        }
-        if (run.stderr) {
-          const errDiv = el('div', { class: 'chip__term-stderr' });
-          errDiv.textContent = run.stderr;
-          body.appendChild(errDiv);
-        }
-        const meta = el('div', { class: 'chip__term-meta' });
-        meta.textContent = 'exit ' + (run.exitCode ?? '?');
-        body.appendChild(meta);
-        // Replace the inner span with a div so the body can be a block element
-        chip.style.display = 'block';
-        chip.appendChild(body);
+        chip.classList.add('chip--terminal-clickable');
+        chip.addEventListener('click', () => openTerminalModal(run));
       }
       return chip;
     }
@@ -9742,8 +9793,8 @@ async function sendChatMessage() {
           // Capture output for the terminal chip. Long requested that chat-agent
           // commands stay in chat -- no panel switch, no second execution in the
           // PTY. The exec() in main.js handles the actual run; its stdout/stderr
-          // is rendered inline by the chip's chip__term-body below (see renderChat
-          // ~line 630).
+          // is shown in a centered overlay when the chip is clicked
+          // (openTerminalModal). Inline body rendering was removed Jul 15.
           agentMsg.runOutputs = [...(agentMsg.runOutputs || []), {
             command: tu.input?.command,
             stdout: toolRes.stdout || '',
