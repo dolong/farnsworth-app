@@ -5,24 +5,34 @@
 
   function renderCopyBlock(surface) {
     const data = surface.data || {};
+    const text = (data.text || '').trim();
+    const label = data.label || '';
+    // Skip empty copy_blocks (Long reported an agent that emitted an empty
+    // copy_block surface, which rendered as a phantom rectangle with a Copy
+    // button and nothing in it). Nothing useful to render if both text and
+    // label are blank.
+    if (!text && !label) return null;
+
     const node = document.createElement('div');
     node.className = 'surface surface--copy-block';
     if (surface.surfaceId) node.dataset.surfaceId = surface.surfaceId;
 
-    if (data.label) {
-      const label = document.createElement('div');
-      label.className = 'copy-block__label';
-      label.textContent = data.label;
-      node.appendChild(label);
+    if (label) {
+      const labelEl = document.createElement('div');
+      labelEl.className = 'copy-block__label';
+      labelEl.textContent = label;
+      node.appendChild(labelEl);
     }
 
-    const code = document.createElement('pre');
-    code.className = 'copy-block__code';
-    const codeInner = document.createElement('code');
-    if (data.language) codeInner.className = 'language-' + data.language;
-    codeInner.textContent = data.text || '';
-    code.appendChild(codeInner);
-    node.appendChild(code);
+    if (text) {
+      const code = document.createElement('pre');
+      code.className = 'copy-block__code';
+      const codeInner = document.createElement('code');
+      if (data.language) codeInner.className = 'language-' + data.language;
+      codeInner.textContent = data.text;
+      code.appendChild(codeInner);
+      node.appendChild(code);
+    }
 
     const copyBtn = document.createElement('button');
     copyBtn.type = 'button';

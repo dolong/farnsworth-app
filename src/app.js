@@ -409,7 +409,21 @@ function renderText(text) {
   // every gap (literal blank line PLUS the block's own margin) and left stray
   // newline text-nodes rendered as empty slivers between <ul>/<li>. Now the
   // container uses white-space: normal and spacing comes only from margins.
-  const html = s.split(/\n{2,}/).map(block => {
+  //
+  // Long-form prose without `\n\n` (the agent streams text_delta chunks that
+  // don't insert blank lines between thoughts) lands here as a single block
+  // and renders as one wall of text. When that's > 300 chars and has clear
+  // sentence boundaries, split on `[.!?] <capital>` so each thought gets its
+  // own paragraph. Safe for markdown because inline passes already ran
+  // (split lands at word boundaries, never inside an open tag).
+  let rawBlocks = s.split(/\n{2,}/);
+  if (rawBlocks.length === 1 && rawBlocks[0].length > 300 && /[.!?]\s+[A-Z]/.test(rawBlocks[0])) {
+    rawBlocks = rawBlocks[0]
+      .split(/(?<=[.!?])\s+(?=[A-Z][a-z])/)
+      .map(b => b.trim())
+      .filter(Boolean);
+  }
+  const html = rawBlocks.map(block => {
     if (!block.trim()) return '';
     // A block that is exactly a fenced-code placeholder renders as-is.
     if (/^\u0000CB\d+\u0000$/.test(block.trim())) return block.trim();
