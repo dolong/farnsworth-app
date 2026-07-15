@@ -4393,6 +4393,10 @@ function startClaudeCodeServer() {
     let term = null;
     let spawned = false;
     let initialized = false;
+    // Stashed at spawn-time so the rename handler can rebuild the args
+    // (and append `--name <title>`) without re-running the JSONL exists
+    // check. Cleared on respawn.
+    const nonoBin = findNonoPath();
     const send = (obj) => {
       if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
     };
@@ -4432,6 +4436,9 @@ function startClaudeCodeServer() {
       const claudeBin = claudePath || 'claude';
       const args = [];
       let useSessionId = null;
+      // Stashed for the rename handler (Jul 14 ~10:58 ET) so we can
+      // rebuild the spawn args with `--name <title>` appended without
+      // re-running the JSONL exists check.
       // Strict UUID v4 format check (8-4-4-4-12). The `claude` CLI rejects
       // anything else with "Error: Invalid session ID. Must be a valid UUID"
       // (verified Jun 28 ~16:33 ET after my earlier ffffffff-prefix attempt).
@@ -4478,7 +4485,6 @@ function startClaudeCodeServer() {
       // longer wired into the spawn. See [[nono-farnsworth-claude]] §
       // rollback note + [[claude-code-panel]] § cwd bug.
       let spawnBin, spawnArgs;
-      const nonoBin = findNonoPath();
       if (nonoBin) {
         // Wrap claude in nono.sh for kernel-level isolation (Tier 1, Jul 5).
         // farnsworth-claude v0.7.0 (Jul 7 ~22:58 ET) adds filesystem.allow
@@ -4561,6 +4567,27 @@ function startClaudeCodeServer() {
         try { term.resize(msg.cols, msg.rows); } catch {}
       } else if (term && msg.type === 'close') {
         try { term.kill(); } catch {}
+      } else if (spawned && term && msg.type === 'rename' && typeof msg.name === 'string' && msg.name.trim()) {
+        // First-message rename (Jul 14 ~13:00 ET, simplified ~14:55 ET):
+        // send `/rename <title>` to the existing PTY instead of killing
+        // and respawning. claude Code's slash command renames the session
+        // in-place + writes custom-title to the JSONL, with no PTY churn.
+        // The earlier kill+respawn approach had two bugs verified Jul 14
+        // ~14:38 ET: (a) the new PTY spawned at hardcoded 80x24 didn't
+        // match xterm's actual width, so content wrapped narrow until the
+        // user resized the window; (b) the user's typed chars went to the
+        // old PTY which was killed before claude could process them, so
+        // the first message got lost (Enter on an empty new PTY = no-op).
+        // The renderer-side keydown handler now sends data("\r") before
+        // the rename so the typed text submits as a normal message first,
+        // then /rename runs on the now-empty prompt.
+        const newName = String(msg.name).slice(0, 80);
+        try {
+          term.write(`/rename ${newName}\r`);
+        } catch (e) {
+          send({ type: 'error', message: 'claude /rename failed: ' + e.message });
+        }
+        send({ type: 'renamed', tabId, name: newName });
       }
     });
     ws.on('close', () => {
