@@ -5113,9 +5113,17 @@ async function runShellCommand(command, opts = {}) {
   });
 }
 
-// Spawn a command under `nono wrap --profile <name> -- sh -c <command>`.
+// Spawn a command under `nono wrap --profile <name> --allow-cwd -- sh -c <command>`.
 // Captures stdout/stderr via streams + applies a 30s timeout to match
 // the plain exec() path. Returns the same shape as runShellCommand.
+//
+// --allow-cwd is load-bearing: nono v0.66's wrap otherwise resets the
+// wrapped process's cwd to '/' (it does NOT honor the spawn() cwd or the
+// profile's workdir.access setting without --allow-cwd). With cwd reset
+// to '/', any agent command using relative paths (grep ., ls, find .,
+// npm scripts, etc.) recursively walks the entire macOS filesystem,
+// easily exceeding the 30s timeout and orphaning the spawn. See
+// [[farnsworth-chat-agent]] § run_command nono-wrap cwd bug (Jul 14).
 async function runSandboxedCommand(nonoBin, profileName, command, folder) {
   const { spawn } = require('child_process');
   return await new Promise((resolve) => {
@@ -5124,7 +5132,7 @@ async function runSandboxedCommand(nonoBin, profileName, command, folder) {
     let timedOut = false;
     const child = spawn(
       nonoBin,
-      ['wrap', '--profile', profileName, '--', '/bin/sh', '-c', command],
+      ['wrap', '--profile', profileName, '--allow-cwd', '--', '/bin/sh', '-c', command],
       { cwd: folder, env: { ...process.env } }
     );
     child.stdout.on('data', d => { stdout += d.toString(); });
