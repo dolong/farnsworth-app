@@ -4530,8 +4530,15 @@ function startClaudeCodeServer() {
         // [[nono-farnsworth-claude]] § v0.7.0 + [[claude-code-panel]] §
         // isolation via nono. markWorkspaceTrusted above handles the
         // trust map; nono profile handles credential/keychain isolation.
+        // --allow-cwd is load-bearing: nono v0.66's wrap otherwise resets
+        // the wrapped process's cwd to '/' AND prompts "Share <cwd> with
+        // read+write access?" on every PTY spawn. The prompt blocks the
+        // user every time they open the Claude Code panel. With --allow-cwd
+        // (level set by profile workdir.access=readwrite), no prompt and
+        // the cwd is honored. Same fix as the chat-agent runSandboxedCommand
+        // cwd bug (Jul 14 ~21:50 ET, dab622a).
         spawnBin = nonoBin;
-        spawnArgs = ['wrap', '--profile', 'farnsworth-claude', '--', claudeBin, ...args];
+        spawnArgs = ['wrap', '--profile', 'farnsworth-claude', '--allow-cwd', '--', claudeBin, ...args];
       } else {
         // Direct spawn (no nono). Fallback if nono isn't installed.
         // Claude Code's own permission system (workspace trust,
