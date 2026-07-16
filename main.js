@@ -4260,6 +4260,116 @@ app.whenReady().then(async () => {
         companionClaudeAttachments.delete(companionId);
       }
     });
+
+    // ====================================================================
+    // Canvas screencast bridge (Jul 16) — same "Piggyback" idea as the
+    // Claude Code bridge, but for the visual canvas. The companion's
+    // Preview tab used to iframe the desktop's LOCAL dev-server URL
+    // (http://localhost:5174/?view=mobile). That's unreachable from a
+    // phone (localhost = the phone) and triggers Chrome's Local Network
+    // Access prompt on desktop (public origin reaching into localhost).
+    //
+    // Instead: the desktop screencasts the active WebContentsView by
+    // polling webContents.capturePage(), JPEG-encoding each frame, and
+    // pushing it over the relay as `canvas:frame`. Taps/scrolls flow back
+    // as `canvas:input` and are replayed via webContents.sendInputEvent().
+    // No localhost, no tunnel, no permission prompt — rides the relay the
+    // companion is already connected to, so it works on any paired device.
+    // ====================================================================
+    const companionCanvasStreams = new Map(); // companionId -> { timer, inFlight }
+    // The canvas preview has TWO render shapes (Jul 9 WebContentsView swap):
+    //   - mobile/desktop/fullscreen previews are WebContentsViews (tracked in
+    //     canvasWebContentsViews). They composite ABOVE the DOM, so they must
+    //     be captured via their OWN webContents.capturePage().
+    //   - post view is a plain DOM <iframe> in the renderer (localhost:517x
+    //     OOPIF). It is NOT in canvasWebContentsViews, so we capture the main
+    //     window cropped to the iframe rect (capturePage on the renderer DOES
+    //     include composited OOPIFs, unlike WebContentsView layers).
+    // Resolve the active capture target on every tick so switching preview
+    // mode on the desktop re-targets automatically.
+    const IFRAME_RECT_JS =
+      "(function(){var f=document.querySelector('iframe[src*=\"localhost\"]')||document.querySelector('iframe');" +
+      "if(!f)return null;var r=f.getBoundingClientRect();" +
+      "return {x:Math.max(0,Math.round(r.left)),y:Math.max(0,Math.round(r.top))," +
+      "width:Math.round(r.width),height:Math.round(r.height)};})()";
+    const getIframeRect = async () => {
+      try { const r = await mainWindow.webContents.executeJavaScript(IFRAME_RECT_JS, true); return (r && r.width > 0) ? r : null; }
+      catch { return null; }
+    };
+    const stopCanvasStream = (companionId) => {
+      const s = companionCanvasStreams.get(companionId);
+      if (s) { try { clearInterval(s.timer); } catch {} companionCanvasStreams.delete(companionId); }
+    };
+    // Capture one JPEG frame from whatever the desktop is currently showing.
+    const captureCanvasFrame = async (maxWidth, quality) => {
+      const entries = [...canvasWebContentsViews.entries()];
+      let img;
+      if (entries.length) {
+        img = await entries[entries.length - 1][1].webContents.capturePage();
+      } else {
+        const rect = await getIframeRect();
+        if (!rect) return null;
+        img = await mainWindow.webContents.capturePage(rect);
+      }
+      if (!img || img.isEmpty()) return null;
+      const sz = img.getSize();
+      if (sz.width > maxWidth) img = img.resize({ width: maxWidth });
+      const out = img.getSize();
+      return { data: img.toJPEG(quality).toString('base64'), w: out.width, h: out.height };
+    };
+    relayClient.on('canvas:screencast:start', async (msg) => {
+      const companionId = msg?.companionId || msg?.from || 'companion';
+      const fps = Math.min(Math.max(Number(msg?.fps) || 6, 1), 15);
+      const quality = Math.min(Math.max(Number(msg?.quality) || 50, 20), 90);
+      const maxWidth = Math.min(Math.max(Number(msg?.maxWidth) || 720, 240), 1280);
+      stopCanvasStream(companionId); // clean re-subscribe
+      const hasTarget = canvasWebContentsViews.size > 0 || !!(await getIframeRect());
+      relayClient.send({
+        type: 'canvas:screencast:started', companionId,
+        ok: hasTarget, reason: hasTarget ? undefined : 'no-active-view', ts: Date.now(),
+      });
+      const stream = { timer: null, inFlight: false };
+      stream.timer = setInterval(async () => {
+        if (stream.inFlight) return; // don't stack captures
+        stream.inFlight = true;
+        try {
+          const frame = await captureCanvasFrame(maxWidth, quality);
+          if (frame) relayClient.send({ type: 'canvas:frame', companionId, ...frame, ts: Date.now() });
+        } catch (e) { /* view reloading/destroyed — drop this frame */ }
+        stream.inFlight = false;
+      }, Math.round(1000 / fps));
+      companionCanvasStreams.set(companionId, stream);
+    });
+    relayClient.on('canvas:screencast:stop', (msg) => {
+      stopCanvasStream(msg?.companionId || msg?.from || 'companion');
+    });
+    relayClient.on('canvas:input', async (msg) => {
+      const nx = Number(msg?.nx), ny = Number(msg?.ny);
+      if (!Number.isFinite(nx) || !Number.isFinite(ny)) return;
+      const cx = Math.min(Math.max(nx, 0), 1), cy = Math.min(Math.max(ny, 0), 1);
+      const entries = [...canvasWebContentsViews.entries()];
+      let wc, x, y;
+      if (entries.length) {
+        const view = entries[entries.length - 1][1];
+        const b = view.getBounds();
+        wc = view.webContents; x = Math.round(cx * b.width); y = Math.round(cy * b.height);
+      } else {
+        const rect = await getIframeRect();
+        if (!rect) return;
+        // sendInputEvent at window-absolute coords; Chromium routes to the OOPIF.
+        wc = mainWindow.webContents; x = Math.round(rect.x + cx * rect.width); y = Math.round(rect.y + cy * rect.height);
+      }
+      try {
+        if (msg.kind === 'scroll') {
+          wc.sendInputEvent({ type: 'mouseWheel', x, y,
+            deltaX: Math.round(Number(msg.dx) || 0), deltaY: Math.round(Number(msg.dy) || 0),
+            canScroll: true });
+        } else { // tap (default) — mouse down + up
+          wc.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
+          wc.sendInputEvent({ type: 'mouseUp',   x, y, button: 'left', clickCount: 1 });
+        }
+      } catch (e) { /* target gone — drop */ }
+    });
   } catch (e) {
     console.warn('[main] relay-client init failed (non-fatal):', e.message);
   }
