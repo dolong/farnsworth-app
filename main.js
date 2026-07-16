@@ -4231,7 +4231,10 @@ app.whenReady().then(async () => {
       };
       entry.term.on('data', onData);
       companionClaudeAttachments.set(companionId, { term: entry.term, onData, tabId: entry.tabId });
-      relayClient.send({ type: 'claudeCode:attached', companionId, tabId: entry.tabId, ok: true, sessionId: entry.sessionId, cwd: entry.cwd });
+      // Send the desktop's CURRENT cols/rows so the companion adopts the
+      // desktop's winsize (and scales its font to fit) instead of resizing
+      // the shared PTY down. The desktop is the sole size owner.
+      relayClient.send({ type: 'claudeCode:attached', companionId, tabId: entry.tabId, ok: true, sessionId: entry.sessionId, cwd: entry.cwd, cols: entry.cols || 80, rows: entry.rows || 24 });
     });
     relayClient.on('claudeCode:input', (msg) => {
       const companionId = msg?.companionId || msg?.from || 'companion';
@@ -4240,11 +4243,14 @@ app.whenReady().then(async () => {
       if (att && data) { try { att.term.write(data); } catch (e) { /* PTY died -- safe to drop */ } }
     });
     relayClient.on('claudeCode:resize', (msg) => {
-      const companionId = msg?.companionId || msg?.from || 'companion';
-      const att = companionClaudeAttachments.get(companionId);
-      if (att && Number.isFinite(msg?.cols) && Number.isFinite(msg?.rows)) {
-        try { att.term.resize(msg.cols, msg.rows); } catch {}
-      }
+      // INTENTIONAL NO-OP (Jul 16 fix). One PTY, one winsize, two viewers
+      // of different sizes. If we honored the companion's phone-narrow
+      // cols/rows here we'd resize the SHARED PTY down and reflow the
+      // desktop's own xterm into a ~1-char column (the garble Long saw
+      // when the companion navigated to Claude Code). The desktop is the
+      // sole size owner; the companion adopts the desktop's cols/rows
+      // (sent in claudeCode:attached) and scales its font to fit instead
+      // of driving the PTY. So we deliberately ignore companion resizes.
     });
     relayClient.on('claudeCode:interrupt', (msg) => {
       // Ctrl+C cancels the current claude turn without killing the PTY.
@@ -4772,7 +4778,7 @@ function startClaudeCodeServer() {
       // PTY -- this just exposes it for piggyback read/write. tabId is
       // duplicated into the value so the bridge can echo it back in
       // claudeCode:output / claudeCode:exit without needing the Map key.
-      claudeCodePtys.set(tabId, { tabId, term, send, sessionId: useSessionId, cwd });
+      claudeCodePtys.set(tabId, { tabId, term, send, sessionId: useSessionId, cwd, cols: 80, rows: 24 });
       send({ type: 'ready', tabId, sessionId: useSessionId });
     };
 
@@ -4785,6 +4791,11 @@ function startClaudeCodeServer() {
         term.write(msg.data);
       } else if (term && msg.type === 'resize' && Number.isFinite(msg.cols) && Number.isFinite(msg.rows)) {
         try { term.resize(msg.cols, msg.rows); } catch {}
+        // Record the desktop's live winsize on the bridge entry so a
+        // subscribing companion adopts the CURRENT desktop cols/rows in
+        // its claudeCode:attached ack (the desktop is the size owner).
+        const e = claudeCodePtys.get(tabId);
+        if (e) { e.cols = msg.cols; e.rows = msg.rows; }
       } else if (term && msg.type === 'close') {
         try { term.kill(); } catch {}
       } else if (spawned && term && msg.type === 'rename' && typeof msg.name === 'string' && msg.name.trim()) {
