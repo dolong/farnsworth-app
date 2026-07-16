@@ -4193,6 +4193,73 @@ app.whenReady().then(async () => {
         mainWindow.webContents.send('relay:status', { status });
       }
     });
+
+    // ====================================================================
+    // Companion Claude Code bridge (Jul 16 2026)
+    // --------------------------------------------------------------------
+    // Piggybacks the companion onto the desktop's ACTIVE Claude Code PTY
+    // (same cwd + same session via the desktop's JSONL). One PTY, two
+    // viewers -- the companion's input is written into the desktop's PTY
+    // stdin and the desktop's PTY onData is forwarded back to the
+    // companion via relayClient.send(). When the companion closes the
+    // sheet it sends claudeCode:detach and we remove the onData listener.
+    // ====================================================================
+    const companionClaudeAttachments = new Map(); // companionId -> { term, onData, tabId }
+    relayClient.on('claudeCode:subscribe', (msg) => {
+      const companionId = msg?.companionId || msg?.from || 'companion';
+      const targetTabId = msg?.tabId || null;
+      // Pick the requested tabId, falling back to whichever Claude Code tab
+      // is currently active on the desktop. claudeCodePtys is populated by
+      // the startClaudeCodeServer() spawnFor() closure below. Map iteration
+      // is insertion order so the LAST entry is the most-recently-spawned —
+      // a reasonable proxy for "active" (Long typically opens one tab at
+      // a time and works in it; opening a new tab moves the focus).
+      const entry = (targetTabId && claudeCodePtys.get(targetTabId))
+        || [...claudeCodePtys.values()].at(-1)
+        || null;
+      if (!entry) {
+        relayClient.send({ type: 'claudeCode:attached', companionId, ok: false, reason: 'no-active-session' });
+        return;
+      }
+      // Clean up any prior attachment from this companion (re-subscribe).
+      const prior = companionClaudeAttachments.get(companionId);
+      if (prior) { try { prior.term.removeListener('data', prior.onData); } catch {} }
+      const onData = (data) => {
+        try {
+          relayClient.send({ type: 'claudeCode:output', companionId, tabId: entry.tabId, data });
+        } catch (e) { /* connection might be down — safe to drop */ }
+      };
+      entry.term.on('data', onData);
+      companionClaudeAttachments.set(companionId, { term: entry.term, onData, tabId: entry.tabId });
+      relayClient.send({ type: 'claudeCode:attached', companionId, tabId: entry.tabId, ok: true, sessionId: entry.sessionId, cwd: entry.cwd });
+    });
+    relayClient.on('claudeCode:input', (msg) => {
+      const companionId = msg?.companionId || msg?.from || 'companion';
+      const att = companionClaudeAttachments.get(companionId);
+      const data = typeof msg?.data === 'string' ? msg.data : '';
+      if (att && data) { try { att.term.write(data); } catch (e) { /* PTY died -- safe to drop */ } }
+    });
+    relayClient.on('claudeCode:resize', (msg) => {
+      const companionId = msg?.companionId || msg?.from || 'companion';
+      const att = companionClaudeAttachments.get(companionId);
+      if (att && Number.isFinite(msg?.cols) && Number.isFinite(msg?.rows)) {
+        try { att.term.resize(msg.cols, msg.rows); } catch {}
+      }
+    });
+    relayClient.on('claudeCode:interrupt', (msg) => {
+      // Ctrl+C cancels the current claude turn without killing the PTY.
+      const companionId = msg?.companionId || msg?.from || 'companion';
+      const att = companionClaudeAttachments.get(companionId);
+      if (att) { try { att.term.write('\x03'); } catch {} }
+    });
+    relayClient.on('claudeCode:detach', (msg) => {
+      const companionId = msg?.companionId || msg?.from || 'companion';
+      const att = companionClaudeAttachments.get(companionId);
+      if (att) {
+        try { att.term.removeListener('data', att.onData); } catch {}
+        companionClaudeAttachments.delete(companionId);
+      }
+    });
   } catch (e) {
     console.warn('[main] relay-client init failed (non-fatal):', e.message);
   }
@@ -4342,6 +4409,11 @@ function startTerminalServer() {
 // the same OAUTH credentials it would if launched from Terminal.app.
 const CLAUDE_CODE_WS_PORT = 9224;
 let claudeCodeWss = null;
+// Companion Claude Code bridge (Jul 16 2026) — tracks live Claude Code
+// PTYs by tabId so the companion-side relay handler can piggyback onto
+// the desktop's active session. Populated on successful pty.spawn inside
+// spawnFor(); cleared on term.onExit and WS close.
+const claudeCodePtys = new Map(); // tabId -> { term, send, sessionId, cwd }
 
 function startClaudeCodeServer() {
   if (!pty) {
@@ -4577,8 +4649,20 @@ function startClaudeCodeServer() {
       });
       term.onExit(({ exitCode, signal }) => {
         send({ type: 'exit', exitCode, signal });
+        claudeCodePtys.delete(tabId); // companion bridge cleanup
+        try {
+          // Best-effort: tell any companion attached to this PTY that the
+          // session died. The relayClient may not be ready yet; guard.
+          const rc = (() => { try { return getRelayClient && getRelayClient(); } catch { return null; } })();
+          rc && rc.send && rc.send({ type: 'claudeCode:exit', tabId, exitCode, signal });
+        } catch {}
         ws.close();
       });
+      // Register for the companion bridge. The desktop xterm still owns the
+      // PTY -- this just exposes it for piggyback read/write. tabId is
+      // duplicated into the value so the bridge can echo it back in
+      // claudeCode:output / claudeCode:exit without needing the Map key.
+      claudeCodePtys.set(tabId, { tabId, term, send, sessionId: useSessionId, cwd });
       send({ type: 'ready', tabId, sessionId: useSessionId });
     };
 
