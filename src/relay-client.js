@@ -37,6 +37,10 @@ function signJwt(payload, secret) {
 const RELAY_URL = process.env.RELAY_URL || 'ws://localhost:7778/api/v1/ws';
 const RELAY_JWT_SECRET = process.env.RELAY_JWT_SECRET || 'dev-secret';
 const RELAY_TENANT_ID = process.env.RELAY_TENANT_ID || 'default';
+// A paired desktop presents a long-lived device token (minted by
+// api.farnsworth.tv, carries userId + instanceId). When present it supersedes
+// the shared-secret self-signing path below.
+const RELAY_DEVICE_TOKEN = process.env.RELAY_DEVICE_TOKEN || null;
 const MACHINE_ID_HASH = crypto
   .createHash('sha256')
   .update(os.hostname() + (os.userInfo()?.username || ''))
@@ -53,6 +57,7 @@ class RelayClient {
     this.secret = opts.secret || RELAY_JWT_SECRET;
     this.tenantId = opts.tenantId || RELAY_TENANT_ID;
     this.sub = opts.sub || SUB;
+    this.deviceToken = opts.deviceToken || RELAY_DEVICE_TOKEN;
     this.ws = null;
     this.reconnectAttempt = 0;
     this.reconnectTimer = null;
@@ -63,11 +68,17 @@ class RelayClient {
   }
 
   token() {
+    // Paired: present the account-scoped device token as-is (userId routing).
+    // Unpaired: self-sign a short-lived token with the shared relay secret
+    // (v1 tenantId routing) so an un-paired desktop still works.
+    if (this.deviceToken) return this.deviceToken;
     return signJwt(
       { sub: this.sub, role: 'farnsworth', tenantId: this.tenantId },
       this.secret
     );
   }
+
+  get paired() { return !!this.deviceToken; }
 
   start() {
     if (process.env.RELAY_DISABLED === '1') {
