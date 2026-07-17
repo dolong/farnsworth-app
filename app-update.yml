@@ -1,0 +1,16 @@
+# app-update.yml — electron-updater config (bundled into app.asar)
+#
+# Where installed copies of Farnsworth look for updates. The provider
+# must match the publish provider in electron-builder.yml.
+#
+# Channel: latest (stable releases only). Prereleases would need a
+# separate channel block here + `--prerelease` flag at build time.
+#
+# Release detection: any GitHub Release on dolong/farnsworth-app with a
+# `version` field that is greater than the installed `package.json`
+# `version`. mac/win/linux builds all check the same channel.
+
+provider: github
+owner: dolong
+repo: farnsworth-app
+releaseType: release

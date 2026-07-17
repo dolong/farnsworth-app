@@ -1,0 +1,111 @@
+# electron-builder.yml — Farnsworth packaging config
+#
+# Build targets:
+#   npm run dist         — build for the current platform (mac/win/linux)
+#   npm run dist:mac     — macOS only (.dmg + .zip for arm64 + x64)
+#   npm run dist:win     — Windows only (.exe via NSIS, x64; unsigned for now)
+#   npm run dist:linux   — Linux only (.AppImage + .deb)
+#   npm run dist:dir     — fast local build (no .dmg, just unpacked .app in dist/)
+#
+# Signing (mac): Developer ID Application: Long Do (66RHAVPZ4J)
+#   - Already imported to login Keychain
+#   - Hardened runtime + V8 JIT entitlements from scripts/entitlements-electron.plist
+#   - Notarization needs APPLE_ID + APPLE_APP_SPECIFIC_PASSWORD + APPLE_TEAM_ID env vars
+
+appId: dev.probablynothing.farnsworth
+productName: Farnsworth
+copyright: Copyright © 2026 Long. MIT License.
+directories:
+  output: dist
+  buildResources: build-cache
+
+# Files to bundle inside the .app's Resources/app.asar
+files:
+  - main.js
+  - preload.js
+  - src/**/*
+  - db.js
+  - pair-device.js
+  - relay-client.js
+  - check_ipcs.mjs
+  - assets/**/*
+  - styles.css
+  - canvas-styles.css
+  - "!**/.DS_Store"
+  - "!**/.git"
+  - "!**/.gitignore"
+  - "!**/*.map"
+  - "!**/*.log"
+
+# Bundled CLI binaries (claude + nono) — sit alongside the .app's Resources/app.asar
+# at Contents/Resources/bin/, exactly where the dev wrapper puts them
+extraResources:
+  - from: Resources/bin
+    to: bin
+    filter:
+      - "**/*"
+
+# Native modules must be unpacked from asar (they can't be loaded from inside)
+asar: true
+asarUnpack:
+  - "node_modules/better-sqlite3/**/*"
+  - "node_modules/keytar/**/*"
+  - "node_modules/node-pty/**/*"
+  - "node_modules/onnxruntime-node/**/*"
+  - "node_modules/sharp/**/*"
+  - "node_modules/fsevents/**/*"
+  - "node_modules/**/*.node"
+  - "node_modules/**/*.dylib"
+  - "node_modules/**/*.so"
+
+# macOS
+#   teamId is set via APPLE_TEAM_ID env var at build time (no teamId field
+#   in the v26 schema); notarytool picks it up from there.
+mac:
+  category: public.app-category.developer-tools
+  icon: Resources/farnsworth-icon.icns
+  target:
+    - target: dmg
+      arch:
+        - arm64
+        - x64
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  identity: "Long Do (66RHAVPZ4J)"  # electron-builder picks the right cert type from the prefix-less common name
+  entitlements: scripts/entitlements-electron.plist
+  entitlementsInherit: scripts/entitlements-electron.plist
+  notarize: true
+
+dmg:
+  sign: false  # .app is signed; .dmg itself doesn't need a separate signature
+  title: "${productName} ${version}"
+
+# Windows (unsigned for now — no EV cert; SmartScreen will warn on first launch)
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+
+# Linux
+linux:
+  target:
+    - AppImage
+    - deb
+  category: Development
+  maintainer: long@probablynothing.dev
+  vendor: Long
+
+# Publishing (GitHub Releases) — electron-updater reads app-update.yml;
+# electron-builder reads this to know where to push artifacts on --publish.
+# `releaseType: release` (vs prerelease/draft) makes the release public
+# immediately on publish. To make a draft: omit --publish, push tags,
+# then `gh release create <tag> --draft ./dist/*.{dmg,exe,deb,AppImage,...}`.
+publish:
+  provider: github
+  owner: dolong
+  repo: farnsworth-app
+  releaseType: release
+
+# Use maximum compression for smaller downloads
+compression: maximum

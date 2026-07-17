@@ -6,7 +6,13 @@
   "scripts": {
     "start": "electron .",
     "dev": "electron .",
-    "postinstall": "electron-rebuild"
+    "postinstall": "electron-rebuild",
+    "dist": "electron-builder",
+    "dist:mac": "electron-builder --mac",
+    "dist:win": "electron-builder --win",
+    "dist:linux": "electron-builder --linux",
+    "dist:dir": "electron-builder --dir",
+    "publish": "electron-builder --publish always"
   },
   "keywords": [
     "electron",
@@ -23,6 +29,7 @@
     "@xterm/addon-web-links": "^0.11.0",
     "better-sqlite3": "^12.11.1",
     "chokidar": "^5.0.0",
+    "electron-updater": "^6.8.9",
     "keytar": "^7.9.0",
     "monaco-editor": "^0.52.2",
     "node-pty": "^1.0.0",
@@ -32,6 +39,7 @@
   },
   "devDependencies": {
     "@electron/rebuild": "^4.0.4",
-    "electron": "^31.7.7"
+    "electron": "^31.7.7",
+    "electron-builder": "^26.15.3"
   }
 }

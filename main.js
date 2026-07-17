@@ -18,6 +18,27 @@ const child_process = require('child_process');
 const crypto = require('crypto');
 const db = require('./db');
 
+// =============================================================================
+// Auto-updater (electron-updater, reads app-update.yml bundled in app.asar).
+// GitHub Releases channel: dolong/farnsworth-app. `checkForUpdatesAndNotify()`
+// is fire-and-forget — checks GitHub for a newer version, downloads in the
+// background, shows a native notification when ready (with a "Restart" button
+// that quits + relaunches into the installed update).
+//
+// Disabled in dev (npm start / electron .) — only runs in packaged builds,
+// via the ELECTRON_IS_PACKAGED === true guard below. That avoids accidentally
+// showing a "newer version available" toast when you're working on the source.
+// =============================================================================
+const { autoUpdater } = require('electron-updater');
+autoUpdater.autoDownload = true;        // download in the background
+autoUpdater.autoInstallOnAppQuit = true; // install when the user quits
+// Surface update events to the renderer so we can show an in-app banner later.
+// Right now we just log them — the native notification from
+// checkForUpdatesAndNotify() is the primary UX.
+autoUpdater.on('update-available',  (info) => console.log('[autoUpdater] update available:', info?.version));
+autoUpdater.on('update-downloaded', (info) => console.log('[autoUpdater] update downloaded:', info?.version, '— restart to apply'));
+autoUpdater.on('error',             (err)  => console.warn('[autoUpdater] error:', err?.message || err));
+
 // keytar (native) — try to load at startup so credential IPCs can reference
 // it directly. If the native binary is missing/broken (Linux without libsecret,
 // etc.), the require throws and we fall back to per-handler lazy requires with
@@ -4169,6 +4190,18 @@ app.whenReady().then(async () => {
   startTerminalServer();
   startClaudeCodeServer();
   startCodexServer();
+
+  // ====================================================================
+  // Auto-updater check (packaged builds only; dev mode skips it).
+  // Runs after createWindow() so any in-app update banner has a renderer
+  // to attach to later (not wired up yet — just logs for now + native
+  // notification from checkForUpdatesAndNotify()).
+  // ====================================================================
+  if (app.isPackaged) {
+    autoUpdater.checkForUpdatesAndNotify().catch((err) => {
+      console.warn('[autoUpdater] check failed:', err?.message || err);
+    });
+  }
 
   // Start the relay client (outbound WS to farnsworth-relay). No-op if
   // RELAY_DISABLED=1 or the relay isn't reachable — Farnsworth keeps

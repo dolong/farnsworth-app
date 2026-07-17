@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Minimal entitlements for the dev wrapper bundle.
+         Main executable is a shell script (hardened runtime flags don't apply to shell scripts),
+         but Resources/bin/claude + Resources/bin/nono are Mach-O binaries that need
+         V8 JIT entitlements if they're Electron-wrapped.
+
+         Same network entitlements as the Electron profile since the wrapper spawns Electron
+         which then makes all the network calls. -->
+
+    <!-- Required for any Electron-wrapped binaries in Resources/bin/ -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+
+    <!-- Network: outbound + inbound (Electron child makes all the calls) -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+    <key>com.apple.security.network.server</key>
+    <true/>
+</dict>
+</plist>

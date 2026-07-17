@@ -1,0 +1,124 @@
+# .github/workflows/build.yml — multi-platform Farnsworth builds
+#
+# Triggers:
+#   - Push of a `v*` tag (e.g. v0.1.1) → build + publish a GitHub Release
+#   - Manual dispatch → build without publishing (for testing)
+#
+# Build matrix:
+#   - macos-latest → .dmg (arm64 + x64). Signed + notarized if Apple
+#     secrets are present in the repo, otherwise unsigned.
+#   - windows-latest → .exe via NSIS (x64). Unsigned for now (no EV cert).
+#     SmartScreen will warn on first launch — users click "More info" → "Run anyway".
+#   - ubuntu-latest → .AppImage + .deb. No signing needed.
+#
+# Required secrets (Settings → Secrets and variables → Actions):
+#   APPLE_ID                — Apple Developer email (1988.dolong@gmail.com)
+#   APPLE_APP_SPECIFIC_PASSWORD  — generated at appleid.apple.com (not the iCloud pw)
+#   APPLE_TEAM_ID           — 66RHAVPZ4J
+# Optional (for fully signed mac on CI):
+#   FARNSWORTH_CERT_P12     — base64-encoded Developer ID Application .p12
+#   FARNSWORTH_CERT_PASSWORD — .p12 password
+#   KEYCHAIN_PASSWORD       — temp keychain password for the runner
+#
+# Notes:
+#   - GITHUB_TOKEN is auto-provided by GitHub Actions.
+#   - electron-builder auto-creates latest.yml / latest-mac.yml / latest-linux.yml
+#     alongside the binary artifacts when --publish is used.
+#   - mac signing on the runner uses `security import` + Keychain ACL; if
+#     secrets are missing, electron-builder still produces an unsigned .dmg
+#     (build still succeeds — just no Developer ID signature).
+#
+# Future: add a `prerelease` channel + signed Win builds once the EV cert is set up.
+
+name: Build + Release Farnsworth
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Why are you triggering this manually?'
+        required: false
+        default: 'manual test build'
+
+permissions:
+  contents: write   # needed to create the GitHub Release on tag push
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js (with npm cache)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # ==================================================================
+      # macOS — code signing + notarization (skipped silently if secrets absent)
+      # ==================================================================
+      - name: Build (macOS)
+        if: matrix.os == 'macos-latest'
+        run: npm run dist:mac
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Signing identity lives in the Keychain of the runner if the
+          # .p12 was imported in a previous step. electron-builder auto-
+          # discovers it via CSC_KEY_PASSWORD + CSC_LINK if those secrets
+          # are set; otherwise it falls back to "unsigned" cleanly.
+          CSC_LINK: ${{ secrets.FARNSWORTH_CERT_P12 }}
+          CSC_KEY_PASSWORD: ${{ secrets.FARNSWORTH_CERT_PASSWORD }}
+          # Notarization via notarytool
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      # ==================================================================
+      # Windows — NSIS installer, unsigned (no EV cert yet)
+      # ==================================================================
+      - name: Build (Windows)
+        if: matrix.os == 'windows-latest'
+        run: npm run dist:win
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ==================================================================
+      # Linux — AppImage + .deb
+      # ==================================================================
+      - name: Build (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: npm run dist:linux
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: List build artifacts
+        run: ls -lh dist/ || dir dist\
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: farnsworth-${{ matrix.os }}
+          path: |
+            dist/*.dmg
+            dist/*.zip
+            dist/*.exe
+            dist/*.deb
+            dist/*.AppImage
+            dist/*.blockmap
+            dist/latest*.yml
+          if-no-files-found: warn
+          retention-days: 14
