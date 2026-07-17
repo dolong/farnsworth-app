@@ -2,7 +2,7 @@
 // Electron desktop shell. SQLite-backed persistence (db.js), folder-based workspace,
 // Claude auth (manual API key + OAuth PKCE via claude.ai), real file operations.
 
-const { app, BrowserWindow, BrowserView, WebContentsView, ipcMain, shell, dialog, safeStorage, Menu, session } = require('electron');
+const { app, BrowserWindow, BrowserView, WebContentsView, ipcMain, shell, dialog, safeStorage, Menu, session, clipboard, nativeImage } = require('electron');
 const path = require('path');
 const os = require('os');
 // `fs` is fs/promises — used by 13 `await fs.xxx(...)` call sites in
@@ -1177,6 +1177,163 @@ ipcMain.handle('chat:setModel', (_event, { alias } = {}) => {
     return { ok: true, alias };
   } catch (e) {
     return { ok: false, error: e.message };
+  }
+});
+
+// ------------------------------------------------------------
+// Clipboard image — paste into AI chat + Claude Code panel
+// (Jul 16 ~23:30 ET). The renderer's paste handler reads the image
+// directly via `e.clipboardData.items` for small/typical cases, but
+// Electron's main-process clipboard is the reliable path for images
+// copied from native macOS apps (Lightshot, Safari, Finder, Preview)
+// where the dataTransfer is empty or only carries a file promise.
+// ------------------------------------------------------------
+// 10MB hard ceiling — Anthropic's image API rejects >5MB and a
+// 10MB cap leaves headroom for base64 expansion.
+const CLIPBOARD_IMAGE_MAX_BYTES = 10 * 1024 * 1024;
+ipcMain.handle('clipboard:readImage', async () => {
+  try {
+    const img = clipboard.readImage();
+    if (!img || img.isEmpty()) return { ok: false, error: 'no_image' };
+    const size = img.getSize();
+    if (!size || !size.width || !size.height) return { ok: false, error: 'no_image' };
+    // Prefer PNG (lossless + transparent). Fall back to JPEG if PNG
+    // encoding fails (some clipboard sources carry JPEG natively).
+    let buf = img.toPNG();
+    let mime = 'image/png';
+    if (!buf || buf.length === 0) {
+      buf = img.toJPEG(85);
+      mime = 'image/jpeg';
+    }
+    if (!buf || buf.length === 0) return { ok: false, error: 'encode_failed' };
+    if (buf.length > CLIPBOARD_IMAGE_MAX_BYTES) {
+      return { ok: false, error: 'too_large', sizeBytes: buf.length, maxBytes: CLIPBOARD_IMAGE_MAX_BYTES };
+    }
+    const dataUrl = 'data:' + mime + ';base64,' + buf.toString('base64');
+    return {
+      ok: true,
+      dataUrl,
+      mime,
+      width: size.width,
+      height: size.height,
+      sizeBytes: buf.length,
+    };
+  } catch (e) {
+    return { ok: false, error: e.message || 'read_failed' };
+  }
+});
+
+// Write a base64 data URL to disk inside the workspace's
+// `.farnsworth-clipboard/` directory. Used by the Claude Code panel to
+// produce a file reference the running `claude` CLI can read via
+// `@/path` paste-style attachment. Falls back to the user-data dir if
+// no workspace folder is open.
+ipcMain.handle('clipboard:saveImage', async (_event, { dataUrl, name } = {}) => {
+  try {
+    if (!dataUrl || typeof dataUrl !== 'string') return { ok: false, error: 'missing_dataUrl' };
+    const m = /^data:([a-zA-Z0-9/+.-]+);base64,(.+)$/.exec(dataUrl);
+    if (!m) return { ok: false, error: 'bad_dataUrl' };
+    const mime = m[1];
+    const buf = Buffer.from(m[2], 'base64');
+    if (!buf.length) return { ok: false, error: 'empty' };
+    if (buf.length > CLIPBOARD_IMAGE_MAX_BYTES) {
+      return { ok: false, error: 'too_large', sizeBytes: buf.length, maxBytes: CLIPBOARD_IMAGE_MAX_BYTES };
+    }
+    // Pick a folder: workspace .farnsworth-clipboard/ if a folder is
+    // open, else user-data. Both are project-scoped so old refs aren't
+    // left lying around forever.
+    const folder = (db.getSetting && db.getSetting('currentFolder')) || app.getPath('userData');
+    const dir = path.join(folder, '.farnsworth-clipboard');
+    await fs.mkdir(dir, { recursive: true });
+    const ext = mime === 'image/jpeg' ? 'jpg'
+      : mime === 'image/png' ? 'png'
+      : mime === 'image/gif' ? 'gif'
+      : mime === 'image/webp' ? 'webp'
+      : 'img';
+    const safeName = (name && typeof name === 'string')
+      ? name.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 60)
+      : 'clipboard';
+    const filename = `${Date.now()}-${safeName}.${ext}`;
+    const filePath = path.join(dir, filename);
+    await fs.writeFile(filePath, buf);
+    return { ok: true, filePath, sizeBytes: buf.length, mime };
+  } catch (e) {
+    return { ok: false, error: e.message || 'write_failed' };
+  }
+});
+
+// ------------------------------------------------------------
+// File attachments — open file picker + read small text files for
+// inline content (Jul 16 ~23:55 ET). Extends the clipboard image
+// pipeline to handle arbitrary files via the paperclip button,
+// drag-and-drop, and Finder "Copy" + paste.
+// ------------------------------------------------------------
+// 100KB inline cap for text files — past this the Anthropic message
+// body gets unwieldy and we just send a `@<path>` reference instead.
+const FILE_INLINE_MAX_BYTES = 100 * 1024;
+// 50MB absolute ceiling on any single attachment — protects the dialog
+// picker from accidentally importing a gigabyte log file.
+const FILE_ATTACH_MAX_BYTES = 50 * 1024 * 1024;
+ipcMain.handle('dialog:openFiles', async () => {
+  try {
+    const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
+    const res = await dialog.showOpenDialog(win, {
+      title: 'Attach files',
+      properties: ['openFile', 'multiSelections'],
+    });
+    if (res.canceled || !res.filePaths || !res.filePaths.length) {
+      return { ok: true, canceled: true, files: [] };
+    }
+    const files = [];
+    for (const fp of res.filePaths) {
+      try {
+        const stat = await fs.stat(fp);
+        if (stat.size > FILE_ATTACH_MAX_BYTES) {
+          files.push({ ok: false, filePath: fp, error: 'too_large', sizeBytes: stat.size });
+          continue;
+        }
+        files.push({
+          ok: true,
+          filePath: fp,
+          name: path.basename(fp),
+          sizeBytes: stat.size,
+        });
+      } catch (e) {
+        files.push({ ok: false, filePath: fp, error: e.message || 'stat_failed' });
+      }
+    }
+    return { ok: true, canceled: false, files };
+  } catch (e) {
+    return { ok: false, error: e.message || 'dialog_failed' };
+  }
+});
+
+// Read a small text file's content for inline inclusion in a message.
+// Caller is responsible for checking size — we still enforce the cap
+// here as a defense-in-depth measure.
+ipcMain.handle('file:read', async (_event, { filePath, maxBytes } = {}) => {
+  try {
+    if (!filePath || typeof filePath !== 'string') return { ok: false, error: 'missing_path' };
+    const cap = Number.isFinite(maxBytes) ? Math.min(maxBytes, FILE_INLINE_MAX_BYTES) : FILE_INLINE_MAX_BYTES;
+    const stat = await fs.stat(filePath);
+    if (!stat.isFile()) return { ok: false, error: 'not_a_file' };
+    if (stat.size > cap) {
+      return { ok: false, error: 'too_large', sizeBytes: stat.size, maxBytes: cap };
+    }
+    const buf = await fs.readFile(filePath);
+    // Decode as utf-8 with replacement so a binary file masquerading as
+    // text doesn't blow up the renderer. The renderer can still detect
+    // a bad decode via replacement chars if it cares.
+    const content = buf.toString('utf8').replace(/\uFFFD/g, '\uFFFD\uFFFD');
+    return {
+      ok: true,
+      content,
+      sizeBytes: stat.size,
+      name: path.basename(filePath),
+      filePath,
+    };
+  } catch (e) {
+    return { ok: false, error: e.message || 'read_failed' };
   }
 });
 

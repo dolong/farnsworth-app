@@ -104,6 +104,12 @@ const state = {
     memStats: null,       // { bufferCount, sectionsCount } from memory:stage-stats
   },
 
+  // Pending image attachments for the chat input. Each is
+  // `{ id, dataUrl, mime, width, height, sizeBytes }`. Cleared after
+  // send. Ephemeral — not persisted to chat history (the message text
+  // + a [Image: name] marker is what gets saved). Jul 16 ~23:30 ET.
+  chatAttachments: [],
+
   // Settings — persisted via IPC
   settings: {
     defaultModel: 'Opus 4.8 High',
@@ -2728,20 +2734,79 @@ async function openDevvitConfig() {
     });
   });
 
-  // Add user / subreddit buttons — open small inline forms.
-  pop.querySelector('#devvit-config-add-user')?.addEventListener('click', () => {
-    const username = prompt('New username (e.g. u/alice):');
-    if (!username) return;
-    const reddit_id = prompt('Reddit id (e.g. t2_alice99):') || `t2_${username.replace(/[^a-z0-9]/gi, '').toLowerCase()}_${Date.now().toString(36).slice(-4)}`;
-    window.farnsworth.devvitUpsertUser({ reddit_id, username, link_karma: 0, comment_karma: 0, is_employee: 0 })
-      .then(() => { showAllCanvasViews(); pop.remove(); openDevvitConfig(); });
+  // Add user / subreddit buttons — open a small inline form directly inside
+  // the popover. (Electron disables window.prompt() entirely — it returns
+  // null and the old prompt()-based handlers bailed instantly, which is why
+  // clicking "+ Add user" appeared to do nothing.)
+  const openInlineAddForm = (btn, opts) => {
+    // Toggle: clicking the button again closes an open form.
+    if (btn.nextElementSibling?.classList?.contains('devvit-config-addform')) {
+      btn.nextElementSibling.remove();
+      btn.style.display = '';
+      return;
+    }
+    btn.style.display = 'none';
+    const form = el('div', { class: 'devvit-config-addform' });
+    form.innerHTML = `
+      ${opts.fields.map((f) => `<input class="devvit-config-input" data-key="${f.key}" placeholder="${escapeHtml(f.placeholder)}" />`).join('')}
+      <div class="devvit-config-addform-row">
+        <button class="devvit-config-cancel" data-addform-cancel>Cancel</button>
+        <button class="devvit-config-save" data-addform-confirm>Add</button>
+      </div>
+      <div class="devvit-config-err" data-addform-err></div>
+    `;
+    btn.after(form);
+    form.querySelector('input')?.focus();
+    const errEl = form.querySelector('[data-addform-err]');
+    const submit = async () => {
+      const values = {};
+      form.querySelectorAll('input').forEach((inp) => { values[inp.dataset.key] = inp.value.trim(); });
+      const missing = opts.fields.find((f) => f.required && !values[f.key]);
+      if (missing) { errEl.textContent = `${missing.label} is required.`; return; }
+      try {
+        await opts.onSubmit(values);
+        showAllCanvasViews();
+        pop.remove();
+        openDevvitConfig(); // re-render with the new entry
+      } catch (e) {
+        errEl.textContent = e.message || 'Add failed.';
+      }
+    };
+    form.querySelector('[data-addform-confirm]')?.addEventListener('click', submit);
+    form.querySelector('[data-addform-cancel]')?.addEventListener('click', () => {
+      form.remove();
+      btn.style.display = '';
+    });
+    form.querySelectorAll('input').forEach((inp) => {
+      inp.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); submit(); }
+      });
+    });
+  };
+
+  pop.querySelector('#devvit-config-add-user')?.addEventListener('click', (e) => {
+    openInlineAddForm(e.currentTarget, {
+      fields: [
+        { key: 'username', label: 'Username', placeholder: 'Username (e.g. u/alice)', required: true },
+        { key: 'reddit_id', label: 'Reddit id', placeholder: 'Reddit id (optional, e.g. t2_alice99)', required: false },
+      ],
+      onSubmit: (v) => {
+        const reddit_id = v.reddit_id || `t2_${v.username.replace(/[^a-z0-9]/gi, '').toLowerCase()}_${Date.now().toString(36).slice(-4)}`;
+        return window.farnsworth.devvitUpsertUser({ reddit_id, username: v.username, link_karma: 0, comment_karma: 0, is_employee: 0 });
+      },
+    });
   });
-  pop.querySelector('#devvit-config-add-sub')?.addEventListener('click', () => {
-    const name = prompt('New subreddit name (e.g. r/foo):');
-    if (!name) return;
-    const reddit_id = prompt('Reddit id (e.g. t5_foo01):') || `t5_${name.replace(/[^a-z0-9]/gi, '').toLowerCase()}_${Date.now().toString(36).slice(-4)}`;
-    window.farnsworth.devvitUpsertSubreddit({ reddit_id, name, type: 'public', member_count: 0 })
-      .then(() => { showAllCanvasViews(); pop.remove(); openDevvitConfig(); });
+  pop.querySelector('#devvit-config-add-sub')?.addEventListener('click', (e) => {
+    openInlineAddForm(e.currentTarget, {
+      fields: [
+        { key: 'name', label: 'Subreddit name', placeholder: 'Subreddit name (e.g. r/foo)', required: true },
+        { key: 'reddit_id', label: 'Reddit id', placeholder: 'Reddit id (optional, e.g. t5_foo01)', required: false },
+      ],
+      onSubmit: (v) => {
+        const reddit_id = v.reddit_id || `t5_${v.name.replace(/[^a-z0-9]/gi, '').toLowerCase()}_${Date.now().toString(36).slice(-4)}`;
+        return window.farnsworth.devvitUpsertSubreddit({ reddit_id, name: v.name, type: 'public', member_count: 0 });
+      },
+    });
   });
 
   // Cancel closes.
@@ -9346,6 +9411,243 @@ function wire() {
     chatInput.addEventListener('input', autoresizeChatInput);
     // Initial sizing (in case value was preloaded from a draft)
     autoresizeChatInput();
+
+    // Clipboard paste into the chat input (Jul 16 ~23:30 ET images,
+    // ~23:55 ET files). Two paths because dataTransfer is unreliable
+    // for native macOS sources (Lightshot, Preview, Finder copy) —
+    // they surface as a file promise or as nothing at all, so we
+    // always cross-check against `clipboard.readImage()` in the main
+    // process for the image path. For files, dataTransfer.files
+    // carries Electron's .path extension, which IS reliable.
+    // Falls through to default paste behavior for text so Cmd+V still
+    // works the way users expect.
+    chatInput.addEventListener('paste', async (ev) => {
+      try {
+        // File-via-dataTransfer path (Jul 16 ~23:55 ET). Electron
+        // extends File with `.path` so we get the absolute path on
+        // disk directly — no need to round-trip through the clipboard
+        // IPC for files. Image files flow through the image path
+        // below; this branch handles non-image files only.
+        const dtFiles = ev.clipboardData && ev.clipboardData.files;
+        let firstNonImageFile = null;
+        if (dtFiles && dtFiles.length) {
+          for (const f of dtFiles) {
+            if (!f.type || !f.type.startsWith('image/')) {
+              firstNonImageFile = f;
+              break;
+            }
+          }
+        }
+        if (firstNonImageFile && firstNonImageFile.path) {
+          ev.preventDefault();
+          addFileAttachment({
+            filePath: firstNonImageFile.path,
+            name: firstNonImageFile.name,
+            sizeBytes: firstNonImageFile.size,
+            mime: firstNonImageFile.type || 'application/octet-stream',
+          });
+          return;
+        }
+        // Image path: cross-check with main-process clipboard — the
+        // source of truth. If main says there's an image, we always
+        // treat it as image-paste (even if dataTransfer disagrees).
+        // If main says no image, fall through to default paste.
+        const r = await window.farnsworth?.clipboardReadImage?.();
+        if (!r || !r.ok) return; // no image → let default paste run
+        // We have an image — kill the default paste so the filename/
+        // binary blob doesn't end up in the textarea as text.
+        ev.preventDefault();
+        const att = {
+          id: 'att-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6),
+          type: 'image',
+          dataUrl: r.dataUrl,
+          mime: r.mime,
+          width: r.width,
+          height: r.height,
+          sizeBytes: r.sizeBytes,
+        };
+        state.chatAttachments.push(att);
+        renderChatAttachments();
+        // Tiny flash so the user sees the chip land even if the
+        // textarea's empty.
+        chatInput.focus();
+      } catch (e) {
+        console.warn('[chat-paste] handler error:', e);
+      }
+    });
+
+    // Drag-and-drop file attachments (Jul 16 ~23:55 ET). Electron
+    // extends the File interface with `.path` so dropped files give
+    // us an absolute path on disk directly. We suppress the default
+    // browser drop behavior so the browser doesn't navigate to the
+    // file URL on a missed drop.
+    const inputWrap = chatInput.closest('.chat__input-wrap');
+    const chatPane = chatInput.closest('.chat');
+    if (inputWrap) {
+      let dragCounter = 0;
+      const showDragOver = () => { inputWrap.classList.add('chat__input-wrap--dragover'); };
+      const hideDragOver = () => { inputWrap.classList.remove('chat__input-wrap--dragover'); };
+      inputWrap.addEventListener('dragenter', (ev) => {
+        if (!ev.dataTransfer || !ev.dataTransfer.types.includes('Files')) return;
+        ev.preventDefault();
+        dragCounter++;
+        showDragOver();
+      });
+      inputWrap.addEventListener('dragover', (ev) => {
+        if (!ev.dataTransfer || !ev.dataTransfer.types.includes('Files')) return;
+        ev.preventDefault();
+        ev.dataTransfer.dropEffect = 'copy';
+      });
+      inputWrap.addEventListener('dragleave', (ev) => {
+        if (!ev.dataTransfer || !ev.dataTransfer.types.includes('Files')) return;
+        dragCounter--;
+        if (dragCounter <= 0) { dragCounter = 0; hideDragOver(); }
+      });
+      inputWrap.addEventListener('drop', async (ev) => {
+        dragCounter = 0;
+        hideDragOver();
+        if (!ev.dataTransfer || !ev.dataTransfer.files || !ev.dataTransfer.files.length) return;
+        ev.preventDefault();
+        for (const f of ev.dataTransfer.files) {
+          if (!f.path) continue;
+          addFileAttachment({
+            filePath: f.path,
+            name: f.name,
+            sizeBytes: f.size,
+            mime: f.type || 'application/octet-stream',
+          });
+        }
+      });
+      // Catch a missed drop on the rest of the chat pane and swallow
+      // it so the browser doesn't navigate to a file:// URL.
+      if (chatPane) {
+        chatPane.addEventListener('dragover', (ev) => {
+          if (ev.dataTransfer && ev.dataTransfer.types.includes('Files')) ev.preventDefault();
+        });
+        chatPane.addEventListener('drop', (ev) => {
+          if (ev.dataTransfer && ev.dataTransfer.types.includes('Files')) ev.preventDefault();
+        });
+      }
+    }
+  }
+
+  // Paperclip / Attach button → open native file picker → add files
+  // (Jul 16 ~23:55 ET). The button existed but was a no-op; we wire
+  // it to the dialog:openFiles IPC. Multiple selections are all added.
+  const attachBtn = document.querySelector('.chat__input-actions .iconbtn[title="Attach"]');
+  if (attachBtn) {
+    attachBtn.addEventListener('click', async () => {
+      try {
+        const r = await window.farnsworth?.openFiles?.();
+        if (!r || !r.ok || r.canceled || !r.files || !r.files.length) return;
+        for (const f of r.files) {
+          if (!f.ok) {
+            console.warn('[attach] skipping:', f.filePath, f.error);
+            continue;
+          }
+          addFileAttachment({
+            filePath: f.filePath,
+            name: f.name,
+            sizeBytes: f.sizeBytes,
+            mime: 'application/octet-stream', // dialog IPC doesn't return mime yet
+          });
+        }
+      } catch (e) {
+        console.warn('[attach] handler error:', e);
+      }
+    });
+  }
+
+  // Add a file attachment chip from any source (paperclip / drag /
+  // paste). Stores a `{type: 'file', filePath, ...}` entry in
+  // state.chatAttachments; sendChatMessage reads `filePath` to inline
+  // small text files or to send a path reference for binary/large.
+  function addFileAttachment(opts) {
+    const att = {
+      id: 'att-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6),
+      type: 'file',
+      filePath: opts.filePath,
+      name: opts.name || 'file',
+      sizeBytes: opts.sizeBytes || 0,
+      mime: opts.mime || 'application/octet-stream',
+    };
+    state.chatAttachments.push(att);
+    renderChatAttachments();
+  }
+
+  // Render the chat-input attachment strip (image + file chips with
+  // × remove). Lives between the chat thread and the input wrap;
+  // only shows when there are pending attachments. Jul 16 ~23:30 ET
+  // (images) + ~23:55 ET (files).
+  function renderChatAttachments() {
+    const wrap = document.querySelector('.chat__input-wrap');
+    if (!wrap) return;
+    let strip = wrap.querySelector('.chat__attachments');
+    const atts = state.chatAttachments || [];
+    if (!atts.length) {
+      if (strip) strip.remove();
+      return;
+    }
+    if (!strip) {
+      strip = document.createElement('div');
+      strip.className = 'chat__attachments';
+      // Insert at the top of the wrap so the chips sit ABOVE the
+      // input box (matches the convention in Claude.ai + Slack).
+      wrap.insertBefore(strip, wrap.firstChild);
+    }
+    strip.innerHTML = '';
+    for (const a of atts) {
+      const chip = document.createElement('div');
+      chip.className = 'chat__attachment-chip' + (a.type === 'file' ? ' chat__attachment-chip--file' : '');
+      // Title (tooltip) shows the most useful info for each kind
+      if (a.type === 'file') {
+        chip.title = `${a.filePath}\n${a.mime || 'file'} · ${formatBytes(a.sizeBytes)}`;
+      } else {
+        chip.title = `${a.mime} · ${a.width}×${a.height} · ${formatBytes(a.sizeBytes)}`;
+      }
+      if (a.type === 'file') {
+        // File chip — colored glyph + name + size. The glyph is a
+        // CSS-only "doc" mark so we don't need to bundle an icon font.
+        const glyph = document.createElement('div');
+        glyph.className = 'chat__attachment-glyph';
+        const ext = (a.name.split('.').pop() || '').toLowerCase().slice(0, 4);
+        glyph.textContent = ext ? ext : 'file';
+        chip.appendChild(glyph);
+      } else {
+        // Image chip — thumbnail preview.
+        const img = document.createElement('img');
+        img.src = a.dataUrl;
+        img.className = 'chat__attachment-thumb';
+        img.alt = '';
+        chip.appendChild(img);
+      }
+      const label = document.createElement('span');
+      label.className = 'chat__attachment-label';
+      if (a.type === 'file') {
+        label.textContent = `${a.name} · ${formatBytes(a.sizeBytes)}`;
+      } else {
+        label.textContent = `Image · ${formatBytes(a.sizeBytes)}`;
+      }
+      chip.appendChild(label);
+      const x = document.createElement('button');
+      x.className = 'chat__attachment-remove';
+      x.type = 'button';
+      x.textContent = '×';
+      x.title = 'Remove';
+      x.addEventListener('click', () => {
+        state.chatAttachments = (state.chatAttachments || []).filter(x => x.id !== a.id);
+        renderChatAttachments();
+      });
+      chip.appendChild(x);
+      strip.appendChild(chip);
+    }
+  }
+
+  function formatBytes(n) {
+    if (!Number.isFinite(n)) return '';
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+    return `${(n / (1024 * 1024)).toFixed(1)} MB`;
   }
 
   // Chat history dropdown — toggle, new chat, list delegation, delete.
@@ -9719,12 +10021,18 @@ function handleDirectAction(action) {
 async function sendChatMessage() {
   const input = $('#chat-input');
   const text = input.value.trim();
+  // Pending clipboard-image attachments (Jul 16 ~23:30 ET). Snapshotted
+  // + cleared at the top so a fail/abort never leaves stale chips in
+  // the input across reloads.
+  const attachments = (state.chatAttachments || []).slice();
+  state.chatAttachments = [];
+  renderChatAttachments();
   // Capture + clear the companion origin id on EVERY call so a stale id from
   // an aborted send can't leak into the next turn. Non-null only when this
   // send was triggered by a companion 'chat' relay message. (Jul 15 2026)
   const companionChatId = pendingCompanionChatId;
   pendingCompanionChatId = null;
-  if (!text) return;
+  if (!text && attachments.length === 0) return;
   if (!window.farnsworth || !window.farnsworth.sendMessage) {
     state.chatMessages.push({ id: 'm' + Date.now(), role: 'agent', text: 'Inference not wired — preload missing sendMessage.', error: true });
     renderChat();
@@ -9732,7 +10040,26 @@ async function sendChatMessage() {
   }
   const userMsgId = 'm' + Date.now();
   const agentMsgId = 'm' + (Date.now() + 1);
-  state.chatMessages.push({ id: userMsgId, role: 'user', text });
+  // Build the user-message preview that lives in the chat thread. When
+  // there are attachments we show the text + a compact summary line
+  // ("📎 2 images · 1 file: foo.js") so the user can see what got
+  // attached without bloating chat history with base64 blobs
+  // (Jul 16 ~23:30 ET images, ~23:55 ET files). The actual image /
+  // file blocks are sent to the API only — never persisted.
+  let previewAttSummary = '';
+  if (attachments.length) {
+    const imgCount = attachments.filter(a => a.type === 'image').length;
+    const fileCount = attachments.filter(a => a.type === 'file').length;
+    const parts = [];
+    if (imgCount) parts.push(`${imgCount} image${imgCount === 1 ? '' : 's'}`);
+    if (fileCount) {
+      const firstFileName = attachments.find(a => a.type === 'file')?.name || 'file';
+      parts.push(`${fileCount} file${fileCount === 1 ? '' : 's'}${fileCount === 1 ? `: ${firstFileName}` : ''}`);
+    }
+    previewAttSummary = parts.length ? `📎 ${parts.join(' · ')}` : '';
+  }
+  const userPreviewText = text + (previewAttSummary ? (text ? '\n\n' : '') + previewAttSummary : '');
+  state.chatMessages.push({ id: userMsgId, role: 'user', text: userPreviewText });
   state.chatMessages.push({ id: agentMsgId, role: 'agent', working: true, workingLabel: 'Thinking' });
   input.value = '';
   renderChat();
@@ -9850,7 +10177,58 @@ async function sendChatMessage() {
     .filter(m => (m.role === 'user' || m.role === 'agent') && !m.working && m.text && m.id !== userMsgId)
     .slice(-20)
     .map(m => ({ role: m.role === 'agent' ? 'assistant' : 'user', content: m.text }));
-  const history = [...prior, { role: 'user', content: userTextForAgent }];
+  // Build the NEW user message content. With attachments, content is
+  // an array: image blocks first (Anthropic expects images before text
+  // in multimodal messages), then any inlined text file content, then
+  // the user's text. Without attachments, plain string is fine
+  // (Jul 16 ~23:30 ET images, ~23:55 ET files).
+  let newUserContent = userTextForAgent;
+  if (attachments.length) {
+    const blocks = [];
+    // Tracks file references that DIDN'T get inlined (binary or over
+    // the size cap). We append a single text block at the end listing
+    // them so the agent knows they exist on disk.
+    const pathOnlyFiles = [];
+    for (const a of attachments) {
+      if (a.type === 'image') {
+        // dataUrl is "data:<mime>;base64,<payload>" — Anthropic wants
+        // { type: 'image', source: { type: 'base64', media_type, data } }
+        const dm = /^data:([a-zA-Z0-9/+.-]+);base64,(.+)$/.exec(a.dataUrl || '');
+        if (!dm) continue;
+        blocks.push({
+          type: 'image',
+          source: { type: 'base64', media_type: dm[1], data: dm[2] },
+        });
+      } else if (a.type === 'file') {
+        // Text files ≤100KB get inlined so the agent can read them
+        // directly. Anything else (binary, too large) gets a path
+        // reference — the agent can still read it via read_file.
+        try {
+          const r = await window.farnsworth?.fileRead?.({ filePath: a.filePath, maxBytes: 1024 * 100 });
+          if (r && r.ok) {
+            const header = `\n\n--- Attached file: ${a.name} (${a.sizeBytes} bytes) ---\n`;
+            const footer = `\n--- End of ${a.name} ---\n`;
+            blocks.push({ type: 'text', text: header + r.content + footer });
+          } else {
+            pathOnlyFiles.push({ name: a.name, filePath: a.filePath, sizeBytes: a.sizeBytes, reason: r?.error || 'inline_failed' });
+          }
+        } catch (e) {
+          pathOnlyFiles.push({ name: a.name, filePath: a.filePath, sizeBytes: a.sizeBytes, reason: e.message });
+        }
+      }
+    }
+    if (pathOnlyFiles.length) {
+      // Single trailing text block listing unattached files. The agent
+      // can decide to read them with read_file if it needs to.
+      const lines = pathOnlyFiles.map(f => `- ${f.name} (${formatBytes(f.sizeBytes)}) — @${f.filePath}`);
+      blocks.push({ type: 'text', text: '\n\nAttached files (not inlined — read with read_file if needed):\n' + lines.join('\n') });
+    }
+    if (text) blocks.push({ type: 'text', text: userTextForAgent });
+    // Fallback: if every attachment failed to parse, fall back to
+    // text-only so the user's message still goes through.
+    newUserContent = blocks.length ? blocks : userTextForAgent;
+  }
+  const history = [...prior, { role: 'user', content: newUserContent }];
 
   // Mutable copy of the agent placeholder so we can update its chips/working label as tools execute
   let agentMsg = { id: agentMsgId, role: 'agent', working: true, workingLabel: 'Thinking', chips: [],
@@ -10705,6 +11083,67 @@ async function initClaudeCode(tabId) {
     ws.send(JSON.stringify({ type: 'spawn', sessionId: persistedSessionId, tabId }));
     ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
   };
+
+  // Clipboard paste into the Claude Code panel (Jul 16 ~23:30 ET images,
+  // ~23:55 ET files). xterm.js doesn't expose a real paste event on its
+  // textarea, so we hook the wrapper div at the capture phase and
+  // intercept Cmd+V / Ctrl+V. The path: read the image (if any) →
+  // save it to `<workspace>/.farnsworth-clipboard/` (if image) →
+  // write `@<path>` (Claude Code's file-mention syntax) to the PTY as
+  // text. The user types their message around it and hits Enter when
+  // ready — claude reads the file from disk. We deliberately do NOT
+  // auto-submit because that would race with the user finishing their
+  // thought. Falls through to default xterm paste for text.
+  paneEl.addEventListener('paste', async (ev) => {
+    try {
+      // File-via-dataTransfer path (Jul 16 ~23:55 ET). Electron's
+      // .path extension gives us the absolute path on disk directly
+      // for any file pasted from Finder. Skip images — those go
+      // through the image path below so we get a copy in
+      // .farnsworth-clipboard/ instead of referencing the original.
+      const dtFiles = ev.clipboardData && ev.clipboardData.files;
+      let firstNonImageFile = null;
+      if (dtFiles && dtFiles.length) {
+        for (const f of dtFiles) {
+          if (!f.type || !f.type.startsWith('image/')) {
+            firstNonImageFile = f;
+            break;
+          }
+        }
+      }
+      if (firstNonImageFile && firstNonImageFile.path) {
+        ev.preventDefault();
+        const mention = '@' + firstNonImageFile.path + ' ';
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'data', data: mention }));
+        }
+        return;
+      }
+      // Image path: cross-check with main-process clipboard. If main
+      // says there's an image, save a copy to .farnsworth-clipboard/
+      // and write that path. Text-only → let default paste run.
+      const r = await window.farnsworth?.clipboardReadImage?.();
+      if (!r || !r.ok) return; // text-only → let default paste run
+      ev.preventDefault();
+      const save = await window.farnsworth?.clipboardSaveImage?.({
+        dataUrl: r.dataUrl,
+        name: 'pasted-image',
+      });
+      if (!save || !save.ok) {
+        console.warn('[cc-paste] save failed:', save?.error);
+        return;
+      }
+      // Write "@<path> " to the PTY so Claude Code treats it as a file
+      // mention. The trailing space lets the user keep typing right
+      // after without an awkward boundary.
+      const mention = '@' + save.filePath + ' ';
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'data', data: mention }));
+      }
+    } catch (e) {
+      console.warn('[cc-paste] handler error:', e);
+    }
+  }, true); // capture phase — fires before xterm's internal paste handling
   ws.onmessage = (e) => {
     try {
       const msg = JSON.parse(e.data);

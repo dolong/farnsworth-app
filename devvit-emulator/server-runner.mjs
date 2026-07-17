@@ -65,6 +65,49 @@ console.log('[server-runner]   state:       ', statePath);
 console.log('[server-runner]   port:        ', port);
 console.log('[server-runner]   node:        ', process.version);
 
+// Read the per-project emulator config (same file the loader-hook path reads)
+// so the server operates as the ACTIVE user/subreddit the cogwheel selected —
+// and knows about every user in the library. Without this, the server would
+// fall back to a hardcoded 'dev-user' with zero seeded users, so every
+// cogwheel switch was silently ignored server-side. Mapping matches
+// emulator-hook.mjs exactly (config field names → emulator seed shape).
+let emulatorSeed = {
+  currentUsername: process.env.DEVVIT_EMULATOR_USERNAME || 'dev-user',
+  currentSubredditName: process.env.DEVVIT_EMULATOR_SUBREDDIT || 'dev-subreddit',
+  seedUsers: [],
+  seedSubreddits: [],
+};
+try {
+  if (configPath && configPath !== '(unset)') {
+    const cfg = JSON.parse(readFileSync(configPath, 'utf8'));
+    emulatorSeed = {
+      currentUsername: cfg.currentUsername || emulatorSeed.currentUsername,
+      currentSubredditName: cfg.currentSubredditName || emulatorSeed.currentSubredditName,
+      seedUsers: (cfg.users || []).map((u) => ({
+        id: u.reddit_id,
+        username: u.username,
+        snoovatar: u.snoovatar_url ?? null,
+        createdUtc: Math.floor(new Date(u.created_at || '2024-01-01').getTime() / 1000),
+        linkKarma: u.link_karma || 0,
+        commentKarma: u.comment_karma || 0,
+        isEmployee: !!u.is_employee,
+      })),
+      seedSubreddits: (cfg.subreddits || []).map((s) => ({
+        id: s.reddit_id,
+        name: s.name,
+        type: s.type || 'public',
+        memberCount: s.member_count || 0,
+      })),
+    };
+    console.log('[server-runner]   active user: ', emulatorSeed.currentUsername,
+      `(${emulatorSeed.seedUsers.length} users, ${emulatorSeed.seedSubreddits.length} subreddits seeded)`);
+  } else {
+    console.log('[server-runner]   active user:  (no config — defaulting to dev-user)');
+  }
+} catch (err) {
+  console.error('[server-runner] WARN: failed to read config, defaulting to dev-user:', err.message);
+}
+
 // The user's index.ts gates dev-admin routes on `process.env.NODE_ENV !== 'production'`.
 // Force NODE_ENV=development so the user's full route surface is mounted.
 // (Vite sets this automatically for its dev server; we need to do it explicitly.)
@@ -93,10 +136,10 @@ const emulatorPlugin = {
 
     build.onLoad({ filter: /.*/, namespace: 'devvit-emulator' }, () => {
       const se = JSON.stringify({
-        seedUsers: [],
-        seedSubreddits: [],
-        currentUsername: process.env.DEVVIT_EMULATOR_USERNAME || 'dev-user',
-        currentSubredditName: process.env.DEVVIT_EMULATOR_SUBREDDIT || 'dev-subreddit',
+        seedUsers: emulatorSeed.seedUsers,
+        seedSubreddits: emulatorSeed.seedSubreddits,
+        currentUsername: emulatorSeed.currentUsername,
+        currentSubredditName: emulatorSeed.currentSubredditName,
         statePath: process.env.DEVVIT_EMULATOR_STATE || null,
       });
       // Synthesize a module that:

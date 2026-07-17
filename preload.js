@@ -329,4 +329,18 @@ contextBridge.exposeInMainWorld('farnsworth', {
     ipcRenderer.on('relay:status', (_e, data) => handler(data));
     return () => ipcRenderer.removeListener('relay:status', handler);
   },
+
+  // Clipboard image paste — read from main-process clipboard (more
+  // reliable than the renderer's dataTransfer for native macOS sources
+  // like Lightshot, Preview, Finder) and save to disk for the Claude
+  // Code panel's file-reference path. Jul 16 ~23:30 ET.
+  clipboardReadImage: () => ipcRenderer.invoke('clipboard:readImage'),
+  clipboardSaveImage: (opts) => ipcRenderer.invoke('clipboard:saveImage', opts),
+
+  // File attachments — paperclip button / drag-drop / Finder paste
+  // (Jul 16 ~23:55 ET). openFiles is the native macOS picker
+  // (multi-select); fileRead inlines small text file content for the
+  // message body, with a hard cap (100KB) so the API call stays sane.
+  openFiles: () => ipcRenderer.invoke('dialog:openFiles'),
+  fileRead: (opts) => ipcRenderer.invoke('file:read', opts),
 });

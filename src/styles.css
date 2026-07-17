@@ -1195,6 +1195,7 @@ pre:hover .code-copy { opacity: 1; }
 .chat__input-wrap {
   flex: 0 0 auto;
   padding: 6px 14px 16px;
+  position: relative; /* anchors the drag-over ::after overlay (Jul 16 ~23:55 ET) */
 }
 .chat__input {
   background: var(--bg-input);
@@ -1214,6 +1215,112 @@ pre:hover .code-copy { opacity: 1; }
      auto before measuring scrollHeight so shrink-on-delete works correctly. */
 }
 .chat__textarea::placeholder { color: var(--text-muted); }
+
+/* Clipboard-image attachment strip (Jul 16 ~23:30 ET). Sits ABOVE the
+   chat input box, scrolls horizontally when many chips, hides
+   naturally when there are no attachments (renderChatAttachments
+   removes the element entirely on empty). */
+.chat__attachments {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 8px;
+  margin-bottom: 8px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+.chat__attachment-chip {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--bg-input);
+  border: 1px solid #1f2023;
+  border-radius: 10px;
+  padding: 6px 26px 6px 6px;
+  flex: 0 0 auto;
+  max-width: 240px;
+}
+.chat__attachment-thumb {
+  width: 32px;
+  height: 32px;
+  border-radius: 6px;
+  object-fit: cover;
+  flex: 0 0 32px;
+  background: #1a1b1e;
+}
+.chat__attachment-label {
+  font-size: 11px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.chat__attachment-remove {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: none;
+  background: rgba(0,0,0,0.4);
+  color: #fff;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+.chat__attachment-remove:hover {
+  background: rgba(255,80,80,0.7);
+}
+/* File chip variant (Jul 16 ~23:55 ET). Same shell as the image
+   chip but with a colored glyph block instead of a thumbnail —
+   shows the file extension as a tiny label inside a 32x32 square. */
+.chat__attachment-chip--file {
+  padding-left: 6px;
+}
+.chat__attachment-glyph {
+  width: 32px;
+  height: 32px;
+  border-radius: 6px;
+  background: linear-gradient(135deg, #2a2c33, #1f2023);
+  border: 1px solid #2f3138;
+  color: var(--text-secondary);
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: lowercase;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 32px;
+  overflow: hidden;
+}
+/* Drag-over highlight on the input wrap (Jul 16 ~23:55 ET). Activates
+   while a file is being dragged over the chat input area — gives a
+   blue border + subtle background tint so the drop target is obvious. */
+.chat__input-wrap--dragover .chat__input {
+  border-color: var(--accent-blurple);
+  box-shadow: 0 0 0 2px rgba(88,101,242,0.25), 0 4px 14px rgba(0,0,0,.2);
+  background: rgba(88,101,242,0.05);
+}
+.chat__input-wrap--dragover::after {
+  content: 'Drop to attach';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent-blurple);
+  text-shadow: 0 1px 2px rgba(0,0,0,0.4);
+}
 .chat__input-actions {
   display: flex; align-items: center; gap: 8px; margin-top: 9px;
 }
@@ -5187,6 +5294,23 @@ pre:hover .code-copy { opacity: 1; }
   border-radius: 4px; color: #888; cursor: pointer; font-size: 12px;
 }
 .devvit-config-add-btn:hover { border-color: #58a6ff; color: #58a6ff; }
+.devvit-config-addform {
+  display: flex; flex-direction: column; gap: 6px;
+  margin-top: 6px; padding: 8px;
+  background: rgba(88, 166, 255, 0.04);
+  border: 1px solid rgba(88, 166, 255, 0.2);
+  border-radius: 4px;
+}
+.devvit-config-input {
+  width: 100%; padding: 6px 8px; box-sizing: border-box;
+  background: #0d0d0d;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 4px; color: #e0e0e0; font-size: 12px;
+}
+.devvit-config-input:focus { outline: none; border-color: #58a6ff; }
+.devvit-config-addform-row {
+  display: flex; gap: 8px; justify-content: flex-end;
+}
 .devvit-config-row {
   display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px;
 }
