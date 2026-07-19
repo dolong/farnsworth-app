@@ -3812,12 +3812,262 @@ async function getValidAccessToken() {
   return null;
 }
 
+// ============================================================
+// OpenAI provider (Jul 19) -- GPT-5.6 Sol/Terra/Luna + any
+// OpenAI-compatible chat model. Routed when the model id looks like
+// an OpenAI model so the Anthropic path stays untouched. Uses the
+// OpenAI-compatible /v1/chat/completions endpoint, adapts
+// Anthropic-shaped messages/tools in and OpenAI responses out, and
+// re-emits Anthropic-shaped stream events so the renderer's existing
+// consumer + tool loop need zero changes.
+// ============================================================
+const OPENAI_BASE = 'https://api.openai.com/v1';
+
+function isOpenAIModel(model) {
+  return typeof model === 'string' && /^(gpt-|o[0-9]|chatgpt-|openai\/)/i.test(model);
+}
+
+function getOpenAIKey() {
+  const t = db.getAuthToken('openai-api');
+  if (t && t.accessToken) return t.accessToken;
+  // Fallback: an API-key codex login stores { OPENAI_API_KEY } in auth.json.
+  try {
+    const p = path.join(os.homedir(), '.codex', 'auth.json');
+    if (fsSync.existsSync(p)) {
+      const raw = JSON.parse(fsSync.readFileSync(p, 'utf8'));
+      if (raw && raw.OPENAI_API_KEY) return raw.OPENAI_API_KEY;
+    }
+  } catch {}
+  return null;
+}
+
+function oaSafeJson(s) {
+  if (!s) return {};
+  try {
+    return JSON.parse(s);
+  } catch (e) {
+    return {};
+  }
+}
+
+function mapOpenAIUsage(u) {
+  if (!u) return null;
+  return {
+    input_tokens: u.prompt_tokens ?? 0,
+    output_tokens: u.completion_tokens ?? 0,
+    total_tokens: u.total_tokens ?? 0,
+  };
+}
+
+function mapOpenAIFinish(fr) {
+  if (fr === 'tool_calls') return 'tool_use';
+  if (fr === 'length') return 'max_tokens';
+  if (fr === 'stop') return 'end_turn';
+  return fr || 'end_turn';
+}
+
+// Anthropic-shaped messages / content blocks -> OpenAI chat messages.
+function toOpenAIMessages(messages, system) {
+  const out = [];
+  if (system) out.push({ role: 'system', content: system });
+  for (const m of messages) {
+    const role = m.role;
+    const content = m.content;
+    if (typeof content === 'string') { out.push({ role, content }); continue; }
+    if (!Array.isArray(content)) { out.push({ role, content: '' }); continue; }
+    if (role === 'user') {
+      const parts = [];
+      const toolMsgs = [];
+      for (const b of content) {
+        if (b.type === 'text') parts.push({ type: 'text', text: b.text || '' });
+        else if (b.type === 'image' && b.source) {
+          const mt = b.source.media_type || 'image/png';
+          const url = b.source.type === 'url' ? b.source.url : `data:${mt};base64,${b.source.data || ''}`;
+          parts.push({ type: 'image_url', image_url: { url } });
+        } else if (b.type === 'tool_result') {
+          const c = b.content;
+          const txt = typeof c === 'string' ? c
+            : Array.isArray(c) ? c.filter(x => x && x.type === 'text').map(x => x.text).join('\n')
+            : JSON.stringify(c);
+          toolMsgs.push({ role: 'tool', tool_call_id: b.tool_use_id, content: txt || '' });
+        }
+      }
+      // OpenAI needs tool responses as their own messages, before user text.
+      for (const tm of toolMsgs) out.push(tm);
+      if (parts.length) out.push({ role: 'user', content: parts });
+    } else if (role === 'assistant') {
+      let text = '';
+      const toolCalls = [];
+      for (const b of content) {
+        if (b.type === 'text') text += b.text || '';
+        else if (b.type === 'tool_use') toolCalls.push({
+          id: b.id, type: 'function',
+          function: { name: b.name, arguments: JSON.stringify(b.input || {}) },
+        });
+        // thinking blocks are dropped for OpenAI
+      }
+      const msg = { role: 'assistant' };
+      if (text) msg.content = text;
+      if (toolCalls.length) msg.tool_calls = toolCalls;
+      if (!text && !toolCalls.length) msg.content = '';
+      out.push(msg);
+    } else {
+      out.push({ role, content: '' });
+    }
+  }
+  return out;
+}
+
+function toOpenAITools(tools) {
+  if (!Array.isArray(tools) || !tools.length) return null;
+  return tools.map(t => ({
+    type: 'function',
+    function: {
+      name: t.name,
+      description: t.description || '',
+      parameters: t.input_schema || { type: 'object', properties: {} },
+    },
+  }));
+}
+
+// Blocking send against OpenAI. Returns the same shape as the Anthropic path.
+async function openAISend(opts) {
+  const model = opts.model;
+  const key = getOpenAIKey();
+  if (!key) return { ok: false, error: 'no_auth', message: 'No OpenAI API key -- paste one in Settings > AI > OpenAI.' };
+  const messages = Array.isArray(opts.messages) ? opts.messages : [];
+  const system = typeof opts.system === 'string' ? opts.system : null;
+  const maxTokens = Number.isFinite(opts.maxTokens) ? opts.maxTokens : 16384;
+  const body = { model, messages: toOpenAIMessages(messages, system), max_completion_tokens: maxTokens };
+  const tools = toOpenAITools(opts.tools);
+  if (tools) body.tools = tools;
+  try {
+    const res = await fetch(`${OPENAI_BASE}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const errBody = await res.text();
+      let parsed = null; try { parsed = JSON.parse(errBody); } catch {}
+      return { ok: false, status: res.status, error: parsed?.error?.type || 'api_error', message: parsed?.error?.message || errBody.slice(0, 500) };
+    }
+    const data = await res.json();
+    const choice = data.choices?.[0] || {};
+    const msg = choice.message || {};
+    const text = typeof msg.content === 'string' ? msg.content : '';
+    const blocks = [];
+    if (text) blocks.push({ type: 'text', text });
+    const toolUses = [];
+    for (const tc of (msg.tool_calls || [])) {
+      const input = oaSafeJson(tc.function?.arguments);
+      blocks.push({ type: 'tool_use', id: tc.id, name: tc.function?.name, input });
+      toolUses.push({ id: tc.id, name: tc.function?.name, input });
+    }
+    return { ok: true, text, content: blocks, toolUses, model: data.model, usage: mapOpenAIUsage(data.usage), stopReason: mapOpenAIFinish(choice.finish_reason) };
+  } catch (e) {
+    return { ok: false, error: 'network', message: e.message };
+  }
+}
+
+// Streaming send against OpenAI. Emits Anthropic-shaped events via send().
+async function openAIStream(opts, send) {
+  const model = opts.model;
+  const key = getOpenAIKey();
+  if (!key) { send({ type: 'error', error: 'no_auth', message: 'No OpenAI API key -- paste one in Settings > AI > OpenAI.' }); return { ok: false }; }
+  const messages = Array.isArray(opts.messages) ? opts.messages : [];
+  const system = typeof opts.system === 'string' ? opts.system : null;
+  const maxTokens = Number.isFinite(opts.maxTokens) ? opts.maxTokens : 16384;
+  const body = { model, messages: toOpenAIMessages(messages, system), max_completion_tokens: maxTokens, stream: true, stream_options: { include_usage: true } };
+  const tools = toOpenAITools(opts.tools);
+  if (tools) body.tools = tools;
+  try {
+    const res = await fetch(`${OPENAI_BASE}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}`, 'Accept': 'text/event-stream' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const errBody = await res.text();
+      let parsed = null; try { parsed = JSON.parse(errBody); } catch {}
+      send({ type: 'error', error: parsed?.error?.type || 'api_error', message: parsed?.error?.message || errBody.slice(0, 500), status: res.status });
+      return { ok: false };
+    }
+    send({ type: 'message_start', message: { role: 'assistant', model } });
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let fullText = '';
+    let textStarted = false;
+    let textIndex = -1;
+    let nextIndex = 0;
+    const toolBlocks = {}; // openai tool_call index -> { anthIndex, id, name, argsJson, started }
+    let stopReason = null;
+    let usage = null;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop();
+      for (const raw of lines) {
+        const line = raw.trim();
+        if (!line.startsWith('data:')) continue;
+        const data = line.slice(5).trim();
+        if (data === '[DONE]') continue;
+        let parsed; try { parsed = JSON.parse(data); } catch { continue; }
+        if (parsed.usage) usage = mapOpenAIUsage(parsed.usage);
+        const choice = parsed.choices?.[0];
+        if (!choice) continue;
+        const delta = choice.delta || {};
+        if (typeof delta.content === 'string' && delta.content.length) {
+          if (!textStarted) { textStarted = true; textIndex = nextIndex++; send({ type: 'block_start', index: textIndex, block: { type: 'text', text: '' } }); }
+          fullText += delta.content;
+          send({ type: 'text_delta', index: textIndex, text: delta.content });
+        }
+        if (Array.isArray(delta.tool_calls)) {
+          for (const tc of delta.tool_calls) {
+            const oaIdx = tc.index ?? 0;
+            let tb = toolBlocks[oaIdx];
+            if (!tb) tb = toolBlocks[oaIdx] = { anthIndex: nextIndex++, id: tc.id || ('call_' + oaIdx), name: tc.function?.name || '', argsJson: '', started: false };
+            if (tc.id) tb.id = tc.id;
+            if (tc.function?.name) tb.name = tc.function.name;
+            if (!tb.started && tb.name) { tb.started = true; send({ type: 'block_start', index: tb.anthIndex, block: { type: 'tool_use', id: tb.id, name: tb.name, inputJson: '' } }); }
+            if (tc.function?.arguments) { tb.argsJson += tc.function.arguments; send({ type: 'tool_use_delta', index: tb.anthIndex, partialJson: tc.function.arguments }); }
+          }
+        }
+        if (choice.finish_reason) stopReason = mapOpenAIFinish(choice.finish_reason);
+      }
+    }
+    if (textStarted) send({ type: 'block_stop', index: textIndex });
+    const toolArr = Object.values(toolBlocks).sort((a, b) => a.anthIndex - b.anthIndex);
+    for (const tb of toolArr) if (tb.started) send({ type: 'block_stop', index: tb.anthIndex });
+    send({ type: 'message_delta', stopReason, usage });
+    const blockArr = [];
+    if (fullText) blockArr.push({ type: 'text', text: fullText });
+    const toolUses = [];
+    for (const tb of toolArr) {
+      const input = oaSafeJson(tb.argsJson);
+      blockArr.push({ type: 'tool_use', id: tb.id, name: tb.name, input });
+      toolUses.push({ id: tb.id, name: tb.name, input });
+    }
+    send({ type: 'done', result: { ok: true, text: fullText, content: blockArr, toolUses, stopReason, usage } });
+    return { ok: true };
+  } catch (e) {
+    send({ type: 'error', error: 'network', message: e.message });
+    return { ok: false };
+  }
+}
+
 ipcMain.handle('inference:send', async (_event, opts = {}) => {
   const messages = Array.isArray(opts.messages) ? opts.messages : [];
   if (messages.length === 0) {
     return { ok: false, error: 'No messages to send' };
   }
   const model = opts.model || 'claude-opus-4-8';
+  // Jul 19: route OpenAI-compatible models (GPT-5.6 Sol/Terra/Luna, etc.)
+  // to the OpenAI adapter; the Anthropic path below stays unchanged.
+  if (isOpenAIModel(model)) return await openAISend({ ...opts, model });
   const maxTokens = Number.isFinite(opts.maxTokens) ? opts.maxTokens : 4096;
   const system = typeof opts.system === 'string' ? opts.system : null;
 
@@ -4001,6 +4251,8 @@ ipcMain.on('inference:stream', async (event, opts = {}) => {
     return { ok: false };
   }
   const model = opts.model || 'claude-opus-4-8';
+  // Jul 19: route OpenAI-compatible models to the streaming OpenAI adapter.
+  if (isOpenAIModel(model)) { await openAIStream({ ...opts, model }, send); return; }
   const maxTokens = Number.isFinite(opts.maxTokens) ? opts.maxTokens : 4096;
   const system = typeof opts.system === 'string' ? opts.system : null;
 

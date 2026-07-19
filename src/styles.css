@@ -285,7 +285,9 @@ button { font-family: inherit; cursor: pointer; }
   padding: 0 10px;
   border-bottom: 1px solid #232428;
   background: var(--bg-card);
-}
+  /* Jul 19: scroll horizontally when there are more tabs than the panel width can fit */
+  overflow-x: auto;
+  flex-wrap: nowrap;}
 .lefttab {
   display: inline-flex; align-items: center; gap: 6px;
   height: 26px; padding: 0 11px;
@@ -310,13 +312,16 @@ button { font-family: inherit; cursor: pointer; }
 .chat {
   flex: 1; min-height: 0;
   display: flex; flex-direction: column;
-}
+  /* Jul 19: shrinkable + clip so chat thread can scroll even when the panel is narrow. */
+  min-width: 0;
+  overflow: hidden;}
 
 .terminal {
   flex: 1; min-height: 0;
   display: flex; flex-direction: column;
   background: #0d0e10;
-}
+  min-width: 0;
+  overflow: hidden;}
 .terminal__tabs {
   height: 30px; flex: 0 0 30px;
   display: flex; align-items: center; gap: 2px;
@@ -393,7 +398,8 @@ button { font-family: inherit; cursor: pointer; }
   flex: 1; min-height: 0;
   display: flex; flex-direction: column;
   background: #0d0e10;
-}
+  min-width: 0;
+  overflow: hidden;}
 .claudecode__tabs {
   height: 30px; flex: 0 0 30px;
   display: flex; align-items: center; gap: 2px;
@@ -529,7 +535,8 @@ button { font-family: inherit; cursor: pointer; }
   flex: 1; min-height: 0;
   display: flex; flex-direction: column;
   background: #0d0e10;
-}
+  min-width: 0;
+  overflow: hidden;}
 .codexpanel__tabs {
   height: 30px; flex: 0 0 30px;
   display: flex; align-items: center; gap: 2px;
@@ -749,8 +756,17 @@ button { font-family: inherit; cursor: pointer; }
 .chat__project-sub { font-size: 11px; color: var(--text-muted); margin-top: 1px; }
 .chat__header-actions { display: flex; align-items: center; gap: 2px; }
 
+/* Jul 19: keep code blocks from overflowing horizontally */
+.chat__thread pre {
+  max-width: 100%;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 .chat__thread {
   flex: 1; overflow-y: auto;
+  /* Jul 19: clip wide code blocks so they do not push the thread wider than the panel */
+  overflow-x: hidden;
   padding: 14px 16px;
   display: flex; flex-direction: column; gap: 14px;
   min-height: 0;
@@ -3472,6 +3488,74 @@ pre:hover .code-copy { opacity: 1; }
   font-size: 12px; color: var(--text-muted);
   margin-bottom: 13px;
 }
+
+/* ---- Left panel tabs: add-on style cards (Jul 19) ------------------------
+   Substantial card-per-tab look replacing the old bare checkboxes. Each card
+   = icon tile + name/description + iOS-style toggle switch on the right.
+   The real <input type=checkbox data-lpt> is visually hidden inside the
+   switch; the handler in renderAISettings() reads/writes it unchanged. */
+.settings-tab-toggles {
+  display: flex; flex-direction: column; gap: 10px;
+  margin-top: 14px;
+}
+.lpt-card {
+  display: flex; align-items: center; gap: 14px;
+  padding: 13px 15px;
+  background: #17181b;
+  border: 1px solid #26282e;
+  border-radius: 12px;
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+.lpt-card:hover { border-color: #34363d; background: #191a1e; }
+.lpt-card:has(input:checked) {
+  border-color: rgba(168,85,247,.42);
+  background: rgba(168,85,247,.07);
+}
+.lpt-card__icon {
+  width: 38px; height: 38px; flex: 0 0 38px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 9px;
+  background: #202227;
+  color: #b9bec7;
+  transition: background 120ms ease, color 120ms ease;
+}
+.lpt-card:has(input:checked) .lpt-card__icon {
+  background: rgba(168,85,247,.15);
+  color: #c8a6ff;
+}
+.lpt-card__icon svg { width: 19px; height: 19px; }
+.lpt-card__text {
+  flex: 1; min-width: 0;
+  display: flex; flex-direction: column; gap: 2px;
+}
+.lpt-card__name { font-size: 13.5px; font-weight: 650; color: #e6e9ef; }
+.lpt-card__sub { font-size: 11.5px; color: #8b909a; }
+
+/* iOS-style toggle switch. The hidden checkbox sits above the track so the
+   whole card (a <label>) toggles it; :checked drives track color + thumb. */
+.lpt-switch {
+  position: relative; flex: 0 0 auto;
+  width: 40px; height: 23px;
+}
+.lpt-switch input {
+  position: absolute; inset: 0;
+  opacity: 0; margin: 0; cursor: pointer; z-index: 2;
+}
+.lpt-switch__track {
+  position: absolute; inset: 0;
+  background: #3a3d44; border-radius: 999px;
+  transition: background 140ms ease;
+}
+.lpt-switch__thumb {
+  position: absolute; top: 3px; left: 3px;
+  width: 17px; height: 17px; border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(0,0,0,.35);
+  transition: transform 140ms ease;
+}
+.lpt-switch input:checked ~ .lpt-switch__track { background: #a855f7; }
+.lpt-switch input:checked ~ .lpt-switch__track .lpt-switch__thumb { transform: translateX(17px); }
 .settings-page__title {
   font-size: 20px; font-weight: 800; color: var(--text-primary);
   margin-bottom: 3px;

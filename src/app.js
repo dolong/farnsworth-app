@@ -117,6 +117,11 @@ const state = {
     // Injected into farnsworth-test.py as FARNSWORTH_TEST_MODEL by the
     // test:run spawns; a per-step "model" field still overrides. Jul 12.
     testingModel: 'Sonnet 5',
+    // Left-panel tab visibility (Jul 19). Each key corresponds to one of the
+    // lefttab buttons (chat / terminal / claudecode / codex). false = hide.
+    // Default all-on; users disable in Settings → AI → Left panel tabs.
+    // Migrating older saved settings: missing key means the tab is shown.
+    leftPanelTabs: { chat: true, terminal: true, claudecode: true, codex: true },
     // Honest rows only — see ROUTING_CALL_SITES above for the id → call
     // site mapping. behavior/verification/streaming were removed Jul 13
     // (persisted with zero consumers since day 1 — dead-controls audit).
@@ -233,6 +238,9 @@ function modelToApiId(displayName) {
     'Sonnet 4.5': 'claude-sonnet-4-5',
     'Haiku 4.5': 'claude-haiku-4-5',
     'Fable 5': 'claude-fable-5',
+    'GPT-5.6 Sol': 'gpt-5.6-sol',
+    'GPT-5.6 Terra': 'gpt-5.6-terra',
+    'GPT-5.6 Luna': 'gpt-5.6-luna',
   };
   return map[displayName] || displayName; // pass through if already an API id
 }
@@ -262,6 +270,9 @@ const CHAT_MODEL_OPTIONS = [
   { display: 'Sonnet 4.5',    effort: 'high', desc: '200k context · balanced' },
   { display: 'Haiku 4.5',     effort: null,   desc: '200k context · fastest' },
   { display: 'Fable 5',       effort: 'high', desc: 'Vellum default (Jul 2 ~16:00 ET)' },
+  { display: 'GPT-5.6 Sol',   effort: null,   desc: 'OpenAI · 1.05M context · advanced reasoning' },
+  { display: 'GPT-5.6 Terra', effort: null,   desc: 'OpenAI · 1.05M context · balanced' },
+  { display: 'GPT-5.6 Luna',  effort: null,   desc: 'OpenAI · 1.05M context · fast + affordable' },
 ];
 
 // Model picker popover — anchored under a dropdown button in Settings → AI.
@@ -323,6 +334,21 @@ function openModelPicker(anchorBtn, settingsKey = 'defaultModel', onPick = null,
     pop.appendChild(row);
   }
   document.body.appendChild(pop);
+
+  // Jul 19: flip the popover ABOVE the anchor when it would overflow the
+  // viewport bottom (the chat-input model chip sits near the window bottom,
+  // so a downward-opening picker would render off-screen). Also nudge it
+  // left if it would spill past the right edge.
+  {
+    const ph = pop.offsetHeight;
+    const pw = pop.offsetWidth;
+    if (r.bottom + 6 + ph > window.innerHeight - 8) {
+      pop.style.top = Math.max(8, r.top - 6 - ph) + 'px';
+    }
+    if (r.left + pw > window.innerWidth - 8) {
+      pop.style.left = Math.max(8, window.innerWidth - 8 - pw) + 'px';
+    }
+  }
 
   // Close on outside click or Escape
   const close = () => { pop.remove(); document.removeEventListener('click', onOutside); };
@@ -6537,7 +6563,92 @@ function renderAISettings() {
       </div>
       <div class="routing-table"></div>
     </div>
+
+    <div class="settings-section" data-lpt-section>
+      <div class="settings-section__title">Left panel tabs</div>
+      <div class="settings-section__desc">Choose which tabs appear in the left panel. Hide what you don't use; the visible tabs take the freed-up space. At least one tab must stay on.</div>
+      <div class="settings-tab-toggles">
+        <label class="lpt-card" data-lpt-card="chat">
+          <span class="lpt-card__icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+          </span>
+          <span class="lpt-card__text">
+            <span class="lpt-card__name">AI Chat</span>
+            <span class="lpt-card__sub">Claude via the Anthropic API</span>
+          </span>
+          <span class="lpt-switch">
+            <input type="checkbox" data-lpt="chat">
+            <span class="lpt-switch__track"><span class="lpt-switch__thumb"></span></span>
+          </span>
+        </label>
+        <label class="lpt-card" data-lpt-card="claudecode">
+          <span class="lpt-card__icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.6L19.5 10l-5.6 1.4L12 17l-1.9-5.6L4.5 10l5.6-1.4z"/></svg>
+          </span>
+          <span class="lpt-card__text">
+            <span class="lpt-card__name">Claude Code</span>
+            <span class="lpt-card__sub">Anthropic's agentic CLI, in a panel</span>
+          </span>
+          <span class="lpt-switch">
+            <input type="checkbox" data-lpt="claudecode">
+            <span class="lpt-switch__track"><span class="lpt-switch__thumb"></span></span>
+          </span>
+        </label>
+        <label class="lpt-card" data-lpt-card="codex">
+          <span class="lpt-card__icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l8.66 5v10L12 22l-8.66-5V7z"/><path d="M12 8v8M8 10v4M16 10v4"/></svg>
+          </span>
+          <span class="lpt-card__text">
+            <span class="lpt-card__name">Codex</span>
+            <span class="lpt-card__sub">OpenAI's coding CLI, in a panel</span>
+          </span>
+          <span class="lpt-switch">
+            <input type="checkbox" data-lpt="codex">
+            <span class="lpt-switch__track"><span class="lpt-switch__thumb"></span></span>
+          </span>
+        </label>
+        <label class="lpt-card" data-lpt-card="terminal">
+          <span class="lpt-card__icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 17l6-6-6-6"/><path d="M12 19h8"/></svg>
+          </span>
+          <span class="lpt-card__text">
+            <span class="lpt-card__name">Terminal</span>
+            <span class="lpt-card__sub">Local shell sessions</span>
+          </span>
+          <span class="lpt-switch">
+            <input type="checkbox" data-lpt="terminal">
+            <span class="lpt-switch__track"><span class="lpt-switch__thumb"></span></span>
+          </span>
+        </label>
+      </div>
+    </div>
   `;
+
+  // Initialize Left panel tab visibility toggles (Jul 19).
+  // Each checkbox reflects state.settings.leftPanelTabs[name]; flipping it
+  // writes to state + persists + re-applies visibility to the left tabs row.
+  const lptSection = wrap.querySelector('[data-lpt-section]');
+  if (lptSection) {
+    const tabs = s.leftPanelTabs || (s.leftPanelTabs = { chat: true, terminal: true, claudecode: true, codex: true });
+    lptSection.querySelectorAll('input[data-lpt]').forEach(input => {
+      const key = input.getAttribute('data-lpt');
+      input.checked = tabs[key] !== false;  // default-on
+      input.addEventListener('change', () => {
+        // Enforce "at least one tab must stay on" — last visible checkbox
+        // can't be unchecked.
+        const all = ['chat', 'terminal', 'claudecode', 'codex'];
+        const wouldBeOn = all.filter(k => k === key ? input.checked : (s.leftPanelTabs[k] !== false));
+        if (wouldBeOn.length === 0) {
+          input.checked = true;
+          s.leftPanelTabs[key] = true;
+          return;
+        }
+        s.leftPanelTabs[key] = input.checked;
+        persistSettings();
+        applyLeftPanelTabsVisibility();
+      });
+    });
+  }
 
   // Build the Claude auth section content
   const authSection = wrap.querySelector('#ai-auth-section');
@@ -9215,6 +9326,8 @@ function wire() {
   $('#lefttab-terminal')?.addEventListener('click', () => switchLeftPanel('terminal'));
   $('#lefttab-claudecode')?.addEventListener('click', () => switchLeftPanel('claudecode'));
   $('#lefttab-codex')?.addEventListener('click', () => switchLeftPanel('codex'));
+  // Jul 19: apply visibility settings on startup so hidden tabs stay hidden.
+  applyLeftPanelTabsVisibility();
   $('#claude-code-new-tab')?.addEventListener('click', () => {
     if (state.leftPanel !== 'claudecode') switchLeftPanel('claudecode');
     addClaudeCodeTab();
@@ -9378,6 +9491,14 @@ function wire() {
   }));
 
   // Chat input
+  // Jul 19: the model chip in the chat composer opens the same model picker
+  // as Settings -> AI (defaultModel). Was previously inert -- Long flagged
+  // that clicking "Opus 4.8 High" did nothing. openModelPicker(defaultModel)
+  // writes + persists + syncs this chip via updateChatInputModelButton().
+  $('#chat-model')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    openModelPicker(document.getElementById('chat-model'));
+  });
   $('#chat-send').addEventListener('click', sendChatMessage);
   $('#chat-input').addEventListener('keydown', e => {
     // Enter submits; Shift+Enter inserts a newline (default textarea
@@ -11760,7 +11881,39 @@ async function closeTerminalTab(tabId) {
   renderTerminalTabs();
 }
 
+// Apply left-panel-tab visibility settings (Jul 19).
+// Hides the lefttab buttons for any tab whose setting is explicitly false.
+// If the currently-active tab gets hidden, falls back to the first remaining
+// visible tab. Called on startup and whenever the user toggles a checkbox
+// in Settings → AI → Left panel tabs.
+function applyLeftPanelTabsVisibility() {
+  const tabs = state.settings.leftPanelTabs || {};
+  const allTabs = ['chat', 'terminal', 'claudecode', 'codex'];
+  let activeStillVisible = false;
+  for (const t of allTabs) {
+    const btn = document.getElementById('lefttab-' + t);
+    if (!btn) continue;
+    const visible = tabs[t] !== false;
+    btn.style.display = visible ? '' : 'none';
+    if (visible && state.leftPanel === t) activeStillVisible = true;
+  }
+  // If the active tab was hidden, fall back to the first visible one.
+  if (!activeStillVisible) {
+    const fallback = allTabs.find(t => tabs[t] !== false && document.getElementById('lefttab-' + t));
+    if (fallback && state.leftPanel !== fallback) switchLeftPanel(fallback);
+  }
+}
+
 function switchLeftPanel(tab) {
+  // Jul 19: refuse to switch to a tab the user has hidden via settings.
+  // The render path already hides the button, but a stale state.leftPanel
+  // could still be set from before the setting was toggled.
+  const tabs = state.settings.leftPanelTabs || {};
+  if (tabs[tab] === false) {
+    const fallback = ['chat', 'terminal', 'claudecode', 'codex'].find(t => tabs[t] !== false);
+    if (fallback) tab = fallback;
+    else return;
+  }
   state.leftPanel = tab;
   const chatPane = $('#chat-pane');
   const termPane = $('#terminal-pane');
