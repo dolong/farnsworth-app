@@ -1271,12 +1271,15 @@ pre:hover .code-copy { opacity: 1; }
   max-width: 240px;
 }
 .chat__attachment-thumb {
-  width: 32px;
-  height: 32px;
-  border-radius: 6px;
+  /* Jul 28: shrunk 32px -> 20px per Long's request -- image attachments
+     should read as a tiny confirmation thumbnail, not a preview. */
+  width: 20px;
+  height: 20px;
+  border-radius: 4px;
   object-fit: cover;
-  flex: 0 0 32px;
+  flex: 0 0 20px;
   background: #1a1b1e;
+  border: 1px solid #2f3138;
 }
 .chat__attachment-label {
   font-size: 11px;

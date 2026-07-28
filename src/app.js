@@ -418,6 +418,18 @@ function openModelPicker(anchorBtn, settingsKey = 'defaultModel', onPick = null,
 // ============================================================================
 function $(sel) { return document.querySelector(sel); }
 function $$(sel) { return Array.from(document.querySelectorAll(sel)); }
+// Jul 28: hoisted to module scope. Was nested inside wire() (only reachable
+// by other code inside wire()) but renderChatAttachments() and the chat send
+// path are both top-level functions outside wire() -- calling formatBytes()
+// from either threw "ReferenceError: formatBytes is not defined" and silently
+// broke the attachment chip strip (caught while verifying attachment
+// thumbnails still worked after the Jul 27 timeline rebuild).
+function formatBytes(n) {
+  if (!Number.isFinite(n)) return '';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
 function el(tag, attrs = {}, ...children) {
   const node = document.createElement(tag);
   Object.entries(attrs).forEach(([k, v]) => {
@@ -10191,12 +10203,6 @@ function wire() {
   // (images) + ~23:55 ET (files).
 
 
-  function formatBytes(n) {
-    if (!Number.isFinite(n)) return '';
-    if (n < 1024) return `${n} B`;
-    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-    return `${(n / (1024 * 1024)).toFixed(1)} MB`;
-  }
 
   // Chat history dropdown — toggle, new chat, list delegation, delete.
   $('#chat-history-toggle')?.addEventListener('click', (ev) => {
