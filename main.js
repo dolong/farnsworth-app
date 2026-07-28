@@ -428,6 +428,26 @@ function buildMenu() {
         { type: 'separator' },
         { role: 'reload' },
         { role: 'toggleDevTools' },
+        // Preview devtools is a DIFFERENT webContents from the app renderer —
+        // ⌥⌘I inspects Farnsworth's own UI, ⇧⌘I inspects the game/app running
+        // in the canvas. Falls back to the focused window's devtools when no
+        // WebContentsView preview is open (e.g. Post View). (Jul 25)
+        {
+          label: 'Inspect Canvas Preview',
+          accelerator: 'CmdOrCtrl+Shift+I',
+          click: () => {
+            const view = canvasWebContentsViews.values().next().value;
+            if (view) {
+              try {
+                const wc = view.webContents;
+                wc.isDevToolsOpened() ? wc.closeDevTools() : wc.openDevTools({ mode: 'detach' });
+              } catch {}
+              return;
+            }
+            const w = BrowserWindow.getFocusedWindow();
+            if (w) { try { w.webContents.toggleDevTools(); } catch {} }
+          },
+        },
         { type: 'separator' },
         { role: 'togglefullscreen' },
       ],
@@ -971,6 +991,25 @@ ipcMain.handle('devvit:set-project-settings', async (_event, workspacePath, curr
 //   target — its own debugger target is at port 9222 type=page
 
 const canvasWebContentsViews = new Map();
+const _CANVAS_IFRAME_RECT_JS =
+  '(function(){var f=document.querySelector("iframe[src*=localhost]")' +
+  '||document.querySelector("iframe");' +
+  'if(!f)return null;var r=f.getBoundingClientRect();' +
+  'return {x:Math.max(0,Math.round(r.left)),y:Math.max(0,Math.round(r.top)),' +
+  'width:Math.round(r.width),height:Math.round(r.height)};})()';
+const captureCanvasPNG = async () => {
+  const entries = [...canvasWebContentsViews.entries()];
+  if (entries.length) {
+    const img = await entries[entries.length - 1][1].webContents.capturePage();
+    return (img && !img.isEmpty()) ? img : null;
+  }
+  try {
+    const r = await mainWindow.webContents.executeJavaScript(_CANVAS_IFRAME_RECT_JS, true);
+    if (!r || r.width <= 0) return null;
+    const img = await mainWindow.webContents.capturePage(r);
+    return (img && !img.isEmpty()) ? img : null;
+  } catch { return null; }
+};
 // Desired content zoom factor per view (set via canvas:setZoomFactor).
 // Electron persists per-origin zoom levels in the persist:farnsworth
 // partition and RESTORES them when a navigation commits — silently
@@ -1018,10 +1057,79 @@ ipcMain.handle('canvas:setNetworkAccess', (_event, { allowed }) => {
 ipcMain.handle('canvas:openDevTools', (_event, args) => {
   const wanted = args && args.viewId;
   const view = wanted ? canvasWebContentsViews.get(wanted) : canvasWebContentsViews.values().next().value;
-  if (!view) return { ok: false, error: 'No preview open' };
-  try { view.webContents.openDevTools({ mode: 'detach' }); return { ok: true }; }
+  if (!view) {
+    // Post View is a plain DOM <iframe> living in the MAIN renderer, not a
+    // WebContentsView — so its DOM is inspectable from the main window's
+    // devtools (expand the iframe node in the Elements tree). Falling back
+    // beats the old "No preview open" dead end. (Jul 25)
+    try {
+      mainWindow.webContents.openDevTools({ mode: 'detach' });
+      return { ok: true, target: 'renderer' };
+    } catch (e) { return { ok: false, error: 'No preview open' }; }
+  }
+  try {
+    const wc = view.webContents;
+    if (wc.isDevToolsOpened()) { wc.closeDevTools(); return { ok: true, target: 'preview', closed: true }; }
+    wc.openDevTools({ mode: 'detach' });
+    return { ok: true, target: 'preview' };
+  }
   catch (e) { return { ok: false, error: String(e.message || e) }; }
 });
+
+// Right-click menu on a preview view — gives the canvas the same affordances
+// as a real Chrome tab, most importantly **Inspect Element**.
+//
+// Why this is worth having: the preview is a WebContentsView, a separate
+// composited layer with its own webContents. Without a context-menu handler
+// it swallows right-clicks entirely, so the only way in was the command
+// palette (whole-page devtools, no node targeting). `params.x`/`params.y`
+// arrive already view-relative, so `inspectElement` lands on the exact node
+// under the cursor.
+//
+// The Styles/Computed panes are also the ONLY practical way to see
+// user-agent-origin rules, which no diff of author CSS can reveal — see the
+// Jul 25 `.squad-slot { align-items }` bug where Chromium 126 kept a UA rule
+// Chrome 150 had dropped. (Jul 25)
+function attachPreviewContextMenu(view, devToolsEnabled) {
+  view.webContents.on('context-menu', (_event, params) => {
+    const wc = view.webContents;
+    const template = [];
+
+    if (params.selectionText) {
+      template.push(
+        { role: 'copy' },
+        { label: 'Copy selection', click: () => { try { clipboard.writeText(params.selectionText); } catch {} } },
+      );
+    }
+    if (params.linkURL) {
+      template.push({ label: 'Copy link address', click: () => { try { clipboard.writeText(params.linkURL); } catch {} } });
+    }
+    if (params.srcURL) {
+      template.push({ label: 'Copy image address', click: () => { try { clipboard.writeText(params.srcURL); } catch {} } });
+    }
+    if (template.length) template.push({ type: 'separator' });
+
+    template.push(
+      { label: 'Reload Preview', click: () => { try { wc.reload(); } catch {} } },
+      { label: 'Reload, Ignoring Cache', click: () => { try { wc.reloadIgnoringCache(); } catch {} } },
+    );
+
+    if (devToolsEnabled) {
+      template.push(
+        { type: 'separator' },
+        { label: 'Inspect Element', click: () => { try { wc.inspectElement(params.x, params.y); } catch {} } },
+        {
+          label: wc.isDevToolsOpened() ? 'Close Preview DevTools' : 'Open Preview DevTools',
+          click: () => {
+            try { wc.isDevToolsOpened() ? wc.closeDevTools() : wc.openDevTools({ mode: 'detach' }); } catch {}
+          },
+        },
+      );
+    }
+
+    try { Menu.buildFromTemplate(template).popup({ window: mainWindow }); } catch {}
+  });
+}
 
 
 ipcMain.handle('canvas:createView', async (_event, { viewId, url, bounds, opts }) => {
@@ -1063,6 +1171,7 @@ ipcMain.handle('canvas:createView', async (_event, { viewId, url, bounds, opts }
     view.webContents.on('did-navigate', applyZoom);
     view.webContents.on('did-finish-load', applyZoom);
     view.webContents.loadURL(url);
+    attachPreviewContextMenu(view, !opts || opts.devTools !== false);
     canvasWebContentsViews.set(viewId, view);
     return { ok: true };
   } catch (e) {
@@ -1485,6 +1594,8 @@ const TEST_RUNNER_PATH = path.join(app.getAppPath(), 'farnsworth-test.py');
 // and full API ids. Returns null when the setting is unset (runner default:
 // claude-sonnet-4-5).
 const MODEL_DISPLAY_TO_API = {
+  'Opus 5': 'claude-opus-5',
+  'Opus 5 High': 'claude-opus-5',
   'Opus 4.8': 'claude-opus-4-8',
   'Opus 4.8 High': 'claude-opus-4-8',
   'Opus 4.7': 'claude-opus-4-7',
@@ -2708,7 +2819,10 @@ ipcMain.handle('fs:listFiles', async (_event, folderPath, opts = {}) => {
 // ============================================================
 const API_KEY_PROVIDERS = ['anthropic-console', 'openai-api'];
 function apiKeyProvider(p) {
-  return API_KEY_PROVIDERS.includes(p) ? p : 'anthropic-console';
+  if (API_KEY_PROVIDERS.includes(p)) return p;
+  // Jul 19: per-endpoint key slots for custom inference (custom-<id>).
+  if (typeof p === 'string' && /^custom-[A-Za-z0-9_.-]+$/.test(p)) return p;
+  return 'anthropic-console';
 }
 
 ipcMain.handle('auth:setApiKey', async (_event, key, provider) => {
@@ -3556,6 +3670,49 @@ const AGENT_TOOLS = [
       },
       required: ['query']
     }
+  },
+  {
+    name: 'take_canvas_screenshot',
+    description: 'Take a screenshot of the active canvas preview and return the image so you can see what the app currently looks like. Returns the image directly — use this to verify UI state, discover selectors for test automation, inspect layout, or confirm the result of a code change. Must have an active preview (set_preview or set_canvas_view first if needed).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        filename: { type: 'string', description: 'Optional PNG filename saved to /tmp/ (e.g. "lobby.png"). Defaults to canvas-<timestamp>.png.' }
+      }
+    }
+  },
+  {
+    name: 'set_canvas_view',
+    description: 'Switch the canvas preview\'s top-level view. "live" shows the running app/game (Live Preview), "storybook" shows the component storybook, "code" shows the Monaco code editor. Use when the user asks to switch to live preview, storybook, or code view.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        view: { type: 'string', enum: ['live', 'storybook', 'code'], description: 'Which top-level canvas view to show.' }
+      },
+      required: ['view']
+    }
+  },
+  {
+    name: 'set_preview',
+    description: 'Within Live Preview, switch which surface shape is shown: "post" (Reddit post view), "mobile" (app mobile), "desktop" (app desktop), "fullscreen", or "testview" (test runner). Auto-switches the canvas into live view if it is not already. Use when the user asks to see the mobile view, desktop view, post view, etc.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        preview: { type: 'string', enum: ['post', 'mobile', 'desktop', 'fullscreen', 'testview'], description: 'Which live-preview surface to show.' }
+      },
+      required: ['preview']
+    }
+  },
+  {
+    name: 'switch_devvit_user',
+    description: 'Switch the active Devvit emulator user for the open project (the user the running game/app sees as the current Reddit user). Restarts the dev server so the change takes effect. Requires an open workspace folder with a Devvit project. Use when the user asks to switch to a different emulator user (e.g. "switch to u/bob").',
+    input_schema: {
+      type: 'object',
+      properties: {
+        username: { type: 'string', description: 'The Devvit emulator username to switch to. Case-insensitive; the leading "u/" is optional.' }
+      },
+      required: ['username']
+    }
   }
 ];
 
@@ -3594,6 +3751,20 @@ async function executeAgentTool(name, input) {
     return { ok: true, result: fmt.join('\n\n') || 'No memory matches for that query.' };
   }
 
+  if (name === 'take_canvas_screenshot') {
+    const img = await captureCanvasPNG();
+    if (!img) return { ok: false, error: 'no_canvas', message: 'No active canvas view. Switch to a preview mode first (e.g. set_preview("mobile") or set_canvas_view("live")).' };
+    const ts = Date.now();
+    const raw = (typeof input?.filename === 'string' && input.filename.trim())
+      ? input.filename.replace(/[^a-z0-9._-]/gi, '_')
+      : `canvas-${ts}.png`;
+    const filename = raw.endsWith('.png') ? raw : raw + '.png';
+    const outPath = path.join('/tmp', filename);
+    const pngBuf = img.toPNG();
+    await fs.writeFile(outPath, pngBuf);
+    const sz = img.getSize();
+    return { ok: true, path: outPath, base64: pngBuf.toString('base64'), width: sz.width, height: sz.height };
+  }
   const folder = db.getSetting('currentFolder');
   if (!folder) {
     return { ok: false, error: 'no_folder', message: 'No workspace folder open. Open a folder first.' };
@@ -3742,6 +3913,42 @@ async function executeAgentTool(name, input) {
     target.webContents.send('canvas:setPreview', { preview: 'testview' });
     return { ok: true, preview: 'testview' };
   }
+  if (name === 'set_canvas_view') {
+    const view = input?.view;
+    if (!['live', 'storybook', 'code'].includes(view)) {
+      return { ok: false, error: 'bad_view', message: 'view must be one of: live, storybook, code' };
+    }
+    const target = BrowserWindow.getFocusedWindow() || mainWindow || openWindows[0];
+    if (!target || target.isDestroyed()) return { ok: false, error: 'no_window' };
+    target.webContents.send('canvas:setMode', { mode: view });
+    return { ok: true, view };
+  }
+  if (name === 'set_preview') {
+    const preview = input?.preview;
+    if (!['post', 'mobile', 'desktop', 'fullscreen', 'testview'].includes(preview)) {
+      return { ok: false, error: 'bad_preview', message: 'preview must be one of: post, mobile, desktop, fullscreen, testview' };
+    }
+    const target = BrowserWindow.getFocusedWindow() || mainWindow || openWindows[0];
+    if (!target || target.isDestroyed()) return { ok: false, error: 'no_window' };
+    // Reuse the existing canvas:setPreview channel (also auto-switches to live).
+    target.webContents.send('canvas:setPreview', { preview });
+    return { ok: true, preview };
+  }
+  if (name === 'switch_devvit_user') {
+    const raw = String(input?.username || '').trim().replace(/^u\//i, '');
+    if (!raw) return { ok: false, error: 'no_username', message: 'username is required' };
+    let users = [];
+    try { users = db.devvitListUsers() || []; }
+    catch (e) { return { ok: false, error: 'db_error', message: String(e && e.message || e) }; }
+    const match = users.find(u => String(u.username || '').replace(/^u\//i, '').toLowerCase() === raw.toLowerCase());
+    if (!match) {
+      return { ok: false, error: 'user_not_found', message: `No emulator user "${raw}". Available: ${users.map(u => u.username).join(', ') || '(none)'}`, available: users.map(u => u.username) };
+    }
+    const target = BrowserWindow.getFocusedWindow() || mainWindow || openWindows[0];
+    if (!target || target.isDestroyed()) return { ok: false, error: 'no_window' };
+    target.webContents.send('devvit:agentSwitchUser', { userId: match.id, username: match.username });
+    return { ok: true, username: match.username, note: 'Switching user and restarting the dev server.' };
+  }
   if (name === 'ui_show') {
     // Renderer-side tool. The renderer's sendChatMessage() stream handler
     // intercepts this BEFORE calling executeTool (see src/app.js), so this
@@ -3827,6 +4034,16 @@ function isOpenAIModel(model) {
   return typeof model === 'string' && /^(gpt-|o[0-9]|chatgpt-|openai\/)/i.test(model);
 }
 
+// Jul 19: OpenAI reasoning models (o-series, gpt-5.x) REJECT function tools
+// in /v1/chat/completions unless reasoning_effort is 'none' (the API points
+// to /v1/responses otherwise). Farnsworth's chat is agentic -- it always
+// sends tools -- so without this, selecting a GPT-5.6 model + sending a
+// message 400s. We set reasoning_effort:'none' only for reasoning models
+// when tools are present; gpt-4o and non-OpenAI custom models are untouched.
+function isReasoningModel(model) {
+  return typeof model === 'string' && /(^|\/)(o[0-9]|gpt-5)/i.test(model);
+}
+
 function getOpenAIKey() {
   const t = db.getAuthToken('openai-api');
   if (t && t.accessToken) return t.accessToken;
@@ -3839,6 +4056,29 @@ function getOpenAIKey() {
     }
   } catch {}
   return null;
+}
+
+// Jul 19: custom-inference connection registry. The renderer registers
+// OpenAI-compatible endpoints (name + baseURL + keyRef) in settings and
+// passes the resolved connection as opts.endpoint on each inference call.
+// The base URL + key come from the connection; everything else (message /
+// tool / response translation) is already provider-agnostic below.
+// endpoint shape: { name, baseURL, keyRef }.
+function endpointBase(ep) {
+  if (ep && typeof ep.baseURL === 'string' && ep.baseURL.trim()) {
+    return ep.baseURL.trim().replace(/\/+$/, '');
+  }
+  return OPENAI_BASE;
+}
+function resolveEndpointKey(ep) {
+  // A custom endpoint stores its key in its own encrypted slot (keyRef).
+  if (ep && ep.keyRef) {
+    const t = db.getAuthToken(ep.keyRef);
+    if (t && t.accessToken) return t.accessToken;
+    return null;
+  }
+  // No endpoint (built-in GPT models) -> the shared OpenAI key.
+  return getOpenAIKey();
 }
 
 function oaSafeJson(s) {
@@ -3933,16 +4173,18 @@ function toOpenAITools(tools) {
 // Blocking send against OpenAI. Returns the same shape as the Anthropic path.
 async function openAISend(opts) {
   const model = opts.model;
-  const key = getOpenAIKey();
-  if (!key) return { ok: false, error: 'no_auth', message: 'No OpenAI API key -- paste one in Settings > AI > OpenAI.' };
+  const ep = opts.endpoint || null;
+  const base = endpointBase(ep);
+  const key = resolveEndpointKey(ep);
+  if (!key) return { ok: false, error: 'no_auth', message: ep ? `No API key for endpoint "${ep.name || base}" -- add one in Settings > AI > Custom inference.` : 'No OpenAI API key -- paste one in Settings > AI > OpenAI.' };
   const messages = Array.isArray(opts.messages) ? opts.messages : [];
   const system = typeof opts.system === 'string' ? opts.system : null;
   const maxTokens = Number.isFinite(opts.maxTokens) ? opts.maxTokens : 16384;
   const body = { model, messages: toOpenAIMessages(messages, system), max_completion_tokens: maxTokens };
   const tools = toOpenAITools(opts.tools);
-  if (tools) body.tools = tools;
+  if (tools) { body.tools = tools; if (isReasoningModel(model)) body.reasoning_effort = 'none'; }
   try {
-    const res = await fetch(`${OPENAI_BASE}/chat/completions`, {
+    const res = await fetch(`${base}/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` },
       body: JSON.stringify(body),
@@ -3971,21 +4213,26 @@ async function openAISend(opts) {
 }
 
 // Streaming send against OpenAI. Emits Anthropic-shaped events via send().
-async function openAIStream(opts, send) {
+// `abortSignal` (Jul 27) lets the renderer's Stop button kill an in-flight
+// turn on the OpenAI / custom-endpoint path too, not just Anthropic.
+async function openAIStream(opts, send, abortSignal) {
   const model = opts.model;
-  const key = getOpenAIKey();
-  if (!key) { send({ type: 'error', error: 'no_auth', message: 'No OpenAI API key -- paste one in Settings > AI > OpenAI.' }); return { ok: false }; }
+  const ep = opts.endpoint || null;
+  const base = endpointBase(ep);
+  const key = resolveEndpointKey(ep);
+  if (!key) { send({ type: 'error', error: 'no_auth', message: ep ? `No API key for endpoint "${ep.name || base}" -- add one in Settings > AI > Custom inference.` : 'No OpenAI API key -- paste one in Settings > AI > OpenAI.' }); return { ok: false }; }
   const messages = Array.isArray(opts.messages) ? opts.messages : [];
   const system = typeof opts.system === 'string' ? opts.system : null;
   const maxTokens = Number.isFinite(opts.maxTokens) ? opts.maxTokens : 16384;
   const body = { model, messages: toOpenAIMessages(messages, system), max_completion_tokens: maxTokens, stream: true, stream_options: { include_usage: true } };
   const tools = toOpenAITools(opts.tools);
-  if (tools) body.tools = tools;
+  if (tools) { body.tools = tools; if (isReasoningModel(model)) body.reasoning_effort = 'none'; }
   try {
-    const res = await fetch(`${OPENAI_BASE}/chat/completions`, {
+    const res = await fetch(`${base}/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}`, 'Accept': 'text/event-stream' },
       body: JSON.stringify(body),
+      signal: abortSignal,
     });
     if (!res.ok) {
       const errBody = await res.text();
@@ -4054,6 +4301,11 @@ async function openAIStream(opts, send) {
     send({ type: 'done', result: { ok: true, text: fullText, content: blockArr, toolUses, stopReason, usage } });
     return { ok: true };
   } catch (e) {
+    // Stop-button abort — a normal outcome, same as the Anthropic path.
+    if (e?.name === 'AbortError') {
+      send({ type: 'cancelled' });
+      return { ok: false, cancelled: true };
+    }
     send({ type: 'error', error: 'network', message: e.message });
     return { ok: false };
   }
@@ -4067,7 +4319,7 @@ ipcMain.handle('inference:send', async (_event, opts = {}) => {
   const model = opts.model || 'claude-opus-4-8';
   // Jul 19: route OpenAI-compatible models (GPT-5.6 Sol/Terra/Luna, etc.)
   // to the OpenAI adapter; the Anthropic path below stays unchanged.
-  if (isOpenAIModel(model)) return await openAISend({ ...opts, model });
+  if (isOpenAIModel(model) || opts.endpoint) return await openAISend({ ...opts, model });
   const maxTokens = Number.isFinite(opts.maxTokens) ? opts.maxTokens : 4096;
   const system = typeof opts.system === 'string' ? opts.system : null;
 
@@ -4239,25 +4491,54 @@ ipcMain.handle('git:commit', async (_e, opts = {}) => {
 // Handles text_delta streaming AND tool_use streaming (accumulate
 // partial_json per block index, JSON.parse on block_stop).
 // ------------------------------------------------------------
+// Jul 27: in-flight stream registry so the renderer's Stop button can kill a
+// turn mid-flight. requestId -> AbortController. Aborting rejects the pending
+// fetch / reader.read() with AbortError, which the handlers below report as
+// type:'cancelled' (a normal outcome) rather than type:'error'.
+const activeInferenceStreams = new Map();
+
+// Cancel one in-flight stream, or every one when requestId is omitted.
+// Idempotent: cancelling an already-finished request is a no-op.
+ipcMain.handle('inference:cancel', async (_event, requestId) => {
+  const ids = requestId ? [requestId] : Array.from(activeInferenceStreams.keys());
+  let aborted = 0;
+  for (const id of ids) {
+    const ctrl = activeInferenceStreams.get(id);
+    if (!ctrl) continue;
+    try { ctrl.abort(); aborted++; } catch {}
+    activeInferenceStreams.delete(id);
+  }
+  return { ok: true, aborted };
+});
+
 ipcMain.on('inference:stream', async (event, opts = {}) => {
   const requestId = opts.requestId || ('stream-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8));
   const send = (payload) => {
     if (!event.sender.isDestroyed()) event.sender.send('inference:chunk', { requestId, ...payload });
   };
+  const abortCtrl = new AbortController();
+  activeInferenceStreams.set(requestId, abortCtrl);
+  const clearStream = () => { activeInferenceStreams.delete(requestId); };
 
   const messages = Array.isArray(opts.messages) ? opts.messages : [];
   if (messages.length === 0) {
+    clearStream();
     send({ type: 'error', error: 'No messages to send' });
     return { ok: false };
   }
   const model = opts.model || 'claude-opus-4-8';
   // Jul 19: route OpenAI-compatible models to the streaming OpenAI adapter.
-  if (isOpenAIModel(model)) { await openAIStream({ ...opts, model }, send); return; }
+  if (isOpenAIModel(model) || opts.endpoint) {
+    try { await openAIStream({ ...opts, model }, send, abortCtrl.signal); }
+    finally { clearStream(); }
+    return;
+  }
   const maxTokens = Number.isFinite(opts.maxTokens) ? opts.maxTokens : 4096;
   const system = typeof opts.system === 'string' ? opts.system : null;
 
   const auth = await getValidAccessToken();
   if (!auth) {
+    clearStream();
     send({ type: 'error', error: 'no_auth', message: 'No auth — sign in to Claude.ai or paste an API key in Settings → AI.' });
     return { ok: false };
   }
@@ -4283,6 +4564,7 @@ ipcMain.on('inference:stream', async (event, opts = {}) => {
       method: 'POST',
       headers,
       body: JSON.stringify(body),
+      signal: abortCtrl.signal,
     });
 
     if (!res.ok) {
@@ -4387,8 +4669,17 @@ ipcMain.on('inference:stream', async (event, opts = {}) => {
     send({ type: 'done', result });
     return { ok: true, requestId };
   } catch (e) {
+    // A Stop-button abort lands here as AbortError. That's a normal outcome,
+    // not a failure -- report it as 'cancelled' so the renderer can mark the
+    // message stopped instead of painting a red error bubble.
+    if (e?.name === 'AbortError') {
+      send({ type: 'cancelled' });
+      return { ok: false, cancelled: true };
+    }
     send({ type: 'error', error: 'network', message: e.message });
     return { ok: false };
+  } finally {
+    clearStream();
   }
 });
 
@@ -4671,12 +4962,23 @@ app.whenReady().then(async () => {
           relayClient.send({ type: 'claudeCode:output', companionId, tabId: entry.tabId, data });
         } catch (e) { /* connection might be down — safe to drop */ }
       };
+      // Snapshot recent output BEFORE hooking the live listener. JS is
+      // single-threaded and there are no awaits here, so no PTY 'data'
+      // event can fire between this snapshot and the hook below — the
+      // replay is zero-loss and stays ordered ahead of live bytes.
+      const replay = (typeof entry.getBuffer === 'function') ? entry.getBuffer() : '';
       entry.term.on('data', onData);
       companionClaudeAttachments.set(companionId, { term: entry.term, onData, tabId: entry.tabId });
       // Send the desktop's CURRENT cols/rows so the companion adopts the
       // desktop's winsize (and scales its font to fit) instead of resizing
       // the shared PTY down. The desktop is the sole size owner.
       relayClient.send({ type: 'claudeCode:attached', companionId, tabId: entry.tabId, ok: true, sessionId: entry.sessionId, cwd: entry.cwd, cols: entry.cols || 80, rows: entry.rows || 24 });
+      // Replay the buffered screen AFTER the attached ack so the companion
+      // has already sized its xterm to the desktop grid. This reconstructs
+      // the current screen; subsequent incremental TUI updates then paint
+      // correctly instead of into a blank buffer (Jul 21 fix for the blank
+      // companion Claude Code tab on an already-running session).
+      if (replay) relayClient.send({ type: 'claudeCode:output', companionId, tabId: entry.tabId, data: replay });
     });
     relayClient.on('claudeCode:input', (msg) => {
       const companionId = msg?.companionId || msg?.from || 'companion';
@@ -5195,9 +5497,19 @@ function startClaudeCodeServer() {
       // ~/.claude.json so subsequent PTY spawns in the same cwd skip it.
       // We only auto-accept ONCE per WS connection (track via promptSeen
       // flag) so we don't spam 'y' if the user opens a different prompt.
+      // Ring buffer of recent PTY output for the companion bridge. When a
+      // companion subscribes to an already-running session we replay this
+      // so its xterm reconstructs the CURRENT screen instead of showing
+      // blank until the next keystroke — the alt-screen TUI only emits
+      // incremental cursor-addressed updates, which need a base to paint
+      // onto (Jul 21 fix for the blank companion Claude Code tab).
+      let outBuf = '';
+      const OUT_BUF_CAP = 256 * 1024;
       let promptSeen = false;
       term.onData((data) => {
         send({ type: 'data', data });
+        outBuf += data;
+        if (outBuf.length > OUT_BUF_CAP) outBuf = outBuf.slice(outBuf.length - OUT_BUF_CAP);
         if (!promptSeen && /to skip this prompt/.test(data) && /\[y\/N\]/.test(data)) {
           promptSeen = true;
           setTimeout(() => {
@@ -5220,7 +5532,7 @@ function startClaudeCodeServer() {
       // PTY -- this just exposes it for piggyback read/write. tabId is
       // duplicated into the value so the bridge can echo it back in
       // claudeCode:output / claudeCode:exit without needing the Map key.
-      claudeCodePtys.set(tabId, { tabId, term, send, sessionId: useSessionId, cwd, cols: 80, rows: 24 });
+      claudeCodePtys.set(tabId, { tabId, term, send, sessionId: useSessionId, cwd, cols: 80, rows: 24, getBuffer: () => outBuf });
       send({ type: 'ready', tabId, sessionId: useSessionId });
     };
 
@@ -5777,7 +6089,24 @@ async function runSandboxedCommand(nonoBin, profileName, command, folder) {
     const child = spawn(
       nonoBin,
       ['wrap', '--profile', profileName, '--allow-cwd', '--', '/bin/sh', '-c', command],
-      { cwd: folder, env: { ...process.env } }
+      {
+        cwd: folder,
+        // Farnsworth launched from Finder / `open .app` inherits launchd's bare
+        // PATH (/usr/bin:/bin:/usr/sbin:/sbin), so Homebrew tools (node, npm,
+        // git, python3, uv, ...) are invisible to the sandboxed shell and the
+        // chat agent sees `command -v node` return nothing even though Node is
+        // installed. Prepend the Homebrew + /usr/local bins. Same class of fix
+        // as the terminal PTY PATH fix (Jul 4) — this call site never got it.
+        env: {
+          ...process.env,
+          PATH: [
+            '/opt/homebrew/bin',
+            '/opt/homebrew/sbin',
+            '/usr/local/bin',
+            process.env.PATH || '/usr/bin:/bin:/usr/sbin:/sbin',
+          ].join(':'),
+        },
+      }
     );
     child.stdout.on('data', d => { stdout += d.toString(); });
     child.stderr.on('data', d => { stderr += d.toString(); });

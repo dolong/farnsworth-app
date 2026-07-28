@@ -55,6 +55,22 @@ contextBridge.exposeInMainWorld('farnsworth', {
     ipcRenderer.on('canvas:setPreview', handler);
     return () => ipcRenderer.removeListener('canvas:setPreview', handler);
   },
+  // Programmatic canvas MODE switch (chat agent's set_canvas_view tool).
+  onCanvasSetMode: (callback) => {
+    const handler = (_e, payload) => {
+      try { callback(payload); } catch (err) { console.error('[canvas:setMode] handler error:', err); }
+    };
+    ipcRenderer.on('canvas:setMode', handler);
+    return () => ipcRenderer.removeListener('canvas:setMode', handler);
+  },
+  // Programmatic devvit user switch (chat agent's switch_devvit_user tool).
+  onDevvitAgentSwitchUser: (callback) => {
+    const handler = (_e, payload) => {
+      try { callback(payload); } catch (err) { console.error('[devvit:agentSwitchUser] handler error:', err); }
+    };
+    ipcRenderer.on('devvit:agentSwitchUser', handler);
+    return () => ipcRenderer.removeListener('devvit:agentSwitchUser', handler);
+  },
   canvasSetVisible: (viewId, visible) =>
     ipcRenderer.invoke('canvas:setVisible', { viewId, visible }),
   canvasSetZoomFactor: (viewId, factor) =>
@@ -173,8 +189,11 @@ contextBridge.exposeInMainWorld('farnsworth', {
   gitCommit: (opts) => ipcRenderer.invoke('git:commit', opts || {}),
   // Streaming — returns a Promise that resolves with the final result.
   // onChunk is called for each SSE event: { type: 'text_delta'|'tool_use_delta'|'block_stop'|..., ... }
+  // `opts.requestId` is honored when the caller supplies one, so the renderer
+  // can hold the id and cancel this exact stream via cancelStream() (Jul 27
+  // Stop button). Omitted -> one is generated as before.
   streamMessage: (opts, onChunk) => {
-    const requestId = 'stream-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+    const requestId = opts?.requestId || ('stream-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8));
     ipcRenderer.send('inference:stream', { ...opts, requestId });
     return new Promise((resolve, reject) => {
       const handler = (_e, payload) => {
@@ -182,6 +201,12 @@ contextBridge.exposeInMainWorld('farnsworth', {
         if (payload.type === 'done') {
           ipcRenderer.removeListener('inference:chunk', handler);
           resolve(payload.result);
+        } else if (payload.type === 'cancelled') {
+          // Stopped by the user. Resolve (don't reject) with a cancelled
+          // marker so the caller's tool loop can exit quietly instead of
+          // routing through its error path.
+          ipcRenderer.removeListener('inference:chunk', handler);
+          resolve({ ok: false, cancelled: true, text: '', content: [], toolUses: [] });
         } else if (payload.type === 'error') {
           ipcRenderer.removeListener('inference:chunk', handler);
           reject({ ok: false, error: payload.error, message: payload.message, status: payload.status });
@@ -192,6 +217,9 @@ contextBridge.exposeInMainWorld('farnsworth', {
       ipcRenderer.on('inference:chunk', handler);
     });
   },
+  // Abort an in-flight streamMessage. Pass the requestId used for the stream,
+  // or omit to cancel every in-flight stream.
+  cancelStream: (requestId) => ipcRenderer.invoke('inference:cancel', requestId),
   executeTool: (name, input) => ipcRenderer.invoke('inference:toolExecute', name, input),
   getAgentTools: () => ipcRenderer.invoke('inference:agentTools'),
 
