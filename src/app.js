@@ -38,6 +38,7 @@ const ROUTING_CALL_SITES = [
   { id: 'titles', name: 'Conversation titles', model: 'Haiku 4.5', savings: 'saves ~50× vs Opus', desc: 'Auto-named after the first exchange' },
   { id: 'commit', name: 'AI Commit message', model: 'Haiku 4.5', savings: 'saves ~50× vs Opus', desc: '⌘K → AI: Commit Changes', confirm: true },
   { id: 'review', name: 'AI Code review', model: 'Sonnet 5', desc: '⌘K → AI: Review Changes' },
+  { id: 'compaction', name: 'Context compaction summary', model: 'Haiku 4.5', savings: '~5× per-turn savings on long chats', desc: 'Summarizes older turns once a conversation grows past the compaction threshold (Jul 28 2026)' },
 ];
 
 const state = {
@@ -689,6 +690,144 @@ function sanitizeGeneratedTitle(raw) {
   let t = String(raw).split('\n')[0].trim();
   t = t.replace(/^["'`]+|["'`]+$/g, '').replace(/\.+$/, '').replace(/\s+/g, ' ').trim();
   return t.slice(0, 60);
+}
+
+// ============================================================================
+// CONTEXT COMPACTION (Jul 28 2026)
+//
+// Farnsworth's chat agent used to hard-truncate prior turns to the last 20
+// messages (Jul 9, ddc0834) with NO summary of what got dropped -- so a
+// conversation's first ~10 exchanges silently vanished from the model's
+// context once it ran long, while turns before that cap kicked in still
+// resent the full text of up to 20 messages every time, so cost still grew
+// with conversation length. This replaces the blind slice with token-aware
+// compaction: send full history verbatim while it's small, and once it
+// crosses a threshold, summarize everything except the last
+// COMPACTION_KEEP_LAST turns into a dense recap (via the routed
+// 'compaction' call site, Haiku 4.5 by default) instead of just dropping it.
+//
+// See /workspace/scratch/context-compaction.md for the original design doc
+// (written Jul 28 heartbeat) -- this follows it with one addition: the
+// summary is cached per-conversation and only recomputed when the
+// compactable boundary actually grows, so a long conversation doesn't pay
+// for a fresh Haiku summarization call on every single turn.
+// ============================================================================
+
+const COMPACTION_KEEP_LAST = 10;              // most recent turns kept verbatim
+const COMPACTION_DEFAULT_THRESHOLD = 100000;  // tokens; below this, no compaction
+
+// { convId -> { boundaryCount, summary } }. boundaryCount is the length of
+// the compactable slice the cached summary covers -- if a later turn's
+// compactable slice is still that same length (nothing new has aged out of
+// the keep-last window yet), the cached summary is still valid and we skip
+// another Haiku call.
+const _compactionCache = new Map();
+
+// ~4 chars/token is conservative for English + code (actual tends to run
+// closer to 3.5 for typical Farnsworth conversations). This only decides
+// WHEN to compact -- the real ceiling is enforced by the API itself, so
+// erring conservative (compacting a little early) is the safe direction.
+function estimateTokens(text) {
+  return Math.ceil(String(text || '').length / 4);
+}
+
+// Handles both plain-string content and the multimodal content-block
+// arrays that attachments produce (see sendChatMessage's newUserContent).
+function estimateMessageTokens(msg) {
+  const c = msg?.content;
+  if (typeof c === 'string') return estimateTokens(c);
+  if (Array.isArray(c)) {
+    return c.reduce((sum, block) => {
+      if (block?.type === 'text') return sum + estimateTokens(block.text);
+      if (block?.type === 'image') return sum + 1200; // flat per-image estimate
+      return sum;
+    }, 0);
+  }
+  return 0;
+}
+
+function estimateMessagesTokens(messages) {
+  return messages.reduce((sum, m) => sum + estimateMessageTokens(m), 0);
+}
+
+// Builds a plaintext transcript for the summarization call. Each turn is
+// capped so one runaway-long message can't blow up the summarization call.
+function buildTranscriptForSummary(messages) {
+  return messages.map(m => {
+    const who = m.role === 'assistant' ? 'Assistant' : 'User';
+    const c = m.content;
+    const text = typeof c === 'string'
+      ? c
+      : (Array.isArray(c) ? c.filter(b => b?.type === 'text').map(b => b.text).join('\n') : '');
+    return `${who}: ${text.slice(0, 2000)}`;
+  }).join('\n\n');
+}
+
+// Summarizes everything before the keep-last window into a dense recap.
+// Falls back to a naive truncated concatenation if the Haiku call fails --
+// compaction must never crash the send path.
+async function summarizeOlderTurns(compactableMsgs) {
+  const transcript = buildTranscriptForSummary(compactableMsgs);
+  try {
+    const res = await window.farnsworth.sendMessage({
+      model: routedModelApiId('compaction'),
+      maxTokens: 700,
+      system: 'You compress earlier turns of an ongoing coding-assistant conversation into a dense recap for the assistant\'s own future reference. Preserve: decisions made, file paths touched, open questions, current state of any in-progress work, and facts the user stated. Drop pleasantries and narration. Write terse notes, not prose. No preamble, no "Here is a summary" -- just the notes.',
+      messages: [{ role: 'user', content: transcript }],
+    });
+    if (res?.ok && res.text) return res.text.trim();
+  } catch (e) {
+    console.warn('[compaction] summarization call failed, falling back to truncation:', e.message);
+  }
+  return transcript.slice(0, 3000) + '\n[...earlier context truncated...]';
+}
+
+// Merges a summary block in front of `recentMsgs` while preserving strict
+// user/assistant alternation (required by the Anthropic API). If the first
+// recent message is already role 'user', the summary is merged INTO it
+// (as a leading block) rather than added as a separate message, since two
+// consecutive 'user' messages back to back would be invalid.
+function mergeSummaryIntoHistory(summaryText, recentMsgs) {
+  const summaryBlock = `[Earlier conversation, condensed]\n${summaryText}\n[End of condensed context -- continue naturally from here]`;
+  if (!recentMsgs.length) return [{ role: 'user', content: summaryBlock }];
+  const first = recentMsgs[0];
+  if (first.role !== 'user') {
+    return [{ role: 'user', content: summaryBlock }, ...recentMsgs];
+  }
+  let mergedContent;
+  if (typeof first.content === 'string') {
+    mergedContent = `${summaryBlock}\n\n---\n\n${first.content}`;
+  } else if (Array.isArray(first.content)) {
+    mergedContent = [{ type: 'text', text: summaryBlock }, ...first.content];
+  } else {
+    mergedContent = summaryBlock;
+  }
+  return [{ ...first, content: mergedContent }, ...recentMsgs.slice(1)];
+}
+
+// Main entry point -- replaces the old blind `.slice(-20)` truncation in
+// sendChatMessage. Returns a role/content-mapped array ready to spread into
+// the API `messages` array (same shape the old `prior` produced).
+async function getCompactedAgentHistory(allPriorMsgs, convId) {
+  const mapped = allPriorMsgs.map(m => ({ role: m.role === 'agent' ? 'assistant' : 'user', content: m.text }));
+  const threshold = state.settings?.chat?.compactThreshold || COMPACTION_DEFAULT_THRESHOLD;
+  if (estimateMessagesTokens(mapped) < threshold) {
+    return mapped; // small enough -- send everything, no truncation, no compaction
+  }
+
+  const recent = mapped.slice(-COMPACTION_KEEP_LAST);
+  const compactable = mapped.slice(0, -COMPACTION_KEEP_LAST);
+  if (!compactable.length) return mapped; // conversation IS the keep-last window
+
+  const cached = _compactionCache.get(convId);
+  let summary;
+  if (cached && cached.boundaryCount === compactable.length) {
+    summary = cached.summary; // nothing new fell into the compactable zone yet
+  } else {
+    summary = await summarizeOlderTurns(compactable);
+    _compactionCache.set(convId, { boundaryCount: compactable.length, summary });
+  }
+  return mergeSummaryIntoHistory(summary, recent);
 }
 
 async function maybeGenerateConvTitle() {
@@ -10890,11 +11029,15 @@ async function sendChatMessage() {
     if (tRes && tRes.ok && Array.isArray(tRes.tools)) tools = tRes.tools;
   } catch {}
 
-  // Build the messages array — include prior turns but stop at the new user msg
-  const prior = state.chatMessages
-    .filter(m => (m.role === 'user' || m.role === 'agent') && !m.working && m.text && m.id !== userMsgId)
-    .slice(-20)
-    .map(m => ({ role: m.role === 'agent' ? 'assistant' : 'user', content: m.text }));
+  // Build the messages array — include prior turns but stop at the new user msg.
+  // Jul 28 2026: replaced the old blind `.slice(-20)` truncation (which
+  // silently forgot everything before the last 20 messages, no summary)
+  // with token-aware compaction — see getCompactedAgentHistory() above.
+  // Full history goes through untouched while it's under threshold; once
+  // it crosses that, older turns get summarized instead of dropped.
+  const priorRaw = state.chatMessages
+    .filter(m => (m.role === 'user' || m.role === 'agent') && !m.working && m.text && m.id !== userMsgId);
+  const prior = await getCompactedAgentHistory(priorRaw, state.chatActiveId || 'default');
   // Build the NEW user message content. With attachments, content is
   // an array: image blocks first (Anthropic expects images before text
   // in multimodal messages), then any inlined text file content, then
@@ -11015,8 +11158,14 @@ async function sendChatMessage() {
   updateChatSendButton();
 
   try {
-    // Tool-use loop — iterate up to 10 times (read_file → answer is the common path)
-    for (let iter = 0; iter < 50; iter++) {
+    // Tool-use loop. Jul 22: raised 10 -> 50 for headroom on complex turns.
+    // Jul 28 2026: removed as a practical limit — a fixed iteration count
+    // was the wrong mechanism (it could cut off a legitimate long multi-tool
+    // turn with plenty of context budget left). The real constraint should
+    // be context size, which context compaction (above) now manages. 2000
+    // is a safety net against a genuine runaway/infinite tool-call bug, not
+    // a limit anyone should ever hit in normal use.
+    for (let iter = 0; iter < 2000; iter++) {
       // Stop pressed between iterations — bail before spending another call.
       if (turn.cancelled) break;
       // Throttled renderChat for streaming — updates the DOM at most every 40ms.
