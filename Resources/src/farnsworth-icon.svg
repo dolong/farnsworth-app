@@ -1,0 +1,18 @@
+<svg width="1024" height="1024" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="iris-bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#7E6BFF"/>
+      <stop offset="100%" stop-color="#5A3FE6"/>
+    </linearGradient>
+  </defs>
+  <rect x="0" y="0" width="100" height="100" rx="18" ry="18" fill="url(#iris-bg)"/>
+  <path d="M11 49 L3.5 44.5" fill="none" stroke="#FFFFFF" stroke-width="6" stroke-linecap="round"/>
+  <path d="M89 49 L96.5 44.5" fill="none" stroke="#FFFFFF" stroke-width="6" stroke-linecap="round"/>
+  <circle cx="30" cy="51" r="19" fill="#C9ECE3" stroke="#FFFFFF" stroke-width="7"/>
+  <circle cx="70" cy="51" r="19" fill="#C9ECE3" stroke="#FFFFFF" stroke-width="7"/>
+  <path d="M47 47 Q50 43 53 47" fill="none" stroke="#FFFFFF" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M22 52 L31 43" fill="none" stroke="#2F7A72" stroke-width="3.1" stroke-linecap="round"/>
+  <path d="M25.5 55 L34.5 46" fill="none" stroke="#2F7A72" stroke-width="3.1" stroke-linecap="round"/>
+  <path d="M62 52 L71 43" fill="none" stroke="#2F7A72" stroke-width="3.1" stroke-linecap="round"/>
+  <path d="M65.5 55 L74.5 46" fill="none" stroke="#2F7A72" stroke-width="3.1" stroke-linecap="round"/>
+</svg>
