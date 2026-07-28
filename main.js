@@ -4877,7 +4877,29 @@ ipcMain.handle('app:platform', () => process.platform);
 // ============================================================
 // Lifecycle
 // ============================================================
+
+// Single-instance lock. Farnsworth binds three fixed WebSocket ports (9223
+// terminal / 9224 Claude Code / 9225 Codex) and one SQLite DB in userData, so
+// a second instance collides on all of them. Before this lock, launching
+// Farnsworth twice produced an EADDRINUSE uncaught-exception dialog and a
+// half-initialized app. Focus the existing window instead.
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.show();
+      mainWindow.focus();
+    }
+  });
+}
+
 app.whenReady().then(async () => {
+  // app.quit() above is not guaranteed to prevent this callback from firing,
+  // so bail explicitly rather than binding ports / opening the DB twice.
+  if (!gotSingleInstanceLock) return;
   await ensureDirs();
   db.init(userDataPath(), safeStorage);
   await db.migrateLegacy(userDataPath());
@@ -5174,6 +5196,21 @@ function startTerminalServer() {
   }
   if (terminalWss) return;
   terminalWss = new WebSocket.Server({ port: TERMINAL_WS_PORT });
+  // Without an 'error' listener, an EADDRINUSE on this port becomes an
+  // unhandled 'error' event -> uncaught exception -> the "A JavaScript error
+  // occurred in the main process" dialog, and it ABORTS the rest of
+  // app.whenReady() (Claude Code server, Codex server, auto-updater all
+  // silently never start). Degrade to "terminal panel disabled" instead.
+  terminalWss.on('error', (err) => {
+    const code = err && err.code;
+    console.error(
+      `[terminal] WebSocket server error on :${TERMINAL_WS_PORT}` +
+        (code === 'EADDRINUSE' ? ' — port in use (another Farnsworth running?); terminal panel disabled' : ''),
+      err?.message || err
+    );
+    try { terminalWss?.close(); } catch {}
+    terminalWss = null;
+  });
   terminalWss.on('connection', (ws) => {
     const shell = (process.env.SHELL) || '/bin/zsh';
     // The renderer sends the workspace cwd on the first WS message via
@@ -5332,6 +5369,18 @@ function startClaudeCodeServer() {
   }
 
   claudeCodeWss = new WebSocket.Server({ port: CLAUDE_CODE_WS_PORT });
+  // See startTerminalServer() — an unhandled 'error' here crashes the whole
+  // main process and aborts the remainder of app.whenReady().
+  claudeCodeWss.on('error', (err) => {
+    const code = err && err.code;
+    console.error(
+      `[claude-code] WebSocket server error on :${CLAUDE_CODE_WS_PORT}` +
+        (code === 'EADDRINUSE' ? ' — port in use (another Farnsworth running?); Claude Code panel disabled' : ''),
+      err?.message || err
+    );
+    try { claudeCodeWss?.close(); } catch {}
+    claudeCodeWss = null;
+  });
   claudeCodeWss.on('connection', (ws) => {
     // [DEBUG Jul 6 ~00:05 ET] trace cwd at connection
     const initialCwd = (db.getSetting && db.getSetting('currentFolder')) || os.homedir();
@@ -5807,6 +5856,18 @@ function startCodexServer() {
   }
 
   codexWss = new WebSocket.Server({ port: CODEX_WS_PORT });
+  // See startTerminalServer() — an unhandled 'error' here crashes the whole
+  // main process and aborts the remainder of app.whenReady().
+  codexWss.on('error', (err) => {
+    const code = err && err.code;
+    console.error(
+      `[codex] WebSocket server error on :${CODEX_WS_PORT}` +
+        (code === 'EADDRINUSE' ? ' — port in use (another Farnsworth running?); Codex panel disabled' : ''),
+      err?.message || err
+    );
+    try { codexWss?.close(); } catch {}
+    codexWss = null;
+  });
   codexWss.on('connection', (ws) => {
     // cwd protocol mirrors the Claude Code panel: renderer sends `init`
     // with state.folder before `spawn`, so the PTY lands in the project
