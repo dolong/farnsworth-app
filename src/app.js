@@ -122,6 +122,11 @@ const state = {
     // Default all-on; users disable in Settings → AI → Left panel tabs.
     // Migrating older saved settings: missing key means the tab is shown.
     leftPanelTabs: { chat: true, terminal: true, claudecode: true, codex: true },
+    // Custom-inference connection registry (Jul 19). Each entry is an
+    // OpenAI-compatible endpoint the chat can route to, with full tool
+    // parity. Shape: { id, name, baseURL, keyRef, models: [{ apiId, display }] }.
+    // keyRef points at an encrypted credential slot ('custom-<id>').
+    customEndpoints: [],
     // Honest rows only — see ROUTING_CALL_SITES above for the id → call
     // site mapping. behavior/verification/streaming were removed Jul 13
     // (persisted with zero consumers since day 1 — dead-controls audit).
@@ -228,6 +233,8 @@ const state = {
 function modelToApiId(displayName) {
   if (!displayName) return 'claude-opus-4-8'; // safe default if settings haven't loaded yet
   const map = {
+    'Opus 5': 'claude-opus-5',
+    'Opus 5 High': 'claude-opus-5',
     'Opus 4.8': 'claude-opus-4-8',
     'Opus 4.8 High': 'claude-opus-4-8',
     'Opus 4.7': 'claude-opus-4-7',
@@ -242,7 +249,49 @@ function modelToApiId(displayName) {
     'GPT-5.6 Terra': 'gpt-5.6-terra',
     'GPT-5.6 Luna': 'gpt-5.6-luna',
   };
+  // Custom-endpoint models resolve by display name to their raw apiId.
+  for (const ep of (state.settings?.customEndpoints || [])) {
+    for (const m of (ep.models || [])) {
+      if ((m.display || m.apiId) === displayName) return m.apiId;
+    }
+  }
   return map[displayName] || displayName; // pass through if already an API id
+}
+
+// Custom-inference helpers (Jul 19). The connection registry lives in
+// state.settings.customEndpoints; these expose it to the picker + send path.
+function customModelOptions() {
+  const out = [];
+  for (const ep of (state.settings?.customEndpoints || [])) {
+    for (const m of (ep.models || [])) {
+      out.push({
+        display: m.display || m.apiId,
+        desc: (ep.name || 'Custom') + ' \u00b7 ' + m.apiId,
+        effort: null,
+        _custom: true,
+        _endpointId: ep.id,
+      });
+    }
+  }
+  return out;
+}
+// Model list for the DEFAULT chat model picker: built-ins + custom endpoints.
+function getAllModelOptions() {
+  return CHAT_MODEL_OPTIONS.concat(customModelOptions());
+}
+// Given a default-model display name, return the endpoint to route through
+// (or null for built-in Anthropic / hardcoded-OpenAI models). Passed as
+// opts.endpoint to streamMessage/sendMessage; main.js resolves baseURL+key.
+function resolveEndpointForModel(displayName) {
+  if (!displayName) return null;
+  for (const ep of (state.settings?.customEndpoints || [])) {
+    for (const m of (ep.models || [])) {
+      if ((m.display || m.apiId) === displayName || m.apiId === displayName) {
+        return { name: ep.name, baseURL: ep.baseURL, keyRef: ep.keyRef };
+      }
+    }
+  }
+  return null;
 }
 
 // Per-call-site routing lookups (Jul 13 ~23:05 ET). See ROUTING_CALL_SITES
@@ -263,6 +312,8 @@ function routedModelApiId(id) {
 // popover below. API ids come from modelToApiId() so the picker can stay in
 // display-name space.
 const CHAT_MODEL_OPTIONS = [
+  { display: 'Opus 5 High',   effort: 'high', desc: '1M context · newest flagship · adaptive thinking' },
+  { display: 'Opus 5',        effort: 'medium', desc: '1M context · newest flagship' },
   { display: 'Opus 4.8 High', effort: 'high', desc: '1M context · most capable · adaptive thinking' },
   { display: 'Opus 4.8',      effort: 'medium', desc: '1M context · most capable' },
   { display: 'Sonnet 5',      effort: 'high', desc: '1M context · fast · new' },
@@ -297,7 +348,11 @@ function openModelPicker(anchorBtn, settingsKey = 'defaultModel', onPick = null,
   pop.style.top = (r.bottom + 6) + 'px';
   pop.style.left = r.left + 'px';
 
-  for (const opt of CHAT_MODEL_OPTIONS) {
+  // Jul 19: the default chat-model picker also lists custom-inference models;
+  // testing-model / per-call-site routing pickers stay on the built-in list.
+  const _modelList = (settingsKey === 'defaultModel' && typeof onPick !== 'function')
+    ? getAllModelOptions() : CHAT_MODEL_OPTIONS;
+  for (const opt of _modelList) {
     const isCurrent = (currentDisplay ?? state.settings?.[settingsKey]) === opt.display;
     const row = el('button', {
       class: 'model-picker__row' + (isCurrent ? ' is-current' : ''),
@@ -520,6 +575,10 @@ function renderChat() {
   const thread = $('#chat-thread');
   thread.innerHTML = '';
   state.chatMessages.forEach(m => thread.appendChild(renderMessage(m)));
+  // Keep the composer button's Send/Stop glyph in sync with the in-flight
+  // turn — guards against a stale Stop glyph after a reload or a render that
+  // happens outside the turn lifecycle.
+  updateChatSendButton();
   // Auto-scroll to bottom
   thread.scrollTop = thread.scrollHeight;
   // Persist the active conversation (debounced) so the dropdown always reflects
@@ -943,7 +1002,15 @@ function renderMessage(m) {
     }
     const body = el('div', { class: 'msg__body' }, head);
 
-    if (m.working) {
+    // Jul 27: `m.timeline` is the ordered record of the turn -- text segments,
+    // tool chips and surfaces in the order the model emitted them. When present
+    // it drives the whole body so the message reads reason -> collapsed steps ->
+    // reason -> steps -> ... (Vellum shape). preambleText / responseText are
+    // still written for copy/share/companion paths and for rendering messages
+    // saved before timelines existed.
+    const tl = Array.isArray(m.timeline) && m.timeline.length ? m.timeline : null;
+
+    function appendWorkingIndicator() {
       const working = el('div', { class: 'msg__working' });
       working.appendChild(el('span', {}, m.workingLabel || 'Editing'));
       const dots = el('span', { class: 'working-dots' });
@@ -951,13 +1018,24 @@ function renderMessage(m) {
       working.appendChild(dots);
       body.appendChild(working);
     }
+    // Stopped-by-user marker. Reuses the .msg__working typography (small,
+    // muted) minus the animated dots -- it's a terminal state, not progress.
+    function appendStoppedIndicator() {
+      body.appendChild(el('div', { class: 'msg__working msg__stopped' }, 'Stopped by user'));
+    }
+    // Legacy messages keep the spinner at the top (that was the old layout).
+    // Timelined ones put it at the very bottom, where the next step lands --
+    // so the eye follows narration -> steps -> narration -> spinner downward.
+    if (m.working && !tl) appendWorkingIndicator();
+    // Stopped before the model emitted anything -> no timeline to append to.
+    if (m.stopped && !m.working && !tl) appendStoppedIndicator();
     // Jul 13 ~18:50 ET: render preamble (text before any tool_use) as a
     // small italic "thinking" indicator at the TOP. Render response (text
     // after all tool_uses complete) as formatted markdown at the BOTTOM
     // (after chips). Vellum-style chat layout -- no plain text at the
     // top above the code executions. white-space: pre-wrap preserves
     // newlines (the prior plain text rendering collapsed them).
-    if (!m.working && m.preambleText && m.preambleText.trim()) {
+    if (!tl && m.preambleText && m.preambleText.trim()) {
       const thinking = el('div', { class: 'msg__text msg__text--thinking' });
       thinking.innerHTML = renderText(m.preambleText);
       attachCodeCopyButtons(thinking);
@@ -968,9 +1046,16 @@ function renderMessage(m) {
     // Surfaces are appended to the message as Claude emits ui_show tool calls.
     // For Phase 1, all surfaces render at the end of the body (after text +
     // working indicator). Phase 4 will add proper interleaving if needed.
-    if (Array.isArray(m.surfaces) && m.surfaces.length && window.FarnsworthSurfaces) {
+    // Timelined messages place each surface at its emission point instead
+    // (see the timeline walk below), so only render the trailing block for
+    // surfaces the timeline doesn't account for.
+    const tlSurfaceIds = new Set(
+      (tl || []).filter(e => e.type === 'surface').map(e => e.surfaceId)
+    );
+    const trailingSurfaces = (m.surfaces || []).filter(s => !tlSurfaceIds.has(s.surfaceId));
+    if (trailingSurfaces.length && window.FarnsworthSurfaces) {
       const surfacesWrap = el('div', { class: 'msg__surfaces' });
-      for (const surface of m.surfaces) {
+      for (const surface of trailingSurfaces) {
         try {
           const node = window.FarnsworthSurfaces.render(surface, {});
           if (node) surfacesWrap.appendChild(node);
@@ -1056,7 +1141,19 @@ function renderMessage(m) {
         outputPre.textContent = isLong ? outputStr.slice(0, TRUNCATE_AT) + '\n...' : outputStr;
         expand.appendChild(outputPre);
 
-        let showFullBtn = null;
+        // Screenshot thumbnail for take_canvas_screenshot chips (Jul 20).
+        // When chip.screenshotBase64 is set, show the PNG inline in the expand block
+        // so the user can see the captured canvas alongside the agent's analysis.
+        if (c.screenshotBase64) {
+          expand.appendChild(el('span', { class: 'chip__expand-label' }, 'SCREENSHOT'));
+          const screenshotImg = el('img', {
+            class: 'chip__screenshot',
+            src: 'data:image/png;base64,' + c.screenshotBase64,
+            alt: 'canvas screenshot',
+          });
+          expand.appendChild(screenshotImg);
+        }
+                let showFullBtn = null;
         if (isLong) {
           showFullBtn = el('button', { class: 'chip__show-full', type: 'button' }, 'Show full output');
           showFullBtn.addEventListener('click', (e) => {
@@ -1088,7 +1185,89 @@ function renderMessage(m) {
       return chip;
     }
 
-    if (m.chips && m.chips.length) {
+    // Render one text segment. Trailing segment of a finished turn is the
+    // model's actual answer (full response style); everything else is
+    // narration between tool calls (compact thinking style).
+    function appendTextSegment(text, isFinal) {
+      const node = el('div', { class: 'msg__text ' + (isFinal ? 'msg__text--response' : 'msg__text--thinking') });
+      node.innerHTML = renderText(text);
+      attachCodeCopyButtons(node);
+      if (isFinal && m.animatingVerdict && !m.__verdictAnimated && !m.error) {
+        m.__verdictAnimated = true;
+        requestAnimationFrame(() => animateFinalVerdict(m.id));
+      }
+      body.appendChild(node);
+    }
+
+    // Render a run of consecutive tool chips. One chip renders bare; several
+    // collapse behind a "N steps" pill. `isLive` (the group currently
+    // executing) starts expanded so the user watches progress happen.
+    function renderChipGroup(entries, isLive) {
+      const chips = entries.map(e => (m.chips || [])[e.chipIndex]).filter(Boolean);
+      if (!chips.length) return;
+      // Jul 28: previously a lone chip (e.g. one `cd ...` command) rendered
+      // bare instead of behind a pill -- Long flagged this as inconsistent
+      // with the 2+ case, which already collapses. Now every group collapses
+      // behind a pill regardless of size; only the label pluralizes.
+      const pill = el('button', { class: 'msg__steps-pill', type: 'button' });
+      const stepsLabel = chips.length === 1 ? '1 step' : chips.length + ' steps';
+      pill.innerHTML = '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg><span>' + stepsLabel + '</span>';
+      pill.title = 'Show tool calls';
+      const wrap = el('div', { class: 'msg__chips-wrap' });
+      for (const c of chips) wrap.appendChild(renderChipNode(c));
+      if (isLive) {
+        wrap.classList.add('msg__chips-wrap--open');
+        pill.classList.add('msg__steps-pill--open');
+      }
+      pill.addEventListener('click', () => {
+        const open = wrap.classList.toggle('msg__chips-wrap--open');
+        pill.classList.toggle('msg__steps-pill--open', open);
+      });
+      body.appendChild(pill);
+      body.appendChild(wrap);
+    }
+
+    if (tl) {
+      const referenced = new Set();
+      let lastTextIdx = -1;
+      for (let k = 0; k < tl.length; k++) {
+        if (tl[k].type === 'chip') referenced.add(tl[k].chipIndex);
+        else if (tl[k].type === 'text' && (tl[k].text || '').trim()) lastTextIdx = k;
+      }
+      let i = 0;
+      while (i < tl.length) {
+        if (tl[i].type === 'surface') {
+          const surface = (m.surfaces || []).find(s => s.surfaceId === tl[i].surfaceId);
+          if (surface && window.FarnsworthSurfaces) {
+            try {
+              const node = window.FarnsworthSurfaces.render(surface, {});
+              if (node) body.appendChild(el('div', { class: 'msg__surfaces' }, node));
+            } catch (e) {
+              console.error('[surface] render failed for type=' + surface.surfaceType, e);
+            }
+          }
+          i++;
+          continue;
+        }
+        if (tl[i].type !== 'chip') {
+          const txt = tl[i].text || '';
+          if (txt.trim()) appendTextSegment(txt, i === lastTextIdx && i === tl.length - 1 && !m.working);
+          i++;
+          continue;
+        }
+        const group = [];
+        while (i < tl.length && tl[i].type === 'chip') group.push(tl[i++]);
+        renderChipGroup(group, !!m.working && i >= tl.length);
+      }
+      if (m.working) appendWorkingIndicator();
+      // Interrupted by the Stop button (Jul 27) — a quiet marker, not an error,
+      // so whatever the agent already produced stays readable above it.
+      if (m.stopped && !m.working) appendStoppedIndicator();
+      // Chips that never entered the timeline: action chips (Open Settings,
+      // git commit confirm) and the end-of-turn usage / HTTP-error chips.
+      const leftovers = (m.chips || []).filter((c, idx) => !referenced.has(idx) && !c._superseded);
+      for (const c of leftovers) body.appendChild(renderChipNode(c));
+    } else if (m.chips && m.chips.length) {
       // 1. Action chips (open-ai, git-commit-*, etc.) — always render directly.
       const actionChips = m.chips.filter(c => c.action);
       for (const c of actionChips) body.appendChild(renderChipNode(c));
@@ -1124,7 +1303,7 @@ function renderMessage(m) {
     // for basic bold/italic/code/lists + white-space: pre-wrap preserves
     // newlines. Vellum-style chat layout -- the model's answer appears
     // after the code executions, not before them.
-    if (!m.working && m.responseText && m.responseText.trim()) {
+    if (!tl && m.responseText && m.responseText.trim()) {
       const response = el('div', { class: 'msg__text msg__text--response' });
       response.innerHTML = renderText(m.responseText);
       attachCodeCopyButtons(response);
@@ -3065,6 +3244,34 @@ function renderLivePreview() {
 // targetInnerW × targetInnerH, adding the measured frame chrome on top. Used
 // for mobile/desktop so preset dimensions describe the game viewport, the way
 // real device-preview tools work. Must run after the artboard is in the DOM.
+// Measure the ACTUAL render surface inside a preview stage. The stage element
+// itself may carry padding/border that is frame chrome, not render area:
+// `.desktop__stage` has `padding: 8px` with border-box, which silently made
+// the desktop preview hand the game 708x580 while the preset, the calibration
+// and the size label all said 724x596 (Jul 25). Measuring the stage's border
+// box therefore over-reports the viewport by the padding on every side, and
+// every aspect-ratio-driven layout inside the game (the-last-draft toggles
+// is-mobile / is-narrow / widthConstrained off getBoundingClientRect) sees a
+// viewport that does not exist on Reddit. Prefer the WebContentsView
+// placeholder / iframe; fall back to the stage's own content box.
+function measureRenderSurface(renderEl) {
+  if (!renderEl) return null;
+  const surface = renderEl.querySelector('[data-canvas-view], iframe');
+  if (surface) {
+    const r = surface.getBoundingClientRect();
+    if (r.width > 10 && r.height > 10) return { width: r.width, height: r.height };
+  }
+  const r = renderEl.getBoundingClientRect();
+  const cs = getComputedStyle(renderEl);
+  const px = (v) => parseFloat(v) || 0;
+  return {
+    width: r.width - px(cs.paddingLeft) - px(cs.paddingRight)
+      - px(cs.borderLeftWidth) - px(cs.borderRightWidth),
+    height: r.height - px(cs.paddingTop) - px(cs.paddingBottom)
+      - px(cs.borderTopWidth) - px(cs.borderBottomWidth),
+  };
+}
+
 function calibrateArtboardToInner(wrap, mode, targetInnerW, targetInnerH) {
   if (!wrap || !wrap.isConnected) return;
   const sel = mode === 'mobile' ? '.phone__screen'
@@ -3075,8 +3282,8 @@ function calibrateArtboardToInner(wrap, mode, targetInnerW, targetInnerH) {
   const renderEl = wrap.querySelector(sel);
   if (!renderEl) return;
   const outer = wrap.getBoundingClientRect();
-  const inner = renderEl.getBoundingClientRect();
-  if (inner.width < 10 || inner.height < 10) return; // not laid out yet
+  const inner = measureRenderSurface(renderEl);
+  if (!inner || inner.width < 10 || inner.height < 10) return; // not laid out yet
   // Chrome is the fixed delta between the outer frame and the render area; it
   // doesn't change as the frame resizes (bezel/bars are fixed px).
   const chromeW = outer.width - inner.width;
@@ -3148,7 +3355,8 @@ function startArtboardResize(e, wrap, corner, sizeLabel) {
       const sel = state.preview === 'mobile' ? '.phone__screen' : '.desktop__stage';
       const renderEl = wrap.querySelector(sel);
       if (renderEl) {
-        const ir = renderEl.getBoundingClientRect();
+        // Content box, not border box — see measureRenderSurface().
+        const ir = measureRenderSurface(renderEl) || { width: 0, height: 0 };
         if (ir.width > 10) finalW = ir.width;
         // Keep a custom height in inner-space too, if one is active.
         if (state.previewCustomHeight?.[state.preview] && ir.height > 10) {
@@ -3265,7 +3473,6 @@ function renderPostView() {
     || 'Strange Mild Japanese Katsu Curry';
   content.appendChild(title);
 
-  
 
   // Game embed — real Sword & Supper Devvit iframe screenshot (732×512)
   // captured from the live Reddit post on Jun 26 ~12:24 ET.
@@ -4257,7 +4464,7 @@ function renderFiles() {
 
   // Wire refresh + change folder buttons
   const refreshBtn = wrap.querySelector('#files-refresh-btn');
-  if (refreshBtn) refreshBtn.addEventListener('click', () => loadFolderFiles(state.folder));
+  if (refreshBtn) refreshBtn.addEventListener('click', () => loadFolderFiles(state.folder, true));
   const changeBtn = wrap.querySelector('#files-change-btn');
   if (changeBtn) changeBtn.addEventListener('click', openFolderPicker);
 
@@ -6487,6 +6694,137 @@ function closeSettings() {
   showAllCanvasViews();
 }
 
+// ============================================================================
+// Usage modal (Jul 27) -- icon next to the chat model picker; shows the
+// active conversation's token usage. "Session" here means the currently
+// open conversation (state.chatMessages), not the whole app lifetime --
+// that's what the per-turn usage chips already track (res.usage, wired
+// Jul 19 near the "N tok" chip), so this is a rollup of data that already
+// exists rather than a new counter.
+// ============================================================================
+
+// Approximate published per-million-token rates (USD), Jul 2026. Anthropic
+// models only -- I don't have confirmed pricing for the GPT-5.6 line, so
+// those show token counts with no cost estimate rather than a guessed number.
+// NOTE: these are list/input+output rates; they do NOT account for prompt
+// caching (cache writes ~1.25x input, cache reads ~0.1x input), so the
+// estimate skews high for conversations that lean on cached context.
+const MODEL_PRICING_PER_MTOK = {
+  'Opus 5 High':   { input: 5,  output: 25 },
+  'Opus 5':        { input: 5,  output: 25 },
+  'Opus 4.8 High': { input: 5,  output: 25 },
+  'Opus 4.8':      { input: 5,  output: 25 },
+  'Sonnet 5':      { input: 2,  output: 10 }, // introductory rate through Aug 2026
+  'Sonnet 4.6':    { input: 3,  output: 15 },
+  'Sonnet 4.5':    { input: 3,  output: 15 },
+  'Haiku 4.5':     { input: 1,  output: 5 },
+  'Fable 5':       { input: 10, output: 50 },
+};
+
+// Parses the "12345→678 tok" usage chip already attached to agent messages
+// (see the usageChip literals around line 8704/11085) rather than
+// re-deriving from res.usage, since the chip IS the persisted record --
+// res.usage itself isn't saved to the conversation JSON.
+function computeSessionUsage() {
+  const perModel = {}; // display name -> { input, output, turns }
+  let totalIn = 0, totalOut = 0, totalTurns = 0;
+  for (const m of (state.chatMessages || [])) {
+    const chips = m.chips || [];
+    for (const c of chips) {
+      if (c.kind !== 'read') continue;
+      const match = /^([\d,]+)\s*→\s*([\d,]+)\s*tok$/.exec(c.label || '');
+      if (!match) continue;
+      const inTok = parseInt(match[1].replace(/,/g, ''), 10) || 0;
+      const outTok = parseInt(match[2].replace(/,/g, ''), 10) || 0;
+      const model = m.model || 'Unknown model';
+      if (!perModel[model]) perModel[model] = { input: 0, output: 0, turns: 0 };
+      perModel[model].input += inTok;
+      perModel[model].output += outTok;
+      perModel[model].turns += 1;
+      totalIn += inTok;
+      totalOut += outTok;
+      totalTurns += 1;
+    }
+  }
+  return { perModel, totalIn, totalOut, totalTurns };
+}
+
+function estimateCostUSD(model, input, output) {
+  const rate = MODEL_PRICING_PER_MTOK[model];
+  if (!rate) return null;
+  return (input / 1e6) * rate.input + (output / 1e6) * rate.output;
+}
+
+function formatUSD(v) {
+  if (v == null) return '—';
+  return '$' + v.toFixed(v < 1 ? 3 : 2);
+}
+
+function renderUsageModal() {
+  const body = $('#usage-modal-body');
+  if (!body) return;
+  const { perModel, totalIn, totalOut, totalTurns } = computeSessionUsage();
+  const models = Object.keys(perModel);
+
+  if (!totalTurns) {
+    body.innerHTML = `<div class="usage-modal__empty">No usage recorded yet in this conversation.<br>Send a message to see token counts here.</div>`;
+    return;
+  }
+
+  let totalCost = 0;
+  let anyPriced = false;
+  const rows = models
+    .map(model => {
+      const { input, output, turns } = perModel[model];
+      const cost = estimateCostUSD(model, input, output);
+      if (cost != null) { totalCost += cost; anyPriced = true; }
+      return { model, input, output, turns, cost };
+    })
+    .sort((a, b) => (b.input + b.output) - (a.input + a.output));
+
+  const rowsHtml = rows.map(r => `
+    <div class="usage-modal__row">
+      <span class="usage-modal__row-model">${r.model}</span>
+      <span class="usage-modal__row-toks">${r.input.toLocaleString()}→${r.output.toLocaleString()} tok · ${r.turns} turn${r.turns === 1 ? '' : 's'}</span>
+      <span class="usage-modal__row-cost">${formatUSD(r.cost)}</span>
+    </div>
+  `).join('');
+
+  body.innerHTML = `
+    <div class="usage-modal__totals">
+      <div class="usage-modal__stat">
+        <div class="usage-modal__stat-label">Tokens</div>
+        <div class="usage-modal__stat-value">${(totalIn + totalOut).toLocaleString()}</div>
+      </div>
+      <div class="usage-modal__stat">
+        <div class="usage-modal__stat-label">Turns</div>
+        <div class="usage-modal__stat-value">${totalTurns}</div>
+      </div>
+      <div class="usage-modal__stat">
+        <div class="usage-modal__stat-label">Est. cost</div>
+        <div class="usage-modal__stat-value usage-modal__stat-value--cost">${anyPriced ? formatUSD(totalCost) : '—'}</div>
+      </div>
+    </div>
+    <div class="usage-modal__section-title">By model</div>
+    ${rowsHtml}
+    <div class="usage-modal__note">
+      ${totalIn.toLocaleString()} in / ${totalOut.toLocaleString()} out, this conversation only. Cost is a rough estimate from list per-token rates — it does not account for prompt-cache discounts, so it can run high. ${models.some(m => !MODEL_PRICING_PER_MTOK[m]) ? 'No pricing data for one or more models shown (custom/OpenAI endpoints) — their tokens count toward the total but not the cost.' : ''}
+    </div>
+  `;
+}
+
+function openUsageModal() {
+  renderUsageModal();
+  $('#usage-overlay').hidden = false;
+  // Same WCV-above-DOM issue as Settings (Jul 10) -- hide canvas views so
+  // the modal actually renders on top instead of underneath.
+  hideAllCanvasViews();
+}
+function closeUsageModal() {
+  $('#usage-overlay').hidden = true;
+  showAllCanvasViews();
+}
+
 function renderSettings() {
   $$('.settings__rail-item').forEach(item => item.classList.toggle('is-active', item.dataset.page === state.settingsPage));
   const pane = $('#settings-pane');
@@ -6562,6 +6900,20 @@ function renderAISettings() {
         <button id="routing-reset-btn" style="font-size:11.5px;font-weight:600;color:#3ab7f0;background:none;border:none;cursor:pointer;white-space:nowrap;">Reset defaults</button>
       </div>
       <div class="routing-table"></div>
+    </div>
+
+    <div class="settings-section" id="ai-custom-inference">
+      <div style="display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:6px;">
+        <div>
+          <div style="display:flex;align-items:center;gap:8px;">
+            <div class="settings-section__title">Custom inference</div>
+            <span class="settings-pill settings-pill--cost">OPENAI-COMPATIBLE</span>
+          </div>
+          <div class="settings-section__desc">Add any OpenAI-compatible endpoint (OpenAI, OpenRouter, Together, Fireworks, vLLM, llama.cpp, \u2026). Registered models appear in the chat model picker with full tool-calling.</div>
+        </div>
+        <button id="ci-add-btn" class="btn btn--primary btn--sm" style="white-space:nowrap;">+ Add endpoint</button>
+      </div>
+      <div class="ci-list"></div>
     </div>
 
     <div class="settings-section" data-lpt-section>
@@ -6781,7 +7133,127 @@ function renderAISettings() {
   // The chat always streams; safety prompts live in nono + Claude Code's
   // own trust dialog; verbosity is the model's job.
 
+  // Custom-inference endpoint registry UI (Jul 19).
+  renderCustomEndpoints(wrap);
+
   return wrap;
+}
+
+// Render the custom-inference endpoint cards + wire the add/edit/delete flow.
+// Each endpoint is an OpenAI-compatible connection: name + baseURL + an
+// encrypted key slot ('custom-<id>') + a list of model { apiId, display }.
+function renderCustomEndpoints(wrap) {
+  const listEl = wrap.querySelector('.ci-list');
+  const addBtn = wrap.querySelector('#ci-add-btn');
+  if (!listEl) return;
+  const eps = state.settings.customEndpoints || (state.settings.customEndpoints = []);
+
+  const draw = () => {
+    listEl.innerHTML = '';
+    if (!eps.length) {
+      const empty = el('div', { class: 'ci-empty' });
+      empty.textContent = 'No custom endpoints yet. Add one to route the chat through an OpenAI-compatible API.';
+      listEl.appendChild(empty);
+      return;
+    }
+    for (const ep of eps) {
+      const card = el('div', { class: 'ci-card' });
+      const modelCount = (ep.models || []).length;
+      const modelPreview = (ep.models || []).map(m => m.display || m.apiId).slice(0, 4).join(', ') + (modelCount > 4 ? ', \u2026' : '');
+      card.innerHTML = `
+        <div class="ci-card__main">
+          <div class="ci-card__icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M4 12h16M4 17h10"/><circle cx="18" cy="17" r="2.4"/></svg>
+          </div>
+          <div class="ci-card__text">
+            <div class="ci-card__name">${escapeHtml(ep.name || 'Endpoint')}</div>
+            <div class="ci-card__url">${escapeHtml(ep.baseURL || '')}</div>
+            <div class="ci-card__models">${modelCount} model${modelCount === 1 ? '' : 's'}${modelCount ? ' \u00b7 ' + escapeHtml(modelPreview) : ''}</div>
+          </div>
+        </div>
+        <div class="ci-card__actions">
+          <button class="btn btn--ghost btn--sm ci-edit">Edit</button>
+          <button class="btn btn--ghost btn--sm ci-del">Delete</button>
+        </div>
+      `;
+      card.querySelector('.ci-edit').addEventListener('click', () => openForm(ep));
+      card.querySelector('.ci-del').addEventListener('click', async () => {
+        const idx = eps.indexOf(ep);
+        if (idx >= 0) eps.splice(idx, 1);
+        try { if (ep.keyRef && window.farnsworth?.clearApiKey) await window.farnsworth.clearApiKey(ep.keyRef); } catch {}
+        // If the deleted endpoint owned the active default model, fall back.
+        if (resolveEndpointForModel(state.settings.defaultModel) === null &&
+            !CHAT_MODEL_OPTIONS.some(o => o.display === state.settings.defaultModel)) {
+          state.settings.defaultModel = 'Opus 4.8 High';
+          updateChatInputModelButton();
+        }
+        persistSettings();
+        draw();
+      });
+      listEl.appendChild(card);
+    }
+  };
+
+  const openForm = (existing) => {
+    const isEdit = !!existing;
+    const form = el('div', { class: 'ci-form' });
+    const modelsText = isEdit
+      ? (existing.models || []).map(m => (m.apiId + (m.display && m.display !== m.apiId ? ' | ' + m.display : ''))).join('\n')
+      : '';
+    form.innerHTML = `
+      <div class="ci-form__title">${isEdit ? 'Edit endpoint' : 'New endpoint'}</div>
+      <label class="ci-field"><span>Name</span><input type="text" class="apikey-input ci-name" placeholder="OpenRouter" value="${isEdit ? escapeHtml(existing.name || '') : ''}"></label>
+      <label class="ci-field"><span>Base URL</span><input type="text" class="apikey-input ci-url" placeholder="https://openrouter.ai/api/v1" value="${isEdit ? escapeHtml(existing.baseURL || '') : ''}"></label>
+      <label class="ci-field"><span>API key</span><input type="password" class="apikey-input ci-key" placeholder="${isEdit ? '\u2022\u2022\u2022\u2022 leave blank to keep' : 'sk-\u2026'}" autocomplete="off"></label>
+      <label class="ci-field"><span>Models <em>(one per line: <code>api-id | Display Name</code>)</em></span><textarea class="apikey-input ci-models" rows="4" placeholder="anthropic/claude-3.5-sonnet | Claude 3.5 Sonnet&#10;meta-llama/llama-3.1-70b-instruct | Llama 3.1 70B">${escapeHtml(modelsText)}</textarea></label>
+      <div class="ci-form__actions">
+        <button class="btn btn--primary btn--sm ci-save">${isEdit ? 'Save' : 'Add endpoint'}</button>
+        <button class="btn btn--ghost btn--sm ci-cancel">Cancel</button>
+      </div>
+    `;
+    listEl.innerHTML = '';
+    listEl.appendChild(form);
+    addBtn.disabled = true;
+
+    form.querySelector('.ci-cancel').addEventListener('click', () => { addBtn.disabled = false; draw(); });
+    form.querySelector('.ci-save').addEventListener('click', async () => {
+      const name = form.querySelector('.ci-name').value.trim();
+      let url = form.querySelector('.ci-url').value.trim();
+      const key = form.querySelector('.ci-key').value.trim();
+      const rawModels = form.querySelector('.ci-models').value;
+      if (!name) { form.querySelector('.ci-name').focus(); return; }
+      if (!/^https?:\/\//i.test(url)) { form.querySelector('.ci-url').focus(); return; }
+      url = url.replace(/\/+$/, '');
+      const models = rawModels.split('\n').map(line => {
+        const t = line.trim();
+        if (!t) return null;
+        const [apiId, ...rest] = t.split('|');
+        const id = apiId.trim();
+        if (!id) return null;
+        const disp = rest.join('|').trim();
+        return { apiId: id, display: disp || id };
+      }).filter(Boolean);
+
+      const id = isEdit ? existing.id : ('ep_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5));
+      const keyRef = isEdit ? (existing.keyRef || ('custom-' + id)) : ('custom-' + id);
+      if (key) { try { await window.farnsworth?.setApiKey(key, keyRef); } catch {} }
+
+      const record = { id, name, baseURL: url, keyRef, models };
+      if (isEdit) {
+        const idx = eps.indexOf(existing);
+        if (idx >= 0) eps[idx] = record; else eps.push(record);
+      } else {
+        eps.push(record);
+      }
+      persistSettings();
+      addBtn.disabled = false;
+      draw();
+    });
+    form.querySelector('.ci-name').focus();
+  };
+
+  addBtn?.addEventListener('click', () => openForm(null));
+  draw();
 }
 
 function makeRoutingRow(row) {
@@ -7438,7 +7910,7 @@ function renderCanvasSettings() {
 
   const engine = el('div', { class: 'settings-section' });
   engine.innerHTML = '<div class="settings-section__title" style="margin-bottom:6px;">Browser engine</div>';
-  engine.appendChild(makeToggleRow('Devtools access', 'Chromium devtools for the preview (⌘K → Canvas: Open Preview DevTools). Applies on next preview load.', s.engine.devtools, v => { s.engine.devtools = v; persistSettings(); }));
+  engine.appendChild(makeToggleRow('Devtools access', 'Chromium devtools + right-click Inspect Element for the preview (⇧⌘I, or View → Inspect Canvas Preview). Applies on next preview load.', s.engine.devtools, v => { s.engine.devtools = v; persistSettings(); }));
   engine.appendChild(makeToggleRow('Cookie isolation per project', 'Each project gets its own cookies + localStorage. Applies on next preview load.', s.engine.cookieIsolation, v => { s.engine.cookieIsolation = v; persistSettings(); }));
   engine.appendChild(makeToggleRow('Network access from canvas', 'Allow the preview to reach hosts beyond localhost. Applies immediately.', s.engine.network, v => { s.engine.network = v; persistSettings(); window.farnsworth?.canvasSetNetworkAccess?.(v); }));
   wrap.appendChild(engine);
@@ -8510,7 +8982,7 @@ function openCommandPalette() {
       { id: 'rename-file',     label: 'Rename File/Folder', shortcut: 'F2', run: () => renameSelectedFile() },
       { id: 'delete-file',     label: 'Delete File/Folder', shortcut: '⌫',   run: () => deleteSelectedFile() },
       { id: 'ai-commit',       label: 'AI: Commit Changes', shortcut: '',   run: () => aiCommitCommand() },
-      { id: 'canvas-devtools',  label: 'Canvas: Open Preview DevTools', shortcut: '', run: () => {
+      { id: 'canvas-devtools',  label: 'Canvas: Inspect Preview (DevTools)', shortcut: '⇧⌘I', run: () => {
         if (state.settings.canvas?.engine?.devtools === false) {
           pushAgentTask('Canvas DevTools')({ working: false, text: 'DevTools are disabled in Settings → Canvas → Browser engine.' });
           return;
@@ -9499,8 +9971,25 @@ function wire() {
     e.stopPropagation();
     openModelPicker(document.getElementById('chat-model'));
   });
-  $('#chat-send').addEventListener('click', sendChatMessage);
+  // Usage icon (Jul 27) -- opens a modal with this conversation's token usage.
+  $('#chat-usage')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    openUsageModal();
+  });
+  $$('[data-close-usage]').forEach(el => el.addEventListener('click', closeUsageModal));
+  // Dual-purpose composer button: Send when idle, Stop while a turn is in
+  // flight (Jul 27). Same affordance as Vellum / Claude Code / ChatGPT.
+  $('#chat-send').addEventListener('click', () => {
+    if (isChatTurnActive()) stopChatTurn();
+    else sendChatMessage();
+  });
   $('#chat-input').addEventListener('keydown', e => {
+    // Esc stops the in-flight turn without leaving the composer.
+    if (e.key === 'Escape' && isChatTurnActive()) {
+      e.preventDefault();
+      stopChatTurn();
+      return;
+    }
     // Enter submits; Shift+Enter inserts a newline (default textarea
     // behavior preserved). The old handler required Cmd+Enter which made
     // a bare Enter insert a newline instead of sending — Long flagged
@@ -9700,69 +10189,7 @@ function wire() {
   // × remove). Lives between the chat thread and the input wrap;
   // only shows when there are pending attachments. Jul 16 ~23:30 ET
   // (images) + ~23:55 ET (files).
-  function renderChatAttachments() {
-    const wrap = document.querySelector('.chat__input-wrap');
-    if (!wrap) return;
-    let strip = wrap.querySelector('.chat__attachments');
-    const atts = state.chatAttachments || [];
-    if (!atts.length) {
-      if (strip) strip.remove();
-      return;
-    }
-    if (!strip) {
-      strip = document.createElement('div');
-      strip.className = 'chat__attachments';
-      // Insert at the top of the wrap so the chips sit ABOVE the
-      // input box (matches the convention in Claude.ai + Slack).
-      wrap.insertBefore(strip, wrap.firstChild);
-    }
-    strip.innerHTML = '';
-    for (const a of atts) {
-      const chip = document.createElement('div');
-      chip.className = 'chat__attachment-chip' + (a.type === 'file' ? ' chat__attachment-chip--file' : '');
-      // Title (tooltip) shows the most useful info for each kind
-      if (a.type === 'file') {
-        chip.title = `${a.filePath}\n${a.mime || 'file'} · ${formatBytes(a.sizeBytes)}`;
-      } else {
-        chip.title = `${a.mime} · ${a.width}×${a.height} · ${formatBytes(a.sizeBytes)}`;
-      }
-      if (a.type === 'file') {
-        // File chip — colored glyph + name + size. The glyph is a
-        // CSS-only "doc" mark so we don't need to bundle an icon font.
-        const glyph = document.createElement('div');
-        glyph.className = 'chat__attachment-glyph';
-        const ext = (a.name.split('.').pop() || '').toLowerCase().slice(0, 4);
-        glyph.textContent = ext ? ext : 'file';
-        chip.appendChild(glyph);
-      } else {
-        // Image chip — thumbnail preview.
-        const img = document.createElement('img');
-        img.src = a.dataUrl;
-        img.className = 'chat__attachment-thumb';
-        img.alt = '';
-        chip.appendChild(img);
-      }
-      const label = document.createElement('span');
-      label.className = 'chat__attachment-label';
-      if (a.type === 'file') {
-        label.textContent = `${a.name} · ${formatBytes(a.sizeBytes)}`;
-      } else {
-        label.textContent = `Image · ${formatBytes(a.sizeBytes)}`;
-      }
-      chip.appendChild(label);
-      const x = document.createElement('button');
-      x.className = 'chat__attachment-remove';
-      x.type = 'button';
-      x.textContent = '×';
-      x.title = 'Remove';
-      x.addEventListener('click', () => {
-        state.chatAttachments = (state.chatAttachments || []).filter(x => x.id !== a.id);
-        renderChatAttachments();
-      });
-      chip.appendChild(x);
-      strip.appendChild(chip);
-    }
-  }
+
 
   function formatBytes(n) {
     if (!Number.isFinite(n)) return '';
@@ -9832,6 +10259,7 @@ function wire() {
   // Esc closes settings
   document.addEventListener('keydown', e => {
     if (e.key === 'Escape' && state.settingsOpen) closeSettings();
+    if (e.key === 'Escape' && $('#usage-overlay') && !$('#usage-overlay').hidden) closeUsageModal();
   });
 
   // Delegated handlers on #settings-pane. The pane itself is in static HTML
@@ -10041,7 +10469,7 @@ function renderChatSurface(agentMsg, input) {
     // Replace data in place; renderChat() will re-render the surface node.
     existing.data = input.data || {};
     renderChat();
-    return;
+    return surfaceId;
   }
 
   const surface = {
@@ -10055,6 +10483,9 @@ function renderChatSurface(agentMsg, input) {
   state.chatSurfaces[surfaceId] = surface;
   // Re-render the chat to show the surface
   renderChat();
+  // Returned so the caller can slot this surface into the message timeline at
+  // the point it was emitted (Jul 27 interleaving).
+  return surfaceId;
 }
 
 // Surface action dispatcher — called from any surface's interaction handler.
@@ -10139,7 +10570,167 @@ function handleDirectAction(action) {
   }
 }
 
+// Jul 20: hoisted to module scope so sendChatMessage() (top-level) can
+// call it. Was nested inside wire() -- a refactor put it out of scope, which
+// made sendChatMessage throw ReferenceError and silently drop every send.
+function renderChatAttachments() {
+  const wrap = document.querySelector('.chat__input-wrap');
+  if (!wrap) return;
+  let strip = wrap.querySelector('.chat__attachments');
+  const atts = state.chatAttachments || [];
+  if (!atts.length) {
+    if (strip) strip.remove();
+    return;
+  }
+  if (!strip) {
+    strip = document.createElement('div');
+    strip.className = 'chat__attachments';
+    // Insert at the top of the wrap so the chips sit ABOVE the
+    // input box (matches the convention in Claude.ai + Slack).
+    wrap.insertBefore(strip, wrap.firstChild);
+  }
+  strip.innerHTML = '';
+  for (const a of atts) {
+    const chip = document.createElement('div');
+    chip.className = 'chat__attachment-chip' + (a.type === 'file' ? ' chat__attachment-chip--file' : '');
+    // Title (tooltip) shows the most useful info for each kind
+    if (a.type === 'file') {
+      chip.title = `${a.filePath}\n${a.mime || 'file'} · ${formatBytes(a.sizeBytes)}`;
+    } else {
+      chip.title = `${a.mime} · ${a.width}×${a.height} · ${formatBytes(a.sizeBytes)}`;
+    }
+    if (a.type === 'file') {
+      // File chip — colored glyph + name + size. The glyph is a
+      // CSS-only "doc" mark so we don't need to bundle an icon font.
+      const glyph = document.createElement('div');
+      glyph.className = 'chat__attachment-glyph';
+      const ext = (a.name.split('.').pop() || '').toLowerCase().slice(0, 4);
+      glyph.textContent = ext ? ext : 'file';
+      chip.appendChild(glyph);
+    } else {
+      // Image chip — thumbnail preview.
+      const img = document.createElement('img');
+      img.src = a.dataUrl;
+      img.className = 'chat__attachment-thumb';
+      img.alt = '';
+      chip.appendChild(img);
+    }
+    const label = document.createElement('span');
+    label.className = 'chat__attachment-label';
+    if (a.type === 'file') {
+      label.textContent = `${a.name} · ${formatBytes(a.sizeBytes)}`;
+    } else {
+      label.textContent = `Image · ${formatBytes(a.sizeBytes)}`;
+    }
+    chip.appendChild(label);
+    const x = document.createElement('button');
+    x.className = 'chat__attachment-remove';
+    x.type = 'button';
+    x.textContent = '×';
+    x.title = 'Remove';
+    x.addEventListener('click', () => {
+      state.chatAttachments = (state.chatAttachments || []).filter(x => x.id !== a.id);
+      renderChatAttachments();
+    });
+    chip.appendChild(x);
+    strip.appendChild(chip);
+  }
+}
+
+// Cap tool-result payloads before they enter chat history. A single big
+// read_file / list_files / run_command / memory_recall result can be
+// megabytes; since the full history is resent to the API every turn, an
+// uncapped result eventually blows the per-message character ceiling
+// (10,485,760) and the turn fails with an opaque HTTP 400. Keep the head and
+// tail so the model still sees the start and end of the output.
+const TOOL_RESULT_CHAR_CAP = 200000;
+function capToolResultContent(content, toolName) {
+  if (typeof content === 'string') {
+    if (content.length <= TOOL_RESULT_CHAR_CAP) return content;
+    const half = Math.floor(TOOL_RESULT_CHAR_CAP / 2);
+    const omitted = content.length - TOOL_RESULT_CHAR_CAP;
+    return content.slice(0, half)
+      + `\n\n… [truncated ${omitted.toLocaleString()} of ${content.length.toLocaleString()} characters from ${toolName} result — output too large to send in full; narrow the request (read a line range, grep, or a more specific path)] …\n\n`
+      + content.slice(content.length - half);
+  }
+  if (Array.isArray(content)) {
+    return content.map(b =>
+      b && b.type === 'text' ? { ...b, text: capToolResultContent(b.text, toolName) } : b
+    );
+  }
+  return content;
+}
+
+// ============================================================
+// In-flight chat turn tracking (Jul 27) — Stop button + concurrency guard
+//
+// Long hit this: he ran a command, sent a second message while the first was
+// still working, and both tool loops ran at once (two commands executing
+// simultaneously, interleaved output, no way to stop either). Two fixes live
+// here: only ONE turn can be in flight at a time, and that turn can be
+// cancelled from the composer.
+//
+// Shape: { agentMsgId, requestId, cancelled }. requestId is regenerated for
+// each inference call inside the tool loop so stopChatTurn() always aborts the
+// stream that's actually open. `cancelled` is the cooperative flag the loop
+// checks at every await boundary — aborting the fetch alone isn't enough,
+// because the loop would just start the NEXT iteration (up to 50 of them).
+let activeChatTurn = null;
+
+function isChatTurnActive() {
+  return !!activeChatTurn;
+}
+
+// Stop the in-flight turn. Aborts the open inference stream and sets the
+// cooperative flag so the tool loop bails instead of starting another
+// iteration. Safe to call when nothing is running.
+async function stopChatTurn() {
+  const turn = activeChatTurn;
+  if (!turn) return;
+  turn.cancelled = true;
+  try {
+    if (window.farnsworth?.cancelStream) await window.farnsworth.cancelStream(turn.requestId);
+  } catch {}
+  // Mark the message stopped immediately so the UI responds on click rather
+  // than waiting for the abort to propagate back through the stream.
+  const idx = state.chatMessages.findIndex(m => m.id === turn.agentMsgId);
+  if (idx >= 0) {
+    const m = state.chatMessages[idx];
+    m.working = false;
+    m.workingLabel = '';
+    m.stopped = true;
+    renderChat();
+  }
+  updateChatSendButton();
+}
+
+const CHAT_SEND_ICON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>';
+// Filled square — the universal stop glyph (Vellum, Claude Code, ChatGPT).
+const CHAT_STOP_ICON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>';
+
+// Swap the composer button between Send and Stop based on whether a turn is in
+// flight. Called on every turn start/end and from renderChat so a reload mid
+// turn can't leave a stale glyph.
+function updateChatSendButton() {
+  const btn = document.getElementById('chat-send');
+  if (!btn) return;
+  const active = isChatTurnActive();
+  btn.classList.toggle('chat__send--stop', active);
+  btn.title = active ? 'Stop (Esc)' : 'Send (Cmd+Enter)';
+  btn.setAttribute('aria-label', active ? 'Stop generating' : 'Send message');
+  const want = active ? CHAT_STOP_ICON : CHAT_SEND_ICON;
+  if (btn.dataset.iconState !== (active ? 'stop' : 'send')) {
+    btn.innerHTML = want;
+    btn.dataset.iconState = active ? 'stop' : 'send';
+  }
+}
+
 async function sendChatMessage() {
+  // Concurrency guard (Jul 27). A second send while a turn is in flight used
+  // to spin up a parallel tool loop — two run_commands executing at once. The
+  // composer button is a Stop button while working, so a click here means the
+  // user wants to stop; a stray Enter is a no-op.
+  if (isChatTurnActive()) return;
   const input = $('#chat-input');
   const text = input.value.trim();
   // Pending clipboard-image attachments (Jul 16 ~23:30 ET). Snapshotted
@@ -10353,11 +10944,43 @@ async function sendChatMessage() {
 
   // Mutable copy of the agent placeholder so we can update its chips/working label as tools execute
   let agentMsg = { id: agentMsgId, role: 'agent', working: true, workingLabel: 'Thinking', chips: [],
+    // Jul 27: ordered record of the turn -- { type:'text', text } and
+    // { type:'chip', chipIndex } entries in emission order. renderMessage walks
+    // this so narration and tool calls interleave (reason -> steps -> reason ->
+    // steps) instead of collapsing into one text-block-per-end. chipIndex
+    // points into `chips` rather than holding the chip object, because chips
+    // get patched (output, screenshot) after they're created.
+    timeline: [],
     // Jul 14 ~09:20 ET: snapshot the model at message creation so the
     // bubble header can show what was actually used, even after the
     // user changes the default mid-conversation. See msg__model render
     // ~line 776.
     model: state.settings?.defaultModel || 'Opus 4.8',
+  };
+  // Timeline writers. Both mutate the array in place -- updateAgentMsg's
+  // spread copies the reference, so mutations stay visible to the renderer.
+  const tlText = (delta) => {
+    const tl = (agentMsg.timeline = agentMsg.timeline || []);
+    const last = tl[tl.length - 1];
+    if (last && last.type === 'text') last.text += delta;
+    else tl.push({ type: 'text', text: delta });
+  };
+  // Returns the entry so callers can repoint chipIndex later (run_command
+  // creates a second, better chip -- the terminal one -- after the fact).
+  const tlChip = (chipIndex) => {
+    const tl = (agentMsg.timeline = agentMsg.timeline || []);
+    const entry = { type: 'chip', chipIndex };
+    tl.push(entry);
+    return entry;
+  };
+  // ui_show surfaces slot in at the point they were emitted. Repeat ui_show
+  // calls with the same surfaceId are in-place updates (task_progress step
+  // flips), so only the first appearance gets a timeline slot.
+  const tlSurface = (surfaceId) => {
+    if (!surfaceId) return;
+    const tl = (agentMsg.timeline = agentMsg.timeline || []);
+    if (tl.some(e => e.type === 'surface' && e.surfaceId === surfaceId)) return;
+    tl.push({ type: 'surface', surfaceId });
   };
   const updateAgentMsg = (patch) => {
     agentMsg = { ...agentMsg, ...patch };
@@ -10379,9 +11002,17 @@ async function sendChatMessage() {
     clientMsgId: companionChatId,
   });
 
+  // Claim the in-flight slot before the loop starts. Cleared in `finally`,
+  // which every exit path below routes through.
+  activeChatTurn = { agentMsgId, requestId: null, cancelled: false };
+  const turn = activeChatTurn;
+  updateChatSendButton();
+
   try {
     // Tool-use loop — iterate up to 10 times (read_file → answer is the common path)
-    for (let iter = 0; iter < 10; iter++) {
+    for (let iter = 0; iter < 50; iter++) {
+      // Stop pressed between iterations — bail before spending another call.
+      if (turn.cancelled) break;
       // Throttled renderChat for streaming — updates the DOM at most every 40ms.
       let renderTimer = null;
       const scheduleRender = () => {
@@ -10424,6 +11055,13 @@ async function sendChatMessage() {
           '- test_save(name, json) — save a test JSON file (validates JSON first)',
           '- test_run(path) — run a test (path is ABSOLUTE, not relative — get it from test_list or test_save)',
           '',
+          '- take_canvas_screenshot(filename?) — capture the active canvas preview as a PNG and return the image so you can SEE what the app looks like right now. Use before writing tests (to discover selectors), after code changes (to verify the result), or any time the user asks what the app currently looks like. Returns the image directly.',
+          '',
+          '**Canvas + emulator control tools:**',
+          '- set_canvas_view(view) — switch the top-level canvas view: "live" (Live Preview), "storybook", or "code" (Monaco editor). Use when the user says "switch to live preview", "show me the code", "open storybook".',
+          '- set_preview(preview) — within Live Preview, switch the surface: "post", "mobile", "desktop", "fullscreen", or "testview". Auto-switches into live view first. Use for "show the app mobile view", "switch to desktop", "show the post view".',
+          '- switch_devvit_user(username) — switch the active Devvit emulator user (leading "u/" optional) and restart the dev server. Use for "switch to u/bob", "log in as carol". On an unknown name the tool returns the list of available users — relay those to the user.',
+          '',
           '## When to use Test View tools',
           '',
           'When the user asks any of: "create a test that...", "make a test for X", "run the test that...", "show me the tests", "edit the test X to...", "what tests exist?", "delete the X test" — call `open_testview` FIRST (so they see Test View in the canvas), then the appropriate test_* tool. Report the result in chat with concrete detail (stdout/stderr if a run failed).',
@@ -10437,11 +11075,19 @@ async function sendChatMessage() {
           '- The active workspace folder is set via File → Open Folder. If the user asks you to do workspace work and no folder is open, tell them to open one.',
           '- Use ui_show surfaces when the work has multiple steps (task_progress), produces a structured outcome (work_result), needs a choice (choice), or needs a credential (credential).',
           '- Be direct, concise, and act. The user runs Farnsworth as their IDE; surface errors with the underlying stdout/stderr so they can fix the issue.',
+          '- Narrate as you go. Before each tool call, write ONE short sentence (not a paragraph) saying what you\'re about to do and why — e.g. "Checking the current config before editing it." or "That failed because X, trying Y instead." This text streams to the user live while the tool runs, so keep it tight; don\'t restate the whole plan every time, just the immediate next step.',
         ].join('\n');
 
+        // Own the requestId so stopChatTurn() can abort THIS stream. Fresh per
+        // iteration — the previous iteration's stream is already closed.
+        turn.requestId = 'chat-' + agentMsgId + '-' + iter + '-' + Math.random().toString(36).slice(2, 8);
         res = await window.farnsworth.streamMessage({
+          requestId: turn.requestId,
           messages: history,
           system: systemPrompt,
+          // Jul 19: route custom-inference models to their endpoint. null for
+          // built-in Anthropic / OpenAI models (main.js falls back correctly).
+          endpoint: resolveEndpointForModel(state.settings?.defaultModel),
           // Translate Farnsworth display name (state.settings.defaultModel,
           // e.g. 'Opus 4.8 High') to the Anthropic API id (e.g.
           // 'claude-opus-4-8'). state.settings.model was the old wrong key
@@ -10463,6 +11109,11 @@ async function sendChatMessage() {
             } else {
               agentMsg.preambleText = (agentMsg.preambleText || '') + deltaText;
             }
+            // Jul 27: also append to the timeline, which is what actually
+            // renders. Lands in the open text segment, or opens a new one if a
+            // tool chip was the last thing emitted -- that's what produces the
+            // reason/steps/reason interleave.
+            tlText(deltaText);
             // Keep m.text as the concatenated view for backward compat (history
             // saves, etc.). renderMessage uses preambleText + responseText.
             agentMsg.text = (agentMsg.preambleText || '') + (agentMsg.responseText || '');
@@ -10519,6 +11170,13 @@ async function sendChatMessage() {
         });
         return;
       }
+      // Stopped by the user — a normal outcome, not a failure. Must be checked
+      // BEFORE the !res.ok branch below, which would otherwise paint a red
+      // "Inference failed" bubble on every Stop press.
+      if (turn.cancelled || res?.cancelled) {
+        turn.cancelled = true;
+        break;
+      }
       if (!res || !res.ok) {
         const msg = res?.message || res?.error || 'Inference failed';
         const extraChips = [];
@@ -10564,12 +11222,24 @@ async function sendChatMessage() {
         // that matters (commit/review/title one-shots stay out of it).
         if (res.usage) { state.session.lastUsage = res.usage; try { updateStatusBar(); } catch {} }
         const usageChip = res.usage ? { label: `${res.usage.input_tokens}→${res.usage.output_tokens} tok`, kind: 'read' } : null;
+        // Jul 21 fix: if the whole turn produced NO tool calls, the model's
+        // answer accumulated in preambleText (which renders small/faint/italic
+        // as "thinking" text). Promote it to responseText so a plain Q&A answer
+        // renders as a proper formatted response, not thinking-styled. Only the
+        // tool-free path needs this — when tools WERE used, preambleText holds
+        // the pre-tool "let me check…" text (correctly thinking-styled) and the
+        // final answer is already in responseText.
+        const promote =
+          !agentMsg._hasSeenToolUse && agentMsg.preambleText && !agentMsg.responseText
+            ? { responseText: agentMsg.preambleText, preambleText: '' }
+            : {};
         updateAgentMsg({
           working: false,
           text: res.text || '(empty response)',
           verified: true,
           animatingVerdict: true,
           chips: [...(agentMsg.chips || []), ...(usageChip ? [usageChip] : [])],
+          ...promote,
         });
         // Final response (no tool use) - send chat:done here too so companion
         // gets the done event before sendChatMessage returns.
@@ -10583,12 +11253,16 @@ async function sendChatMessage() {
       // Execute each tool_use in order, then send results back
       const toolResultBlocks = [];
       for (const tu of res.toolUses) {
+        // Stop pressed mid-batch: don't fire the remaining tools. A turn can
+        // carry several tool_uses (e.g. two run_commands), and without this the
+        // queue keeps executing after the user has already hit Stop.
+        if (turn.cancelled) break;
         // Surfaces are renderer-side — intercept BEFORE executeTool so we
         // never round-trip them as a tool result back to main. Render the
         // surface inline and synthesize a tool_result ack so the model can
         // continue its turn.
         if (tu.name === 'ui_show') {
-          renderChatSurface(agentMsg, tu.input);
+          tlSurface(renderChatSurface(agentMsg, tu.input));
           toolResultBlocks.push({
             type: 'tool_result',
             tool_use_id: tu.id,
@@ -10598,15 +11272,34 @@ async function sendChatMessage() {
         }
         const preview = JSON.stringify(tu.input).slice(0, 60);
         const newChip = { label: `${tu.name}(${preview})`, kind: 'edit', name: tu.name, input: tu.input };
+        const nextChips = [...(agentMsg.chips || []), newChip];
+        const tlEntry = tlChip(nextChips.length - 1);
         updateAgentMsg({
           working: true,
           workingLabel: `Running ${tu.name}…`,
-          chips: [...(agentMsg.chips || []), newChip],
+          chips: nextChips,
         });
         const toolRes = await window.farnsworth.executeTool(tu.name, tu.input);
         let resultContent;
-        if (!toolRes.ok) {
+        if (tu.name === 'test_run') {
+          // test_run's `ok` means "0 exit code AND 0 failed steps" -- a
+          // completed run with some failing steps is ok:false even though
+          // it's not a tool error, so it must be handled BEFORE the generic
+          // !toolRes.ok branch below or its real stdout/stderr gets thrown
+          // away and replaced with a bare "tool failed" (Jul 27 bug fix).
+          if (toolRes.error && toolRes.code === undefined) {
+            resultContent = `Error: ${toolRes.error}`;
+          } else {
+            resultContent = `Exit ${toolRes.code}, ${toolRes.failed || 0} failed\n\nSTDOUT:\n${toolRes.stdout || '(empty)'}\n\nSTDERR:\n${toolRes.stderr || '(empty)'}`;
+          }
+        } else if (!toolRes.ok) {
           resultContent = `Error: ${toolRes.message || toolRes.error || 'tool failed'}`;
+        } else if (tu.name === 'test_list') {
+          resultContent = JSON.stringify(toolRes.tests || [], null, 2);
+        } else if (tu.name === 'test_read') {
+          resultContent = toolRes.json || '(empty)';
+        } else if (tu.name === 'test_save') {
+          resultContent = `Saved ${toolRes.name} at ${toolRes.path}`;
         } else if (tu.name === 'read_file') {
           resultContent = toolRes.content;
         } else if (tu.name === 'list_files') {
@@ -10624,28 +11317,51 @@ async function sendChatMessage() {
             stderr: toolRes.stderr || '',
             exitCode: toolRes.exitCode,
           }];
-          updateAgentMsg({
-            chips: [
-              ...(agentMsg.chips || []),
-              {
-                label: '$ ' + (tu.input?.command || '').slice(0, 80),
-                kind: 'terminal',
-                runIndex: (agentMsg.runOutputs?.length || 1) - 1,
-              },
-            ],
-          });
+          const withTerm = [
+            ...(agentMsg.chips || []),
+            {
+              label: '$ ' + (tu.input?.command || '').slice(0, 80),
+              kind: 'terminal',
+              runIndex: (agentMsg.runOutputs?.length || 1) - 1,
+            },
+          ];
+          // The terminal chip ($ the-actual-command, click for stdout/stderr)
+          // is strictly better than the generic run_command(...) chip, so the
+          // timeline shows that one instead of both.
+          tlEntry.chipIndex = withTerm.length - 1;
+          // Kept in `chips` for history/companion compat, but flagged so the
+          // renderer doesn't resurrect it as an unreferenced leftover chip.
+          newChip._superseded = true;
+          updateAgentMsg({ chips: withTerm });
+        } else if (tu.name === 'take_canvas_screenshot') {
+          if (toolRes.base64) {
+            resultContent = [
+              { type: 'text', text: 'Screenshot: ' + toolRes.path + ' (' + toolRes.width + 'x' + toolRes.height + ')' },
+              { type: 'image', source: { type: 'base64', media_type: 'image/png', data: toolRes.base64 } }
+            ];
+          } else {
+            resultContent = toolRes.message || 'Screenshot failed.';
+          }
         } else if (tu.name === 'memory_recall') {
           resultContent = toolRes.result || 'No memory matches.';
         } else {
           resultContent = toolRes.message || 'OK';
         }
+        // Guard the API per-message character ceiling: cap oversized tool
+        // results before they enter history (they get resent every turn).
+        resultContent = capToolResultContent(resultContent, tu.name);
         // Capture output on the chip so renderMessage can show it on expand
         // (Vellum-style: chip is collapsed by default; click reveals input + output).
         // agentMsg was reassigned by updateAgentMsg above, so agentMsg.chips is
         // the latest array. Patch the last chip with its output.
+        const chipOutput = Array.isArray(resultContent)
+          ? resultContent.filter(b => b.type === 'text').map(b => b.text).join('\n')
+          : resultContent;
         const lastChips = (agentMsg.chips || []).slice();
         if (lastChips.length) {
-          lastChips[lastChips.length - 1] = { ...lastChips[lastChips.length - 1], output: resultContent };
+          const chipPatch = { ...lastChips[lastChips.length - 1], output: chipOutput };
+          if (toolRes?.base64) chipPatch.screenshotBase64 = toolRes.base64;
+          lastChips[lastChips.length - 1] = chipPatch;
           updateAgentMsg({ chips: lastChips });
         }
         toolResultBlocks.push({
@@ -10663,12 +11379,26 @@ async function sendChatMessage() {
           openFileByPath(absPath);
         }
       }
+      // Stop pressed while a tool was executing — its result is in
+      // toolResultBlocks but there's no point sending it back for another turn.
+      if (turn.cancelled) break;
       // Send tool results back as a user message
       history.push({ role: 'user', content: toolResultBlocks });
       updateAgentMsg({ working: true, workingLabel: 'Thinking' });
     }
-    // Hit the iter cap
-    updateAgentMsg({ working: false, text: agentMsg.text || 'Tool loop reached max iterations', error: true });
+    if (turn.cancelled) {
+      // Leave whatever the agent already produced visible and append a quiet
+      // marker, matching how Vellum / Claude Code show an interrupted turn.
+      updateAgentMsg({ working: false, workingLabel: '', stopped: true });
+      sendChatEventToCompanions('chat:done', {
+        messageId: agentMsgId,
+        finalText: agentMsg.text || '',
+        stopped: true,
+      });
+    } else {
+      // Hit the iter cap
+      updateAgentMsg({ working: false, text: agentMsg.text || 'Tool loop reached max iterations', error: true });
+    }
   } catch (e) {
     const idx = state.chatMessages.findIndex(m => m.id === agentMsgId);
     if (idx >= 0) {
@@ -10676,6 +11406,11 @@ async function sendChatMessage() {
       renderChat();
     }
   } finally {
+    // Release the in-flight slot + restore the Send glyph. Must happen on EVERY
+    // exit path (success, error, cancel, early return) or the composer stays
+    // locked in Stop state and no further message can be sent.
+    if (activeChatTurn === turn) activeChatTurn = null;
+    updateChatSendButton();
     // Memory: archive the completed turn (user msg + final agent reply).
     // Goes to the immutable daily log; doesn't auto-add to the concept
     // store (that's the consolidation job's job). Tier 1: archive-only.
@@ -12750,6 +13485,38 @@ async function init() {
       if (state.previewCustomHeight) delete state.previewCustomHeight[state.preview];
       updateModeToggles();
       renderCanvas();
+    });
+  }
+  // Programmatic canvas MODE switcher (chat agent's set_canvas_view tool).
+  // Sets the top-level Live / Storybook / Code view.
+  if (window.farnsworth?.onCanvasSetMode) {
+    window.farnsworth.onCanvasSetMode((payload) => {
+      const mode = payload?.mode;
+      if (!['live', 'storybook', 'code'].includes(mode)) return;
+      window.farnsworth?.canvasRemoveAllViews?.();
+      state.canvasMode = mode;
+      updateModeToggles();
+      renderCanvas();
+    });
+  }
+  // Programmatic devvit user switch (chat agent's switch_devvit_user tool).
+  // Mirrors the openDevvitUserMenu click handler: persist the selection,
+  // restart the dev server, refresh the user pill.
+  if (window.farnsworth?.onDevvitAgentSwitchUser) {
+    window.farnsworth.onDevvitAgentSwitchUser(async (payload) => {
+      const userId = payload?.userId;
+      const username = payload?.username || 'user';
+      if (!userId || !state.folder) { showToast?.('Cannot switch devvit user: no folder open.'); return; }
+      try {
+        const settings = await window.farnsworth.devvitGetProjectSettings(state.folder);
+        await window.farnsworth.devvitSetProjectSettings(state.folder, userId, settings?.current_subreddit_id || null);
+        showToast?.(`Switched to ${username}. Restarting dev server…`);
+        await stopFarnsworthDev();
+        await bootFarnsworthDev();
+        await refreshDevvitUserPill();
+      } catch (e) {
+        showToast?.('Failed to switch devvit user.');
+      }
     });
   }
   // Initial title bar / chat header — shows folder name when set, else

@@ -147,6 +147,9 @@
                 <button class="iconbtn iconbtn--sm" title="Attach">
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5l-8.5 8.5a5 5 0 0 1-7-7l8.5-8.5a3 3 0 0 1 4.2 4.2l-8.5 8.5a1 1 0 0 1-1.5-1.5l7.8-7.8"/></svg>
                 </button>
+                <button class="chat__usage" id="chat-usage" title="Session token usage">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></svg>
+                </button>
                 <button class="chat__model" id="chat-model">
                   <span class="chat__model-dot"></span>
                   <span class="chat__model-name">Opus 4.8</span>
@@ -469,6 +472,20 @@
     </div>
 
     <!-- ============ SETTINGS OVERLAY ============ -->
+    <div class="usage-overlay" id="usage-overlay" hidden>
+      <div class="usage-overlay__backdrop" data-close-usage></div>
+      <div class="usage-modal" role="dialog" aria-label="Session token usage">
+        <header class="usage-modal__header">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#a855f7" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></svg>
+          <span class="usage-modal__title">Session token usage</span>
+          <button class="iconbtn iconbtn--sm" data-close-usage title="Close" style="margin-left:auto;">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+          </button>
+        </header>
+        <div class="usage-modal__body" id="usage-modal-body"><!-- rendered by renderUsageModal() --></div>
+      </div>
+    </div>
+
     <div class="settings-overlay" id="settings-overlay" hidden>
       <div class="settings-overlay__backdrop" data-close-settings></div>
       <div class="settings" role="dialog" aria-label="Settings">
