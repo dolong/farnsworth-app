@@ -52,7 +52,12 @@ if (!repoRoot) {
 const esbuildPath = pathResolve(repoRoot, 'node_modules/esbuild/lib/main.js');
 const { build } = await import(pathToFileURL(esbuildPath).href);
 
-const serverEntry = pathResolve(repoRoot, 'src/server/index.ts');
+// Entry override: default is the Devvit production entry (src/server/index.ts),
+// which the-last-draft uses. Projects with their own local dev entry (e.g.
+// dontdie-reddit's src/server/local.ts, which loads .env via dotenv + binds its
+// own LOCAL_PORT + sets CORS) can override via DEVVIT_EMULATOR_SERVER_ENTRY.
+const serverEntryRel = process.env.DEVVIT_EMULATOR_SERVER_ENTRY || 'src/server/index.ts';
+const serverEntry = pathResolve(repoRoot, serverEntryRel);
 const port = Number(process.env.DEVVIT_EMULATOR_SERVER_PORT || 3000);
 const configPath = process.env.DEVVIT_EMULATOR_CONFIG || '(unset)';
 const statePath = process.env.DEVVIT_EMULATOR_STATE || '(unset)';
@@ -248,6 +253,17 @@ try {
     // so the bundle is self-contained and Node can import it from /tmp/.
     absWorkingDir: repoRoot,
     resolveExtensions: ['.ts', '.tsx', '.js', '.jsx', '.json'],
+    // Provide a real `require` at module top-level so esbuild's __require
+    // helper delegates to it instead of throwing "Dynamic require of X is not
+    // supported". CJS deps bundled into the ESM output (e.g. dotenv, which
+    // dontdie's local.ts imports and which does require('fs')) need this.
+    // Harmless for entries with no dynamic requires (the-last-draft's index.ts).
+    banner: {
+      js: [
+        "import { createRequire as __fwCreateRequire } from 'node:module';",
+        "const require = __fwCreateRequire(import.meta.url);",
+      ].join('\n'),
+    },
     plugins: [emulatorPlugin],
   });
   console.log('[server-runner] bundle complete');
