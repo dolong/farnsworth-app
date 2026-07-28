@@ -53,6 +53,7 @@ Step fields: `action` (required) + action-specific fields. `_comment` and `name`
 | `increment` | `var` | | var += 1 |
 | `if` | `condition`, `steps` | | Run nested steps only if JS `condition` is truthy |
 | `while` | `steps` | `max` (default 100), `until` | Repeat nested steps until JS `until` truthy or `max` reached |
+| `switchUser` | `username` | `timeout` (default 60000) | Switch the active Devvit emulator user. Restarts the dev server and re-attaches. See below |
 | `llm-step` | `prompt` | `into`, `screenshot`, `model`, `max_tokens` | Visual judgment via direct Anthropic API (~2-3s; screenshot sent inline; auth auto-injected by Farnsworth). Falls back to `claude` CLI only if no auth (slow, ~30s+). `model` accepts `haiku`/`sonnet`/`opus` or a full API id; default = Settings → AI → Testing model (Sonnet 5 unless changed) |
 
 There is NO `scroll`, `wait`, or `hover` action.
@@ -77,6 +78,32 @@ Any string field supports `${var}` interpolation from `extract`/`setVar`/`increm
 ```
 
 Wrap first-run-only flows (FTUE coaches, intro videos) in `if` blocks testing `!!document.querySelector(...)` so the test passes for fresh AND returning users.
+
+## Switching Devvit users mid-test
+
+```json
+{ "action": "switchUser", "username": "carol" }
+```
+
+`username` takes `"carol"` or `"u/carol"` — the `u/` prefix is normalized on both sides, so either works.
+
+**This is an expensive step, by necessity.** The emulator's server-runner seeds the current user from its config at BOOT, so switching requires a full dev-server restart (typically 3-10s). The runner handles the fallout for you: it drives the switch through Farnsworth's renderer, waits for the server to come back, then re-attaches to the rebuilt game page. Variables set via `extract`/`setVar` survive the switch; page state does not.
+
+Practical consequences:
+
+- **The page is freshly loaded after a switch.** You do NOT need a `reload` right after — but you DO need to re-navigate (click through the lobby, etc.), because you're back at the app's entry point.
+- **If the user is already active, the step is a no-op** and skips the restart. Safe to put at the top of every test to pin identity without paying for a restart on every run.
+- **The user must already exist** in Farnsworth's emulator settings (cogwheel → users). The step fails with the list of available users if not; it will not create one.
+- Raise `timeout` above the 60s default only if the project's dev server is unusually slow to boot.
+
+Multi-user flows (one user posts, another sees it) are the main use:
+
+```json
+{ "action": "switchUser", "username": "bob" },
+{ "action": "click", "selector": ".bnav-play" },
+{ "action": "switchUser", "username": "carol" },
+{ "action": "waitFor", "selector": ".lb2-mission-tab", "timeout": 15000 }
+```
 
 ## Common selectors (the-last-draft)
 

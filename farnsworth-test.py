@@ -43,6 +43,9 @@ Available actions:
   increment           - ${var} += 1
   while               - repeat nested steps up to `max` times; stop if `until` truthy
   if                  - run nested steps only if `condition` is truthy
+  switchUser          - switch the active Devvit emulator user, restart the dev
+                        server, and re-attach. `username` accepts 'bob' or
+                        'u/bob'. No-op (no restart) if already active.
   llm-step            - take screenshot (optional), ask an LLM. Fast path:
                         direct Anthropic API call (auth via FARNSWORTH_AUTH_TOKEN
                         or ANTHROPIC_API_KEY env). Fallback: `claude` CLI,
@@ -77,12 +80,42 @@ import websocket
 
 CDP_PORT = 9222
 
-def find_target(port=CDP_PORT, prefer_url='localhost:5174'):
-    targets = json.loads(urllib.request.urlopen(f'http://localhost:{port}/json').read())
+def find_renderer_target(port=CDP_PORT):
+    """Find Farnsworth's OWN renderer (file://...index.html), not the game page.
+
+    The switchUser action needs this: emulator users live in Farnsworth's
+    SQLite + the switch has to restart the dev server, and both of those are
+    only reachable from the main renderer's `window.farnsworth` bridge. The
+    game page has no access to either.
+    """
+    try:
+        targets = json.loads(urllib.request.urlopen(f'http://localhost:{port}/json').read())
+    except Exception:
+        return None
+    return next((t for t in targets
+                 if t.get('type') == 'page' and 'index.html' in t.get('url', '')), None)
+
+
+def find_target(port=CDP_PORT, prefer_url='localhost:5174', quiet=False):
+    """Find the game page target.
+
+    `quiet` suppresses the "no WebContentsView" guidance — used by the
+    switchUser re-attach loop, where the target is EXPECTED to be missing for a
+    few seconds while the dev server restarts. Printing the setup error there
+    made a passing step look like a failure.
+    """
+    try:
+        targets = json.loads(urllib.request.urlopen(f'http://localhost:{port}/json').read())
+    except Exception:
+        if quiet:
+            return None
+        raise
     bv = next((t for t in targets if t.get('type') == 'page' and prefer_url in t.get('url', '')), None)
     if bv:
         return bv
     page_targets = [t for t in targets if t.get('type') == 'page']
+    if quiet:
+        return None
     if len(page_targets) == 1 and 'index.html' in page_targets[0].get('url', ''):
         print(f'ERROR: No WebContentsView target found at port {port}.')
         print(f'  Only the Farnsworth main renderer is active (file://...index.html).')
@@ -121,6 +154,116 @@ class Tester:
         # both undefined and missing-key cases — otherwise Python raises KeyError.
         return r['result'].get('value')
 
+    def switch_devvit_user(self, username, timeout_ms=60000):
+        """Switch the active Devvit emulator user, then reconnect to the game page.
+
+        Why this is more than a one-liner: the emulator's server-runner seeds
+        `currentUsername` from DEVVIT_EMULATOR_CONFIG at BOOT, so changing the
+        active user requires a dev-server restart for the server side to see it.
+        That restart tears down the WebContentsView this Tester is attached to,
+        so our own websocket goes stale and every subsequent step would fail
+        with a dead-connection error. Hence: drive the switch from Farnsworth's
+        renderer, then re-attach to the fresh game target.
+
+        Returns a dict describing what happened (see `result` keys below).
+        """
+        rt = find_renderer_target()
+        if not rt:
+            raise Exception('Farnsworth renderer target not found on CDP '
+                            f'{CDP_PORT} — is the app running?')
+
+        # `u/` is stripped from BOTH sides. The emulator stores usernames WITH
+        # the prefix ('u/bob') but people write tests with the bare handle
+        # ('bob'); comparing raw is the exact bug that broke the chat agent's
+        # switch_devvit_user tool on Jul 27.
+        js = '''(async () => {
+            const want = %s.replace(/^u\\//i, '').toLowerCase();
+            if (!state.folder) return { ok: false, error: 'no_folder' };
+            const users = await window.farnsworth.devvitListUsers();
+            const match = (users || []).find(u =>
+                String(u.username || '').replace(/^u\\//i, '').toLowerCase() === want);
+            if (!match) return {
+                ok: false, error: 'user_not_found',
+                available: (users || []).map(u => u.username),
+            };
+            const settings = await window.farnsworth.devvitGetProjectSettings(state.folder);
+            // Already active -> skip the restart entirely. Keeps re-runs fast
+            // and makes the action idempotent, which the whole format assumes.
+            if (String(settings && settings.current_user_id) === String(match.id)) {
+                return { ok: true, username: match.username, alreadyActive: true };
+            }
+            await window.farnsworth.devvitSetProjectSettings(
+                state.folder, match.id, (settings && settings.current_subreddit_id) || null);
+            await stopFarnsworthDev();
+            await bootFarnsworthDev();
+            try { await refreshDevvitUserPill(); } catch (e) {}
+            return {
+                ok: true, username: match.username, restarted: true,
+                url: (state.farnsworthDev || {}).url || null,
+                available: !!(state.farnsworthDev || {}).available,
+            };
+        })()''' % json.dumps(str(username))
+
+        rws = websocket.create_connection(rt['webSocketDebuggerUrl'], timeout=timeout_ms / 1000.0 + 15)
+        try:
+            res = Tester(rws).eval(js, await_promise=True) or {}
+        finally:
+            try: rws.close()
+            except Exception: pass
+
+        if not res.get('ok'):
+            if res.get('error') == 'user_not_found':
+                avail = ', '.join(res.get('available') or []) or '(none)'
+                raise Exception(f'no emulator user "{username}". Available: {avail}')
+            if res.get('error') == 'no_folder':
+                raise Exception('no workspace folder open in Farnsworth')
+            raise Exception(f'switch failed: {res}')
+
+        if res.get('alreadyActive'):
+            return res
+        if not res.get('available'):
+            raise Exception(f'dev server did not come back up after switching to {res.get("username")}')
+
+        # Re-attach: the old WebContentsView died with the dev server.
+        self._reattach(timeout_ms)
+        return res
+
+    def _reattach(self, timeout_ms=60000):
+        """Point self.ws at the rebuilt game target, waiting for it to serve.
+
+        Polls for a target AND proves it's actually alive with a real eval --
+        a target can appear in /json before Vite is ready to serve the page.
+        Variables (self.vars) intentionally survive; only the socket changes.
+        """
+        try: self.ws.close()
+        except Exception: pass
+        self.ws = None
+        # Let the old WebContentsView finish deregistering. Without this we can
+        # briefly see the doomed target still listed and attach to a page that's
+        # about to be destroyed. Negligible against a multi-second restart.
+        time.sleep(0.6)
+        deadline = time.time() + timeout_ms / 1000.0
+        last_err = None
+        while time.time() < deadline:
+            tgt = find_target(quiet=True)
+            if tgt and tgt.get('webSocketDebuggerUrl'):
+                try:
+                    ws = websocket.create_connection(tgt['webSocketDebuggerUrl'], timeout=10)
+                    self.ws = ws
+                    self._id = 0
+                    # Prove the page actually executes JS before handing back.
+                    if self.eval('1 + 1') == 2:
+                        return True
+                    self.ws = None
+                    try: ws.close()
+                    except Exception: pass
+                except Exception as e:
+                    last_err = e
+                    self.ws = None
+            time.sleep(0.5)
+        raise Exception(f'could not re-attach to the game page after switching users '
+                        f'({int(timeout_ms / 1000)}s): {last_err}')
+
     def screenshot(self, path):
         r = self.send('Page.captureScreenshot', {'format': 'png'})
         with open(path, 'wb') as f:
@@ -149,6 +292,17 @@ class Tester:
             // Also include foreignObject descendants (TeamSelect input lives in one)
             document.querySelectorAll('foreignObject').forEach(fo => {{
                 fo.querySelectorAll('button, [role="button"]').forEach(b => all.push(b));
+            }});
+            // Also catch custom-styled clickable elements not on the allowlist
+            // above (e.g. a plain <div style="cursor:pointer"> debug toggle).
+            // Jul 27 fix: waitFor's text= check is loose (innerText.includes),
+            // but click's text= was restricted to this allowlist, so an
+            // element waitFor found could still fail to click. cursor:pointer
+            // is the generic signal for "this is meant to be clicked".
+            document.querySelectorAll('div, span').forEach(el => {{
+                if (all.includes(el)) return;
+                const cs = getComputedStyle(el);
+                if (cs.cursor === 'pointer') all.push(el);
             }});
             const matches = all.filter(el => {{
                 if (el.offsetParent === null && el.tagName !== 'foreignObject') return false;
@@ -366,7 +520,8 @@ class Tester:
 
 def run_step(t, step, idx):
     action = step['action']
-    desc = step.get('selector') or step.get('path') or step.get('expression') or step.get('prompt', '')[:60]
+    desc = (step.get('selector') or step.get('path') or step.get('expression')
+            or step.get('username') or step.get('prompt', '')[:60])
     print(f'  [{idx}] {action:18} {str(desc)[:60]}', end='... ')
     try:
         if action == 'waitFor':
@@ -414,6 +569,18 @@ def run_step(t, step, idx):
         elif action == 'type':
             t.type_text(step['selector'], step['text'])
             print(f'OK ({len(step["text"])} chars)')
+            return True
+        elif action == 'switchUser' or action == 'switchDevvitUser':
+            username = step.get('username') or step.get('user')
+            if not username:
+                print('(no username!)')
+                return False
+            res = t.switch_devvit_user(t.interpolate(str(username)),
+                                       step.get('timeout', 60000))
+            if res.get('alreadyActive'):
+                print(f'{res.get("username")} (already active, no restart)')
+            else:
+                print(f'{res.get("username")} (dev server restarted, re-attached)')
             return True
         elif action == 'extract':
             result = t.eval(step['expression'])

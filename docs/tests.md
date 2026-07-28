@@ -193,6 +193,7 @@ Fifteen actions, verified against the runner source.
 | `increment` | `var` | | Adds 1 to a variable (starts at 0 if unset) |
 | `if` | `condition`, `steps` | | Evaluates `condition` as JS; runs nested steps only if truthy. Falsy is not a failure |
 | `while` | `steps` | `max` (default 100), `until` | Repeats nested steps up to `max` times; checks `until` (JS) before each iteration and stops when truthy. Hitting `max` is not a failure |
+| `switchUser` | `username` | `timeout` (default 60000) | Switches the active Devvit emulator user. Restarts the dev server and re-attaches to the rebuilt page. See section 8b |
 | `llm-step` | `prompt` | `into`, `screenshot`, `model`, `max_tokens` | Asks an LLM, optionally with a screenshot — direct API fast path (~2-3s), `claude` CLI fallback. See section 9 |
 
 Notes:
@@ -232,7 +233,9 @@ Use `text=` for SVG-based buttons that CSS cannot address well (the TeamSelect S
 
 ## 8. Variables and control flow
 
-Any string field (selector, path, expression, prompt) supports `${varName}` interpolation from variables set by `extract`, `setVar`, `increment`, or `llm-step`'s `into`.
+`${varName}` interpolation is applied to **`selector` fields only** (plus `switchUser`'s `username`), from variables set by `extract`, `setVar`, `increment`, or `llm-step`'s `into`. It is **not** applied to `expression`, `until`, `condition`, `path`, `text`, or `prompt`.
+
+This is the single most surprising thing about the format, and it shapes how loops are written: a `while` loop's `until` cannot read a runner variable, so loop counters have to live in **page** state (`window.__pickCount`) rather than in `increment`. Runner variables and page-side JS state are two separate worlds, and only selectors bridge them.
 
 The signature pattern, from `draft-5-picks-rarest.json` (pick the rarest of 3 draft cards, 5 rounds):
 
@@ -257,6 +260,30 @@ How the pieces fit:
 - Failure semantics inside blocks: the first failed nested step aborts the block, and the block counts as one failed step; the run then continues with the next top-level step.
 
 ---
+
+## 8b. Switching Devvit users mid-test
+
+```json
+{ "action": "switchUser", "username": "carol" }
+```
+
+`username` accepts `"carol"` or `"u/carol"` — the `u/` prefix is normalized on both sides. The user must already exist in Farnsworth's emulator settings (cogwheel → users); the step will not create one. If the name is unknown it fails with the list of available users and leaves the running server untouched.
+
+**This step is expensive by necessity.** The emulator's server-runner seeds the current user from its config at *boot*, so changing the active user requires a full dev-server restart (typically 3-10s). The runner handles the fallout: it drives the switch through Farnsworth's own renderer, waits for the server to return, then re-attaches to the rebuilt game page. Raise `timeout` above the 60s default only for unusually slow projects.
+
+Two consequences worth internalizing:
+
+- **The page is freshly loaded afterwards.** Runner variables (`extract` / `setVar`) survive the switch; page state does not. You don't need a `reload` after switching, but you do need to re-navigate from the app's entry point.
+- **Switching to the already-active user is a no-op** and skips the restart entirely. That makes it safe to pin identity at the top of every test without paying a restart on every run.
+
+The main use is multi-user flows, where one user acts and another observes:
+
+```json
+{ "action": "switchUser", "username": "bob" },
+{ "action": "click", "selector": ".bnav-play" },
+{ "action": "switchUser", "username": "carol" },
+{ "action": "waitFor", "selector": ".lb2-mission-tab", "timeout": 15000 }
+```
 
 ## 9. LLM in the loop (`llm-step`)
 
