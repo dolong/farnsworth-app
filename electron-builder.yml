@@ -21,9 +21,22 @@ directories:
 
 # Files to bundle inside the .app's Resources/app.asar
 files:
+  # index.html is the renderer entry point — main.js does
+  # loadFile(path.join(__dirname, 'index.html')). It was MISSING from this
+  # list through v0.1.0/v0.1.1/v0.1.2, so every packaged build opened a
+  # black window (menu bar worked because that's main-process code).
+  # An explicit `files` list REPLACES electron-builder's default "**/*",
+  # so anything not named here simply isn't in the app.
+  - index.html
   - main.js
   - preload.js
   - src/**/*
+  # devvit-emulator/loader.mjs is injected into the user's dev-server
+  # subprocess via NODE_OPTIONS --import. Also absent from packaged builds,
+  # so the emulator silently no-op'd (main.js guards on existsSync).
+  # Must ALSO be in asarUnpack below: the loader path is handed to a plain
+  # node child process, which cannot read inside app.asar.
+  - devvit-emulator/**/*
   - db.js
   - pair-device.js
   - relay-client.js
@@ -48,6 +61,9 @@ extraResources:
 # Native modules must be unpacked from asar (they can't be loaded from inside)
 asar: true
 asarUnpack:
+  # Read by a spawned plain-node process (NODE_OPTIONS --import), which has
+  # no asar support — must exist as real files on disk.
+  - "devvit-emulator/**/*"
   - "node_modules/better-sqlite3/**/*"
   - "node_modules/keytar/**/*"
   - "node_modules/node-pty/**/*"

@@ -722,7 +722,14 @@ ipcMain.handle('dev:farnsworth:boot', async (_event, appType = 'devvit', repoRoo
       const fs2 = require('fs');
       const path2 = require('path');
       const os2 = require('os');
-      const loaderPath = path2.join(__dirname, 'devvit-emulator', 'loader.mjs');
+      // In a packaged build __dirname is inside app.asar. Electron's fs shim
+      // can read that, but the loader path below is handed to the user's dev
+      // server — a plain node child process with NO asar support. Point it at
+      // the app.asar.unpacked copy (electron-builder unpacks devvit-emulator
+      // for exactly this reason). No-op in the dev tree, where there's no asar.
+      const loaderPath = path2
+        .join(__dirname, 'devvit-emulator', 'loader.mjs')
+        .replace(`${path2.sep}app.asar${path2.sep}`, `${path2.sep}app.asar.unpacked${path2.sep}`);
       if (fs2.existsSync(loaderPath)) {
         // Seed defaults for this workspace on first boot.
         db.devvitInitDefaultsForProject(repoRoot);
