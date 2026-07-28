@@ -148,6 +148,33 @@ function findNonoPath() {
   return null;
 }
 
+// Resolve a nono profile to an absolute PATH inside the app (Jul 28).
+//
+// Both nono spawn sites used to pass a bare profile NAME, which nono resolves
+// against ~/.config/nono/profiles/ — a directory that only ever existed on the
+// one machine where the profiles were hand-authored. Everywhere else the
+// Claude Code panel died at spawn with "nono: Profile not found:
+// farnsworth-claude", and chat-agent run_command silently fell back to
+// UNSANDBOXED exec. Same class as index.html / devvit-emulator missing from
+// the asar: it worked only on the machine that had the un-shipped file.
+//
+// nono's --profile takes <NAME_OR_PATH>, so hand it a path to the copy that
+// ships in nono-profiles/. The path must point at app.asar.unpacked in
+// packaged builds — nono is a separate process with no asar support, exactly
+// like the devvit-emulator loader. No-op in the dev tree.
+function resolveNonoProfile(name) {
+  const fs = require('fs');
+  const path = require('path');
+  const bundled = path
+    .join(__dirname, 'nono-profiles', `${name}.json`)
+    .replace(`${path.sep}app.asar${path.sep}`, `${path.sep}app.asar.unpacked${path.sep}`);
+  try { if (fs.existsSync(bundled)) return bundled; } catch {}
+  // Fall back to the bare name so a hand-authored profile in
+  // ~/.config/nono/profiles/ still resolves if the bundled copy is missing.
+  console.warn(`[nono] bundled profile missing at ${bundled} — falling back to name "${name}"`);
+  return name;
+}
+
 // Phase 2: terminal panel. node-pty for real PTYs, ws for renderer↔main bridge.
 let pty;
 try {
@@ -5516,7 +5543,7 @@ function startClaudeCodeServer() {
         // the cwd is honored. Same fix as the chat-agent runSandboxedCommand
         // cwd bug (Jul 14 ~21:50 ET, dab622a).
         spawnBin = nonoBin;
-        spawnArgs = ['wrap', '--profile', 'farnsworth-claude', '--allow-cwd', '--', claudeBin, ...args];
+        spawnArgs = ['wrap', '--profile', resolveNonoProfile('farnsworth-claude'), '--allow-cwd', '--', claudeBin, ...args];
       } else {
         // Direct spawn (no nono). Fallback if nono isn't installed.
         // Claude Code's own permission system (workspace trust,
@@ -6156,7 +6183,7 @@ async function runSandboxedCommand(nonoBin, profileName, command, folder) {
     let timedOut = false;
     const child = spawn(
       nonoBin,
-      ['wrap', '--profile', profileName, '--allow-cwd', '--', '/bin/sh', '-c', command],
+      ['wrap', '--profile', resolveNonoProfile(profileName), '--allow-cwd', '--', '/bin/sh', '-c', command],
       {
         cwd: folder,
         // Farnsworth launched from Finder / `open .app` inherits launchd's bare

@@ -1,0 +1,37 @@
+{
+  "$schema": "https://nono.sh/schemas/nono-profile.schema.json",
+  "extends": "default",
+  "meta": {
+    "name": "farnsworth-chat-run",
+    "version": "0.1.0",
+    "description": "Farnsworth chat-agent run_command isolation profile. v0.1.0 (Jul 13 ~17:35 ET): wraps child_process.exec in nono Seatbelt. NO commands.deny (we ARE running a shell). Includes claude_code_macos for language-runtime grants (node/python/rust) + git_config + unlink_protection. Workdir is readwrite so npm install/git commit/etc. work. filesystem.deny on ~/.aws + ~/.ssh + ~/.gnupg + ~/.config/gh + /etc/shadow + /etc/sudoers (Seatbelt kernel-enforced). network_profile: developer + allow_domain for Anthropic -- currently best-effort only (nono v0.66 strict allowlist only fires from CLI flag, not profile field; tracking for future nono versions). Verified Jul 13 ~17:35 ET: shell runs, ~/.aws reads blocked, outside-cwd writes blocked, cwd writes allowed.",
+    "author": "Farnsworth"
+  },
+  "groups": {
+    "include": ["claude_code_macos"]
+  },
+  "workdir": {
+    "access": "readwrite"
+  },
+  "filesystem": {
+    "deny": [
+      { "path": "$HOME/.aws" },
+      { "path": "$HOME/.ssh" },
+      { "path": "$HOME/.gnupg" },
+      { "path": "$HOME/.config/gh" },
+      { "path": "/etc/shadow" },
+      { "path": "/etc/sudoers" },
+      { "path": "/etc/sudoers.d" }
+    ]
+  },
+  "network": {
+    "network_profile": "developer",
+    "allow_domain": [
+      "api.anthropic.com",
+      "console.anthropic.com",
+      "claude.ai",
+      "statsig.anthropic.com",
+      "events.statsig.com"
+    ]
+  }
+}

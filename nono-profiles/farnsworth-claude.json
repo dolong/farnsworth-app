@@ -1,0 +1,56 @@
+{
+  "$schema": "https://nono.sh/schemas/nono-profile.schema.json",
+  "extends": "default",
+  "meta": {
+    "name": "farnsworth-claude",
+    "version": "0.7.1",
+    "description": "Farnsworth Claude Code panel isolation profile. v0.7.1 (Jul 14 ~22:18 ET): drop commands.deny (deprecated in nono v0.33.0, startup-only, no security value beyond seatbelt filesystem deny + network policy). v0.7.0 (Jul 7 ~22:58 ET): adds filesystem.allow + filesystem.allow_file + filesystem.bypass_protection for ~/.claude.json + ~/.claude/ + ~/Library/Keychains so Seatbelt doesn't break Claude Code's auth (Keychain reads) + workspace trust (~/.claude.json `projects[cwd].hasTrustDialogAccepted`) reads. Without these allows, claude under the wrap reports 'Not logged in · Please run /login' and ignores its own settings. v0.6.0 (Jul 6 ~08:10 ET): adds filesystem.access: 'readwrite' so the sandboxed claude child can read+write the cwd. v0.5.0 (Jul 5 ~22:35 ET): (1) commands.deny on bash/zsh/sh as startup-block [REMOVED in v0.7.1], (2) filesystem.deny for shell binaries + sensitive paths, (3) explicit network.allow_domain for Anthropic + OAuth + npm + GitHub + Homebrew.",
+    "author": "Farnsworth"
+  },
+  "groups": {
+    "include": ["claude_code_macos"]
+  },
+  "workdir": {
+    "access": "readwrite"
+  },
+  "filesystem": {
+    "allow": [
+      { "path": "$HOME/.claude" },
+      { "path": "$HOME/.local/state/claude/locks" },
+      { "path": "$HOME/.cache/claude" },
+      { "path": "$HOME/Library/Keychains" }
+    ],
+    "allow_file": [
+      { "path": "$HOME/.claude.json" },
+      { "path": "$HOME/.claude.json.lock" },
+      { "path": "$HOME/.claude.lock" }
+    ],
+    "bypass_protection": [
+      { "path": "$HOME/Library/Keychains" }
+    ],
+    "deny": [
+      { "path": "$HOME/.aws" },
+      { "path": "$HOME/.ssh" },
+      { "path": "$HOME/.gnupg" },
+      { "path": "$HOME/.config/gh" },
+      { "path": "/etc/shadow" },
+      { "path": "/etc/sudoers" },
+      { "path": "/etc/sudoers.d" }
+    ]
+  },
+  "network": {
+    "allow_domain": [
+      "api.anthropic.com",
+      "console.anthropic.com",
+      "claude.ai",
+      "statsig.anthropic.com",
+      "events.statsig.com",
+      "registry.npmjs.org",
+      "github.com",
+      "api.github.com",
+      "raw.githubusercontent.com",
+      "formulae.brew.sh",
+      "ghcr.io"
+    ]
+  }
+}

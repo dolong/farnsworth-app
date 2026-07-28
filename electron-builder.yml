@@ -37,6 +37,12 @@ files:
   # Must ALSO be in asarUnpack below: the loader path is handed to a plain
   # node child process, which cannot read inside app.asar.
   - devvit-emulator/**/*
+  # nono sandbox profiles for the Claude Code panel + chat-agent run_command.
+  # These used to live ONLY in ~/.config/nono/profiles/ on the authoring
+  # machine, so every other install hit "nono: Profile not found". Like the
+  # emulator loader, they're read by the nono process (no asar support) and
+  # must ALSO be in asarUnpack below.
+  - nono-profiles/**/*
   - db.js
   - pair-device.js
   - relay-client.js
@@ -64,6 +70,8 @@ asarUnpack:
   # Read by a spawned plain-node process (NODE_OPTIONS --import), which has
   # no asar support — must exist as real files on disk.
   - "devvit-emulator/**/*"
+  # Read by the nono binary, a separate process with no asar support.
+  - "nono-profiles/**/*"
   - "node_modules/better-sqlite3/**/*"
   - "node_modules/keytar/**/*"
   - "node_modules/node-pty/**/*"
