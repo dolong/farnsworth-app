@@ -739,6 +739,24 @@ ipcMain.handle('dev:farnsworth:boot', async (_event, appType = 'devvit', repoRoo
   const extraPaths = ['/opt/homebrew/bin', '/usr/local/bin'];
   env.PATH = [...extraPaths, env.PATH || ''].filter(Boolean).join(':');
 
+  // Tell the project's farnsworth:<type> script where OUR server-runner lives
+  // (Jul 28). The scripts historically hardcoded
+  // $HOME/Documents/Farnsworth/app/devvit-emulator/server-runner.mjs — a DEV
+  // TREE path that only exists on the machine Farnsworth was developed on.
+  // On a normal install the runner ships inside the .app, so the script
+  // printed "server-runner not found (skipping)" and the game booted with no
+  // backend: every /api/trpc call ECONNREFUSED, nothing persisted.
+  // Farnsworth knows its own layout, so it should say so rather than making
+  // every template repo guess. Path is asar.unpacked-aware because the runner
+  // is executed by a plain node child process.
+  {
+    const runnerPath = path
+      .join(__dirname, 'devvit-emulator', 'server-runner.mjs')
+      .replace(`${path.sep}app.asar${path.sep}`, `${path.sep}app.asar.unpacked${path.sep}`);
+    if (fs.existsSync(runnerPath)) env.FARNSWORTH_DEVVIT_RUNNER = runnerPath;
+    else console.warn(`[dev:farnsworth:boot] server-runner missing at ${runnerPath}`);
+  }
+
   // Devvit emulator: write the per-project config (current user, current
   // subreddit, seeded users/subreddits) to a temp file and inject the
   // emulator loader via NODE_OPTIONS so the user's scripts.dev subprocess
