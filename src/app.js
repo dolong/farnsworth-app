@@ -2132,6 +2132,20 @@ function renderCanvas() {
   // modes only — hide them in code view (the editor doesn't need them).
   const vmToggles = $('#vm-toggles');
   if (vmToggles) vmToggles.style.display = state.canvasMode === 'code' ? 'none' : '';
+  // Code mode: the 100% zoom control becomes the find toggle. Zoom scales the
+  // preview artboard via transform, and code mode has no artboard, so the
+  // control was inert there -- Long clicked it on 0.1.12 and nothing happened.
+  // (The bottom-right -/+ % widget is the same control a second time; CSS hides
+  // it in code mode for the same reason.)
+  const zoomDisp = $('#zoom-display');
+  const findBtn = $('#code-find-btn');
+  const inCodeMode = state.canvasMode === 'code';
+  if (zoomDisp) zoomDisp.style.display = inCodeMode ? 'none' : '';
+  if (findBtn) {
+    findBtn.style.display = inCodeMode ? 'flex' : 'none';
+    findBtn.classList.toggle('is-active', !!state.codeFindOpen);
+    findBtn.title = state.codeFindOpen ? 'Hide find bar (\u2318F)' : 'Find in file (\u2318F)';
+  }
   // Re-sync the mode-toggle active states and the Live pulse — renderCanvas()
   // runs after the dev server boots/stops, so this is when the pulse state
   // needs to flip.
@@ -4458,23 +4472,12 @@ function renderCodeView() {
       fbInput.setSelectionRange(state.codeFindTerm.length, state.codeFindTerm.length);
       recompute();
     }, 0);
-  } else {
-    // Compact bar — just a search icon button to open the find bar
-    const openBtn = el('button', { class: 'code-view__findbar-toggle', title: 'Find in file (Cmd+F)' });
-    openBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg>';
-    openBtn.addEventListener('click', () => {
-      // Seed with the current selection if there is one
-      const sel = monacoEditor && monacoEditor.getSelection();
-      if (sel && !sel.isEmpty()) {
-        const model = monacoEditor.getModel();
-        state.codeFindTerm = model.getValueInRange(sel);
-      }
-      state.codeFindOpen = true;
-      renderCanvas();
-    });
-    findbar.appendChild(openBtn);
   }
-  view.appendChild(findbar);
+  // Mount the find bar only when it is open. The magnifier that opens it now
+  // lives in the canvas header (in the 100% zoom slot), so the old
+  // permanently-present closed strip with its own magnifier is gone -- two
+  // magnifiers ~50px apart read as a duplicated control.
+  if (state.codeFindOpen) view.appendChild(findbar);
 
   // Layout (Jun 26 ~10:30 ET per Long's call — tabs + breadcrumbs moved
   // from top to bottom of the canvas pane so they don't crowd the file
@@ -8714,11 +8717,18 @@ function applyCanvasFileChrome({ name, relPath, ext }) {
 function syncExtBanner(viewEl) {
   const root = viewEl || document.querySelector('.code-view');
   if (!root) return;
+  // How far to push the floating overlay bar down. Set on every path through
+  // this function, including the early returns -- a stale non-zero value would
+  // leave the toggles hovering in empty space after the banner is dismissed.
+  const setBannerOffset = (px) => {
+    const vp = document.getElementById('canvas-viewport');
+    if (vp) vp.style.setProperty('--fw-extbanner-h', (px || 0) + 'px');
+  };
   root.querySelectorAll('.code-view__extbanner').forEach(n => n.remove());
   const file = openFiles[activeFileIdx] || null;
-  if (!file) return;
+  if (!file) { setBannerOffset(0); return; }
   const relPath = relPathOf(file.path);
-  if (!externalChanges.has(relPath)) return;
+  if (!externalChanges.has(relPath)) { setBannerOffset(0); return; }
 
   const banner = el('div', { class: 'code-view__extbanner' });
   banner.innerHTML = `
@@ -8735,16 +8745,28 @@ function syncExtBanner(viewEl) {
       <button class="code-view__extbanner-btn code-view__extbanner-btn--discard" data-act="discard">Keep my changes</button>
     </div>
   `;
-  // Order inside .code-view is findbar -> banner -> body, so anchor on the body.
-  const body = root.querySelector('.code-view__body');
-  if (body) root.insertBefore(banner, body);
-  else root.appendChild(banner);
+  // Long asked for this at the TOP of the dark grey, with the Live Preview /
+  // Storybook / Code toggles pushed down when it appears -- so it goes above
+  // the findbar as the code view's first row, not tucked below it.
+  const findbar = root.querySelector('.code-view__findbar');
+  if (findbar) root.insertBefore(banner, findbar);
+  else root.insertBefore(banner, root.firstChild);
 
   // Wire on THIS element. The previous version used document.getElementById in a
   // setTimeout, which binds to whatever banner happens to be in the document.
   banner.querySelector('[data-act="diff"]').onclick = () => showExternalDiff(relPath);
   banner.querySelector('[data-act="reload"]').onclick = () => reloadFileFromDisk(relPath);
   banner.querySelector('[data-act="discard"]').onclick = () => discardExternalChange(relPath);
+
+  // Measure AFTER the code view is attached to the stage. renderCodeView() builds
+  // the whole view detached and appends it to #canvas-stage afterwards, so
+  // offsetHeight is 0 on that path -- which silently left the offset at 0 and the
+  // toggles sitting on top of the banner. rAF runs after the append, so this
+  // measures the real height on both paths (detached render, and the in-place
+  // refresh from focusActiveFile where the banner IS already connected).
+  const publishHeight = () => { if (banner.isConnected) setBannerOffset(banner.offsetHeight); };
+  publishHeight();
+  requestAnimationFrame(publishHeight);
 }
 
 async function flagExternalChange(relPath, openIdx) {
@@ -10089,6 +10111,24 @@ function wire() {
   // Titlebar "Search files ⌘K" chip. It looked like a control and named its
   // own shortcut, but had zero handlers -- clicking it did nothing. Opens the
   // command palette, i.e. exactly what the ⌘K it advertises already does.
+  // Code-mode magnifier in the canvas header -> toggles the find bar directly
+  // beneath it. Seeds from the selection on open, same as Cmd+F does.
+  const codeFindBtn = document.getElementById('code-find-btn');
+  if (codeFindBtn) {
+    codeFindBtn.addEventListener('click', () => {
+      if (!state.codeFindOpen) {
+        const sel = monacoEditor && monacoEditor.getSelection();
+        if (sel && !sel.isEmpty()) {
+          try { state.codeFindTerm = monacoEditor.getModel().getValueInRange(sel); } catch {}
+        }
+        state.codeFindOpen = true;
+      } else {
+        state.codeFindOpen = false;
+      }
+      renderCanvas();
+    });
+  }
+
   const tbSearch = document.getElementById('titlebar-search');
   if (tbSearch) {
     tbSearch.addEventListener('click', () => openCommandPalette());

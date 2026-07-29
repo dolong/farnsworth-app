@@ -253,7 +253,17 @@
                 Tweaks
               </button>
             </div>
+            <!-- Code mode swaps this 100% control out for #code-find-btn below.
+                 Zoom scales the preview artboard; in code mode there is no
+                 artboard, so clicking it did nothing (Long hit that in 0.1.12).
+                 The same control also exists a second time as the -/+ % widget
+                 at the bottom right of the preview. -->
             <button class="zoom-display" id="zoom-display">100% <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#80848e" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg></button>
+            <!-- Code mode only: takes the 100% slot and toggles the find bar
+                 directly underneath it. -->
+            <button class="code-find-btn" id="code-find-btn" title="Find in file (⌘F)" style="display:none">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg>
+            </button>
           </div>
         </header>
 

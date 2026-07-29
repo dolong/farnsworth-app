@@ -1518,6 +1518,30 @@ pre:hover .code-copy { opacity: 1; }
 }
 .zoom-display:hover { border-color: var(--border-strong); }
 
+/* Code-mode find toggle. Occupies the slot the 100% zoom control uses in
+   preview modes, because zoom is meaningless in the editor: it scales the
+   preview artboard and there is no artboard in code mode. */
+.code-find-btn {
+  display: none;   /* renderCanvas() shows it in code mode */
+  align-items: center; justify-content: center;
+  width: 32px; height: 30px;
+  background: #1a1b1e; border: 1px solid #1f2023;
+  border-radius: var(--r-lg);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background .13s ease, border-color .13s ease, color .13s ease;
+}
+.code-find-btn:hover { border-color: var(--border-strong); color: #fff; }
+.code-find-btn.is-active {
+  background: color-mix(in srgb, var(--accent-blurple) 22%, transparent);
+  border-color: var(--accent-blurple);
+  color: #fff;
+}
+
+/* The bottom-right -/+ % widget is a SECOND copy of the zoom control and is
+   just as inert in code mode, where it floated over the editor. */
+.canvas__viewport--code .canvas__zoom-widget { display: none; }
+
 .canvas__viewport {
   flex: 1; position: relative; overflow: hidden;
   background-color: #161719;
@@ -1575,21 +1599,17 @@ pre:hover .code-copy { opacity: 1; }
 /* last resort -- allow a second row so nothing is EVER unreachable, however
    narrow the canvas gets. */
 .canvas__overlay-bar.is-wrap { flex-wrap: wrap; }
+/* Code mode: the toggles float at the top-right, clearing the findbar row
+   (the 48px is load-bearing -- it has bitten twice before, Jun 26 and Jul 8:
+   anything above it covers the code-view findbar's magnifier).
+   --fw-extbanner-h pushes the toggles DOWN by the height of the
+   "File modified on disk" banner whenever that banner is showing, so the
+   banner can own the top of the code view and the toggles never cover it.
+   Published by syncExtBanner(); 0px when there is no banner, which restores
+   the plain top:48px behaviour exactly. */
 .canvas__viewport--code .canvas__overlay-bar {
-  top: 10px; left: auto; bottom: auto; right: 16px;
-}
-/* Reserve a band at the top of the code view for the floating overlay bar
-   (Jul 29). The bar is position:absolute, so it does not participate in
-   layout -- any full-width row in the code view would render UNDERNEATH it
-   and become unclickable. Long hit exactly that: the "File modified on disk"
-   banner's Show diff / Reload / Keep-my-changes buttons were covered by the
-   Live Preview / Storybook / Code toggles, so the only affordance for
-   resolving an external change was unreachable.
-   The height comes from fitOverlayBar(), which measures the bar after its
-   collapse tiers settle -- so this stays correct when the bar wraps to two
-   rows on a narrow canvas, which a hardcoded value would not. */
-.canvas__viewport--code .code-view {
-  padding-top: calc(var(--fw-overlay-bar-h, 34px) + 20px);
+  top: calc(var(--fw-extbanner-h, 0px) + 48px);
+  left: auto; bottom: auto; right: 16px;
 }
 /* In code mode the Mark up / Comments / Edit / Tweaks toolbar chips
    are for marking / story / preview only — hide them. */
@@ -2647,14 +2667,11 @@ pre:hover .code-copy { opacity: 1; }
   border-radius: 4px; color: #9aa0a8; cursor: pointer;
 }
 .code-view__findbar-btn:hover { background: #25272b; color: #fff; }
-.code-view__findbar-toggle {
-  display: flex; align-items: center; justify-content: center;
-  width: 22px; height: 22px;
-  background: transparent; border: none;
-  border-radius: 4px; color: #6d7178; cursor: pointer;
-  margin-left: auto;
-}
-.code-view__findbar-toggle:hover { background: #25272b; color: #fff; }
+/* (The old .code-view__findbar-toggle rules lived here. That button was the
+   magnifier at the right of a permanently-present closed findbar strip. The
+   magnifier now lives in the canvas header where the 100% zoom control sits in
+   preview modes, and the findbar is only mounted when open -- two magnifiers
+   ~50px apart read as a duplicate control.) */
 .code-view__tabs {
   flex: 0 0 38px;
   display: flex; align-items: stretch;
