@@ -1102,6 +1102,52 @@ function toolchainReadDirs() {
   return out;
 }
 
+// Git reads its user-level config from $HOME, which the Seatbelt profile denies
+// (the profile opens the workspace + toolchain roots, nothing else in $HOME).
+// A denied config read is NOT a soft miss: git treats EPERM on a config path as
+// fatal and exits 128 with
+//   fatal: unable to access '/Users/<u>/.gitconfig': Operation not permitted
+// so EVERY git subcommand dies -- status, commit, diff, all of it. The failure
+// is invisible on a machine with no ~/.gitconfig (the Mac mini has none, which
+// is why this never reproduced here) and total on one that has it (Long's
+// MacBook Pro, Jul 29). Worse, the chat agent sees a bare non-zero exit and
+// invents an explanation -- it told Long no workspace folder was open.
+//
+// Grant READ-ONLY on the config files only. Deliberately NOT granted:
+//   ~/.git-credentials  -- plaintext tokens
+//   ~/.ssh              -- profile denies it, keep it denied
+// and deliberately read-only rather than --allow-file, because `credential.helper`
+// in a writable .gitconfig is an arbitrary-command-execution vector for a
+// prompt-injected agent. `git config --global` therefore still fails, which is
+// the correct trade: the agent has no business rewriting global git config.
+function gitConfigReadFiles() {
+  const fs = require('fs');
+  const home = os.homedir();
+  const xdg = process.env.XDG_CONFIG_HOME || path.join(home, '.config');
+  const out = [];
+  for (const f of [
+    path.join(home, '.gitconfig'),
+    path.join(home, '.gitignore_global'),
+    path.join(xdg, 'git', 'config'),
+    path.join(xdg, 'git', 'ignore'),
+    path.join(xdg, 'git', 'attributes'),
+  ]) {
+    try { if (fs.statSync(f).isFile()) out.push(f); } catch {}
+  }
+  return out;
+}
+
+// The full argv fragment of Seatbelt grants every nono wrap site needs:
+// toolchain dirs so node/npm resolve at all (v0.1.9), plus the git config files
+// so git doesn't exit 128. nono flags: --read is directories only, --read-file
+// is the single-file form (passing a file to --read is a hard config error).
+function sandboxGrantArgs() {
+  const args = [];
+  for (const d of toolchainReadDirs()) args.push('--read', d);
+  for (const f of gitConfigReadFiles()) args.push('--read-file', f);
+  return args;
+}
+
 let _npmBinCache;
 function resolveNpmBin() {
   if (_npmBinCache !== undefined) return _npmBinCache;
@@ -6302,7 +6348,12 @@ function startClaudeCodeServer() {
         // the cwd is honored. Same fix as the chat-agent runSandboxedCommand
         // cwd bug (Jul 14 ~21:50 ET, dab622a).
         spawnBin = nonoBin;
-        spawnArgs = ['wrap', '--profile', resolveNonoProfile('farnsworth-claude'), '--allow-cwd', '--', claudeBin, ...args];
+        // Same Seatbelt grants the chat-agent path gets. This site never got the
+        // v0.1.9 toolchain fix, so Claude Code on a machine with a version-manager
+        // node saw no toolchain at all, and git inside the panel exited 128 on any
+        // machine with a ~/.gitconfig. See sandboxGrantArgs().
+        spawnArgs = ['wrap', '--profile', resolveNonoProfile('farnsworth-claude'), '--allow-cwd',
+          ...sandboxGrantArgs(), '--', claudeBin, ...args];
       } else {
         // Direct spawn (no nono). Fallback if nono isn't installed.
         // Claude Code's own permission system (workspace trust,
@@ -6926,12 +6977,21 @@ async function runSandboxedCommand(nonoBin, profileName, command, folder) {
     // toolchain is invisible to the sandboxed shell. composeChildPath() adds
     // the user's login-shell PATH (version managers included) and the --read
     // grants make those dirs readable through Seatbelt. BOTH halves are
-    // required: see toolchainReadDirs().
-    const readGrants = [];
-    for (const d of toolchainReadDirs()) readGrants.push('--read', d);
+    // required: see toolchainReadDirs(). sandboxGrantArgs() adds the git config
+    // --read-file grants on top (see gitConfigReadFiles) -- without them every
+    // git command exits 128 on any machine that has a ~/.gitconfig.
+    const readGrants = sandboxGrantArgs();
     const child = spawn(
       nonoBin,
-      ['wrap', '--profile', resolveNonoProfile(profileName), '--allow-cwd',
+      // --silent suppresses nono's capabilities banner, which it prints to
+      // STDERR on every single call (~15 lines). That banner is machine-consumed
+      // here: run_command feeds stderr straight to the model, so the banner both
+      // burned tokens on every command AND buried the real error underneath it --
+      // in Long's Jul 29 report the agent said "the git command failed (no stderr
+      // details)" while git had in fact printed a precise fatal. Verified that
+      // --silent still surfaces BOTH the command's own stderr and nono's own
+      // config/profile errors, so nothing diagnostic is lost.
+      ['wrap', '--silent', '--profile', resolveNonoProfile(profileName), '--allow-cwd',
        ...readGrants, '--', '/bin/sh', '-c', command],
       {
         cwd: folder,
