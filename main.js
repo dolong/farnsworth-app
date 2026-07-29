@@ -147,6 +147,9 @@ function findClaudePath() {
     // Login-shell PATH (nvm/fnm/volta/asdf/mise) -- `which` above runs with
     // Electron's launchd PATH, which never sees a version manager's shims.
     ...getUserShellPathDirs().map((d) => path.join(d, 'claude')),
+    // npm -g installs land in the version manager's bin dir, which the
+    // shell probe can miss (it skips .zshrc). Independent discovery.
+    ...discoverToolchainDirs().map((d) => path.join(d, 'claude')),
     '/opt/homebrew/bin/claude',
     '/usr/local/bin/claude',
     '/usr/bin/claude',
@@ -180,6 +183,9 @@ function findCodexPath() {
     // Login-shell PATH (nvm/fnm/volta/asdf/mise) -- `which` above runs with
     // Electron's launchd PATH, which never sees a version manager's shims.
     ...getUserShellPathDirs().map((d) => path.join(d, 'codex')),
+    // npm -g installs land in the version manager's bin dir, which the
+    // shell probe can miss (it skips .zshrc). Independent discovery.
+    ...discoverToolchainDirs().map((d) => path.join(d, 'codex')),
     '/opt/homebrew/bin/codex',
     '/usr/local/bin/codex',
     '/usr/bin/codex',
@@ -208,6 +214,9 @@ function findNonoPath() {
     // Login-shell PATH (nvm/fnm/volta/asdf/mise) -- `which` above runs with
     // Electron's launchd PATH, which never sees a version manager's shims.
     ...getUserShellPathDirs().map((d) => path.join(d, 'nono')),
+    // npm -g installs land in the version manager's bin dir, which the
+    // shell probe can miss (it skips .zshrc). Independent discovery.
+    ...discoverToolchainDirs().map((d) => path.join(d, 'nono')),
     '/opt/homebrew/bin/nono',
     '/usr/local/bin/nono',
     path.join(process.env.HOME || '', '.local', 'bin', 'nono'),
@@ -788,22 +797,99 @@ function getUserShellPathDirs() {
   try {
     const { execFileSync } = require('child_process');
     const shell = process.env.SHELL || '/bin/zsh';
-    // -l so profile/rc files run (that's what defines nvm etc). Markers let us
-    // ignore any banner noise an rc file prints. stderr dropped for the same
-    // reason. Timeboxed: a slow rc file must not stall Go Live.
-    const out = execFileSync(shell, ['-lc', 'printf "__FWP__%s__FWP__" "$PATH"'], {
-      encoding: 'utf8',
-      timeout: 8000,
-      stdio: ['ignore', 'pipe', 'ignore'],
-    });
-    const parts = out.split('__FWP__');
-    if (parts.length >= 2) {
-      _userShellPathDirs = parts[1].split(':').filter(Boolean);
+    // Ask BOTH shell flavors and union the answers. This is load-bearing:
+    // `zsh -lc` sources .zprofile but NOT .zshrc, and nvm/fnm/asdf init
+    // snippets conventionally live in .zshrc (it's what the installers append).
+    // So a plain -l probe on a Mac whose .zprofile runs `brew shellenv`
+    // returned exactly '/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:...'
+    // -- a PATH with no version manager in it. It looked like a success and
+    // silently produced the same broken result as no probe at all (Jul 29,
+    // reported from a real machine after v0.1.9 shipped). -i sources the rc
+    // file; the union keeps whichever flavor actually knows about the
+    // toolchain. Markers let us ignore banner noise an rc file prints (p10k,
+    // nvm, conda all do). stderr dropped for the same reason -- an interactive
+    // shell without a TTY warns about job control. Timeboxed per flavor: a slow
+    // rc file must not stall Go Live.
+    const seen = new Set();
+    for (const flags of ['-ilc', '-lc']) {
+      try {
+        const out = execFileSync(shell, [flags, 'printf "__FWP__%s__FWP__" "$PATH"'], {
+          encoding: 'utf8',
+          timeout: 8000,
+          stdio: ['ignore', 'pipe', 'ignore'],
+        });
+        const parts = out.split('__FWP__');
+        if (parts.length < 2) continue;
+        for (const d of parts[1].split(':')) {
+          if (d && !seen.has(d)) { seen.add(d); _userShellPathDirs.push(d); }
+        }
+      } catch {
+        // This flavor refused (some rc files exit non-interactively, or -i
+        // without a TTY is rejected). Try the other one.
+      }
     }
   } catch {
     // Non-fatal: fall through to the static candidates below.
   }
   return _userShellPathDirs;
+}
+
+// The shell probe must NOT be the only way we find a toolchain. It failed
+// exactly that way once already (see getUserShellPathDirs above), and because
+// BOTH the child PATH and the sandbox read grants were derived from it, one
+// silent miss broke both halves at once. Discover version-manager installs
+// directly on disk so the two mechanisms are independent.
+//
+// Newest version first, so a machine with several installed node versions gets
+// the one the user most likely means. Capped: this feeds argv.
+let _discoveredToolchainDirs = null;
+function discoverToolchainDirs() {
+  if (_discoveredToolchainDirs) return _discoveredToolchainDirs;
+  const fs = require('fs');
+  const home = os.homedir();
+  const out = [];
+  const seen = new Set();
+  const add = (d) => {
+    if (!d || seen.has(d)) return;
+    seen.add(d);
+    try { if (fs.statSync(d).isDirectory()) out.push(d); } catch {}
+  };
+
+  // Managers that keep one bin dir per installed version.
+  const versioned = [
+    path.join(home, '.nvm', 'versions', 'node'),
+    path.join(home, 'Library', 'Application Support', 'fnm', 'node-versions'),
+    path.join(home, '.local', 'share', 'fnm', 'node-versions'),
+    path.join(home, '.local', 'share', 'mise', 'installs', 'node'),
+    path.join(home, '.asdf', 'installs', 'nodejs'),
+    path.join(home, '.volta', 'tools', 'image', 'node'),
+    path.join(home, 'n', 'n', 'versions', 'node'),
+  ];
+  for (const base of versioned) {
+    let versions;
+    try { versions = fs.readdirSync(base); } catch { continue; }
+    // Numeric-aware sort so v22 beats v9, newest first.
+    versions.sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
+    for (const v of versions.slice(0, 4)) {
+      add(path.join(base, v, 'bin'));
+      add(path.join(base, v, 'installation', 'bin')); // fnm layout
+    }
+  }
+  // Managers with a single stable shim dir.
+  for (const d of [
+    path.join(home, '.volta', 'bin'),
+    path.join(home, '.asdf', 'shims'),
+    path.join(home, '.bun', 'bin'),
+    path.join(home, '.local', 'share', 'mise', 'shims'),
+    path.join(home, '.local', 'bin'),
+    path.join(home, '.yarn', 'bin'),
+    path.join(home, 'Library', 'pnpm'),
+    path.join(home, 'n', 'bin'),
+    '/usr/local/n/versions/node',
+  ]) add(d);
+
+  _discoveredToolchainDirs = out.slice(0, 24);
+  return _discoveredToolchainDirs;
 }
 
 // ---- toolchain PATH + sandbox grants (Jul 29) ---------------------------
@@ -815,11 +901,41 @@ function getUserShellPathDirs() {
 // under homebrew or nvm" while node v22 was installed and working in Terminal.
 // composeChildPath() puts the user's real login-shell PATH first, then the
 // static fallbacks.
+// One line, once per session, naming what we actually resolved. Every toolchain
+// bug this month was invisible until someone reported a symptom: the v0.1.9 fix
+// silently no-op'd because the shell probe returned a PATH with no version
+// manager in it and nothing said so. Cheap to print, expensive to be without.
+let _toolchainLogged = false;
+function logToolchainOnce() {
+  if (_toolchainLogged) return;
+  _toolchainLogged = true;
+  try {
+    const fs = require('fs');
+    const shellDirs = getUserShellPathDirs();
+    const discovered = discoverToolchainDirs();
+    const findIn = (dirs, bin) => dirs.find((d) => {
+      try { fs.accessSync(path.join(d, bin), fs.constants.X_OK); return true; } catch { return false; }
+    });
+    const nodeFrom = findIn(shellDirs, 'node') ? 'login-shell'
+      : findIn(discovered, 'node') ? 'discovered:' + findIn(discovered, 'node')
+      : 'NOT FOUND';
+    console.log('[toolchain] login-shell dirs=' + shellDirs.length +
+      ' discovered=' + discovered.length +
+      ' node=' + nodeFrom +
+      ' sandboxReadGrants=[' + toolchainReadDirs().join(', ') + ']');
+  } catch (err) {
+    console.warn('[toolchain] resolution log failed:', err && err.message);
+  }
+}
+
 function composeChildPath(extra = [], base = process.env.PATH) {
+  logToolchainOnce();
   const seen = new Set();
   return [
     ...extra,
     ...getUserShellPathDirs(),
+    // Independent of the shell probe on purpose -- see discoverToolchainDirs().
+    ...discoverToolchainDirs(),
     '/opt/homebrew/bin',
     '/opt/homebrew/sbin',
     '/usr/local/bin',
@@ -844,7 +960,14 @@ function toolchainGrantRoot(dir) {
   if (!dir || !dir.startsWith(home + path.sep)) return null; // system dirs need no grant
   const rel = dir.slice(home.length + 1).split(path.sep).filter(Boolean);
   if (!rel.length) return null;
-  if (rel[0] === 'Library') return rel.length >= 3 ? path.join(home, rel[0], rel[1], rel[2]) : null;
+  // ~/Library needs care: grant the specific named subtree, never ~/Library
+  // itself. 'Application Support/<tool>' needs 3 levels; '~/Library/pnpm'
+  // is only 2 and would otherwise get PATH but no read grant (denied at exec).
+  if (rel[0] === 'Library') {
+    if (rel.length >= 3) return path.join(home, rel[0], rel[1], rel[2]);
+    if (rel.length === 2) return path.join(home, rel[0], rel[1]);
+    return null;
+  }
   if (rel[0] === '.local') return rel.length >= 2 ? path.join(home, rel[0], rel[1]) : null;
   return path.join(home, rel[0]);
 }
@@ -853,7 +976,7 @@ function toolchainReadDirs() {
   const fs = require('fs');
   const out = [];
   const seen = new Set();
-  for (const dir of getUserShellPathDirs()) {
+  for (const dir of [...getUserShellPathDirs(), ...discoverToolchainDirs()]) {
     const root = toolchainGrantRoot(dir);
     if (!root || seen.has(root)) continue;
     seen.add(root);
@@ -880,6 +1003,8 @@ function resolveNpmBin() {
   if (process.env.FARNSWORTH_NPM) candidates.push(process.env.FARNSWORTH_NPM);
   // 2. Whatever the user's login shell actually resolves (nvm/fnm/volta/asdf).
   for (const d of getUserShellPathDirs()) candidates.push(path.join(d, 'npm'));
+  // Independent of the shell probe -- see discoverToolchainDirs().
+  for (const d of discoverToolchainDirs()) candidates.push(path.join(d, 'npm'));
   // 3. Static fallbacks for the common installs.
   for (const d of ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin']) {
     candidates.push(path.join(d, 'npm'));
@@ -956,17 +1081,11 @@ ipcMain.handle('dev:farnsworth:boot', async (_event, appType = 'devvit', repoRoo
   // location that happened to be true on the dev machine.
   const npmBin = resolveNpmBin();
   const env = { ...process.env };
-  const extraPaths = [
-    ...(npmBin ? [path.dirname(npmBin)] : []),
-    ...getUserShellPathDirs(),
-    '/opt/homebrew/bin',
-    '/usr/local/bin',
-  ];
-  // De-dupe, preserving order, so the child's PATH stays sane.
-  const seen = new Set();
-  env.PATH = [...extraPaths, ...(env.PATH || '').split(':')]
-    .filter((d) => d && !seen.has(d) && (seen.add(d), true))
-    .join(':');
+  // composeChildPath() is the single source of truth for child PATHs: login
+  // shell (both flavors) + discovered version managers + static fallbacks.
+  // This site used to assemble the list by hand and so missed the discovery
+  // pass entirely.
+  env.PATH = composeChildPath(npmBin ? [path.dirname(npmBin)] : [], env.PATH);
 
   if (!npmBin) {
     return {
@@ -1943,6 +2062,7 @@ function resolvePythonBin() {
   //    conda, uv, asdf and friends. Preferred over /usr/bin/python3, which on
   //    macOS is a Command Line Tools stub with no third-party packages.
   for (const d of getUserShellPathDirs()) for (const n of names) candidates.push(path.join(d, n));
+  for (const d of discoverToolchainDirs()) for (const n of names) candidates.push(path.join(d, n));
   // 3. Static fallbacks for the common installs.
   for (const d of ['/opt/homebrew/bin', '/usr/local/bin']) {
     for (const n of names) candidates.push(path.join(d, n));
@@ -2024,16 +2144,7 @@ async function spawnTestRunner(testPath, runnerEnv) {
   // Absolute interpreter path is not enough on its own: the runner shells out
   // to other tools, so the child needs a PATH that reflects this machine.
   const env = { ...runnerEnv };
-  const extraPaths = [
-    path.dirname(pythonBin),
-    ...getUserShellPathDirs(),
-    '/opt/homebrew/bin',
-    '/usr/local/bin',
-  ];
-  const seen = new Set();
-  env.PATH = [...extraPaths, ...(env.PATH || '').split(':')]
-    .filter((d) => d && !seen.has(d) && (seen.add(d), true))
-    .join(':');
+  env.PATH = composeChildPath([path.dirname(pythonBin)], env.PATH);
 
   const deps = checkTestRunnerDeps(pythonBin, env);
   if (!deps.ok) return { error: 'python_dep_missing', message: deps.message };
