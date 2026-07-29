@@ -1755,7 +1755,168 @@ ipcMain.handle('canvas:debugView', (_event, { viewId }) => {
 // These back the in-canvas test editor in Test View (Jul 11 ~16:42 ET)
 // plus the optional NLP "Generate from description" button.
 // ============================================================
-const TEST_RUNNER_PATH = path.join(app.getAppPath(), 'farnsworth-test.py');
+// ---- test runner discovery (python3 + farnsworth-test.py) --------------
+// Test View and the chat agent's test_run tool both shell out to
+// farnsworth-test.py, an external Python process that drives the canvas
+// preview over CDP. Three assumptions in here were only ever true on the
+// machine that wrote them, so on an installed build EVERY test failed with
+// "Exit ?" and two empty output blocks (found Jul 29 on v0.1.5):
+//
+//   1. cwd was app.getAppPath(). In a packaged build that resolves to
+//      .../Contents/Resources/app.asar -- a FILE, not a directory. spawn()
+//      rejects it before the child process exists, so there is no exit code
+//      and nothing on stderr to show. That is the "Exit ?" signature.
+//   2. The script was resolved inside app.asar. A plain python process has
+//      no asar support and cannot read it there, so it now ships via
+//      extraResources to Contents/Resources/test-runner/.
+//   3. spawn('python3') trusted PATH. A GUI-launched Electron app inherits
+//      only /usr/bin:/bin:/usr/sbin:/sbin from LaunchServices -- no
+//      Homebrew, no pyenv, no conda. Identical to the npm ENOENT bug.
+//
+// Same family as the nono-profile, server-runner and npm path bugs: resolve
+// against the real install, and say so out loud when the resolve fails.
+
+function resolveTestRunnerPath() {
+  const candidates = [];
+  if (process.env.FARNSWORTH_TEST_RUNNER) candidates.push(process.env.FARNSWORTH_TEST_RUNNER);
+  if (app.isPackaged) {
+    // extraResources target (electron-builder.yml) -- a real file on disk.
+    candidates.push(path.join(process.resourcesPath, 'test-runner', 'farnsworth-test.py'));
+    candidates.push(path.join(process.resourcesPath, 'farnsworth-test.py'));
+    // asarUnpack shape, in case packaging moves to that mechanism later.
+    candidates.push(path.join(app.getAppPath() + '.unpacked', 'farnsworth-test.py'));
+  }
+  candidates.push(path.join(__dirname, 'farnsworth-test.py'));
+  for (const c of candidates) {
+    try { if (fs.statSync(c).isFile()) return c; } catch {}
+  }
+  return null;
+}
+
+let _pythonBinCache;
+function resolvePythonBin() {
+  if (_pythonBinCache !== undefined) return _pythonBinCache;
+  const os = require('os');
+  const isExec = (f) => {
+    try { fs.accessSync(f, fs.constants.X_OK); return fs.statSync(f).isFile(); }
+    catch { return false; }
+  };
+  const names = ['python3', 'python3.14', 'python3.13', 'python3.12', 'python3.11', 'python3.10'];
+  const candidates = [];
+  // 1. Explicit escape hatch for exotic setups.
+  if (process.env.FARNSWORTH_PYTHON) candidates.push(process.env.FARNSWORTH_PYTHON);
+  // 2. The user's own login shell -- the one place that knows about pyenv,
+  //    conda, uv, asdf and friends. Preferred over /usr/bin/python3, which on
+  //    macOS is a Command Line Tools stub with no third-party packages.
+  for (const d of getUserShellPathDirs()) for (const n of names) candidates.push(path.join(d, n));
+  // 3. Static fallbacks for the common installs.
+  for (const d of ['/opt/homebrew/bin', '/usr/local/bin']) {
+    for (const n of names) candidates.push(path.join(d, n));
+  }
+  // 4. Version managers, newest first, in case the shell probe failed.
+  const home = os.homedir();
+  candidates.push(path.join(home, '.pyenv', 'shims', 'python3'));
+  try {
+    const base = path.join(home, '.pyenv', 'versions');
+    for (const v of fs.readdirSync(base).sort().reverse()) {
+      candidates.push(path.join(base, v, 'bin', 'python3'));
+    }
+  } catch {}
+  for (const d of ['miniconda3', 'anaconda3', '.local']) {
+    candidates.push(path.join(home, d, 'bin', 'python3'));
+  }
+  // 5. System python last: it exists on every Mac but is the least likely to
+  //    have websocket-client installed.
+  candidates.push('/usr/bin/python3');
+  for (const c of candidates) {
+    if (isExec(c)) { _pythonBinCache = c; return _pythonBinCache; }
+  }
+  _pythonBinCache = null;
+  return _pythonBinCache;
+}
+
+// Cached on SUCCESS only: if the dep gets installed mid-session, the next run
+// should pick it up instead of repeating a stale complaint.
+let _pyDepsOk = false;
+function checkTestRunnerDeps(pythonBin, env) {
+  if (_pyDepsOk) return { ok: true };
+  try {
+    const { execFileSync } = require('child_process');
+    execFileSync(pythonBin, ['-c', 'import websocket'], {
+      timeout: 15000, stdio: 'ignore', env,
+    });
+    _pyDepsOk = true;
+    return { ok: true };
+  } catch (e) {
+    return {
+      ok: false,
+      message:
+        'The test runner needs the Python package "websocket-client", which ' +
+        'is not installed for the interpreter Farnsworth found:\n  ' + pythonBin +
+        '\n\nInstall it with:\n  "' + pythonBin + '" -m pip install --user websocket-client' +
+        '\n\nTo point Farnsworth at a different interpreter instead, set ' +
+        'FARNSWORTH_PYTHON to its full path.',
+    };
+  }
+}
+
+// Returns { proc } on success, or { error, message } when the runner could not
+// be started. Callers must surface the message field -- swallowing it is what made this
+// bug class invisible for so long.
+function spawnTestRunner(testPath, runnerEnv) {
+  const { spawn } = require('child_process');
+
+  const runner = resolveTestRunnerPath();
+  if (!runner) {
+    return {
+      error: 'runner_not_found',
+      message:
+        'Could not find farnsworth-test.py. Expected it next to the app, or ' +
+        'at Contents/Resources/test-runner/farnsworth-test.py in an installed ' +
+        'build. Set FARNSWORTH_TEST_RUNNER to override.',
+    };
+  }
+  const pythonBin = resolvePythonBin();
+  if (!pythonBin) {
+    return {
+      error: 'python_not_found',
+      message:
+        'Could not find a python3 interpreter. Farnsworth checked your login ' +
+        'shell PATH, Homebrew, pyenv, conda and /usr/bin. Install Python 3 ' +
+        '(brew install python) or set FARNSWORTH_PYTHON to its full path.',
+    };
+  }
+
+  // Absolute interpreter path is not enough on its own: the runner shells out
+  // to other tools, so the child needs a PATH that reflects this machine.
+  const env = { ...runnerEnv };
+  const extraPaths = [
+    path.dirname(pythonBin),
+    ...getUserShellPathDirs(),
+    '/opt/homebrew/bin',
+    '/usr/local/bin',
+  ];
+  const seen = new Set();
+  env.PATH = [...extraPaths, ...(env.PATH || '').split(':')]
+    .filter((d) => d && !seen.has(d) && (seen.add(d), true))
+    .join(':');
+
+  const deps = checkTestRunnerDeps(pythonBin, env);
+  if (!deps.ok) return { error: 'python_dep_missing', message: deps.message };
+
+  // cwd must be a real DIRECTORY. This is the line that broke every packaged
+  // build: app.getAppPath() is app.asar, a file.
+  const cwd = path.dirname(runner);
+  try {
+    const proc = spawn(pythonBin, [runner, testPath], { cwd, env });
+    return { proc, runner, pythonBin, cwd };
+  } catch (e) {
+    return {
+      error: e.code || 'spawn_failed',
+      message: 'Could not start ' + pythonBin + ': ' + e.message,
+    };
+  }
+}
 
 // Settings → AI → Testing model: display name → API id for the runner env
 // (FARNSWORTH_TEST_MODEL). Mirrors src/app.js modelToApiId — keep in sync.
@@ -1868,10 +2029,9 @@ ipcMain.handle('test:run', async (_event, { path: testPath }) => {
     // Spawn the Python test runner. Capture stdout+stderr, resolve with
     // the merged output. Exit code 0 = pass, non-zero = fail (but a test
     // can also exit 0 with "X failed" in stdout — treat that as partial).
-    // cwd is the Farnsworth app dir so the runner's relative imports
-    // (if any) resolve against its own location; the test path is
-    // absolute so cwd doesn't affect what the runner targets.
-    const { spawn } = require('child_process');
+    // Runner path, interpreter and cwd are all resolved by
+    // spawnTestRunner() -- see the notes on that helper for why each one
+    // needed fixing for installed builds.
     // Inject the chat's auth into the runner env so llm-step can take the
     // direct-API fast path (one POST, screenshot inline) instead of shelling
     // to the claude CLI. Runner falls back to the CLI when absent. Jul 11.
@@ -1891,11 +2051,18 @@ ipcMain.handle('test:run', async (_event, { path: testPath }) => {
         rc.send({ type: 'test:state', testId: testPath, status: 'running', ts: Date.now() });
       }
     } catch {}
+    const launch = spawnTestRunner(testPath, runnerEnv);
+    if (launch.error) {
+      try {
+        const rc = getRelayClient();
+        if (rc && rc.status === 'connected') {
+          rc.send({ type: 'test:state', testId: testPath, status: 'failed', error: launch.error, ts: Date.now() });
+        }
+      } catch {}
+      return { ok: false, error: launch.error, message: launch.message };
+    }
     return await new Promise((resolve) => {
-      const proc = spawn('python3', [TEST_RUNNER_PATH, testPath], {
-        cwd: app.getAppPath(),
-        env: runnerEnv,
-      });
+      const proc = launch.proc;
       let stdout = '';
       let stderr = '';
       proc.stdout.on('data', d => stdout += d.toString());
@@ -1931,7 +2098,7 @@ ipcMain.handle('test:run', async (_event, { path: testPath }) => {
             rc.send({ type: 'test:state', testId: testPath, status: 'failed', error: err.message, ts: Date.now() });
           }
         } catch {}
-        resolve({ ok: false, error: err.message });
+        resolve({ ok: false, error: err.code || 'spawn_error', message: err.message });
       });
     });
   } catch (e) {
@@ -4100,7 +4267,6 @@ async function executeAgentTool(name, input) {
   if (name === 'test_run') {
     if (!input?.path || typeof input.path !== 'string') return { ok: false, error: 'missing_path' };
     if (!fsSync.existsSync(input.path)) return { ok: false, error: 'not_found', path: input.path };
-    const { spawn } = require('child_process');
     // Same auth injection as the test:run IPC — llm-step direct-API fast path.
     const llmAuth = await getValidAccessToken().catch(() => null);
     const runnerEnv = { ...process.env };
@@ -4110,11 +4276,10 @@ async function executeAgentTool(name, input) {
     }
     const testModel = testingModelApiId();
     if (testModel) runnerEnv.FARNSWORTH_TEST_MODEL = testModel;
+    const launch = spawnTestRunner(input.path, runnerEnv);
+    if (launch.error) return { ok: false, error: launch.error, message: launch.message };
     return await new Promise((resolve) => {
-      const proc = spawn('python3', [TEST_RUNNER_PATH, input.path], {
-        cwd: app.getAppPath(),
-        env: runnerEnv,
-      });
+      const proc = launch.proc;
       let stdout = '';
       let stderr = '';
       proc.stdout.on('data', d => stdout += d.toString());
@@ -4131,7 +4296,7 @@ async function executeAgentTool(name, input) {
         });
       });
       proc.on('error', err => {
-        resolve({ ok: false, error: err.message });
+        resolve({ ok: false, error: err.code || 'spawn_error', message: err.message });
       });
     });
   }

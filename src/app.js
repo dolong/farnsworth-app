@@ -4255,6 +4255,15 @@ async function runTestViewTest(panel, t) {
     pre.textContent = 'Test runner IPC failed (no response from main).';
     return;
   }
+  // No exit code means the runner never started -- bad interpreter, missing
+  // script, unusable cwd. Show the actual reason: packaged v0.1.5 rendered
+  // "Exit ?" plus two empty output blocks for every test, which told the user
+  // nothing at all (Jul 29).
+  if (result.code === undefined || result.code === null) {
+    pre.textContent = `Could not start the test runner\n\n${result.message || result.error || 'No exit code and no output from the runner.'}`;
+    output.querySelector('.testview__output-header').innerHTML = `▶ ${t.name}.json · ERROR`;
+    return;
+  }
   const status = result.ok ? 'PASS' : (result.failed > 0 ? `FAIL (${result.failed} failed)` : 'ERROR');
   pre.textContent = `Exit ${result.code ?? '?'} · ${status}\n\n--- stdout ---\n${result.stdout || '(empty)'}\n\n--- stderr ---\n${result.stderr || '(empty)'}`;
   output.querySelector('.testview__output-header').innerHTML = `▶ ${t.name}.json · ${status}`;
@@ -11519,7 +11528,9 @@ async function sendChatMessage() {
           // !toolRes.ok branch below or its real stdout/stderr gets thrown
           // away and replaced with a bare "tool failed" (Jul 27 bug fix).
           if (toolRes.error && toolRes.code === undefined) {
-            resultContent = `Error: ${toolRes.error}`;
+            // message carries the actionable detail (which interpreter, which
+            // missing dep); error alone is just a machine-readable slug.
+            resultContent = `Error: ${toolRes.message || toolRes.error}`;
           } else {
             resultContent = `Exit ${toolRes.code}, ${toolRes.failed || 0} failed\n\nSTDOUT:\n${toolRes.stdout || '(empty)'}\n\nSTDERR:\n${toolRes.stderr || '(empty)'}`;
           }

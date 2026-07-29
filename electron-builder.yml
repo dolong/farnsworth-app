@@ -63,6 +63,12 @@ extraResources:
     to: bin
     filter:
       - "**/*"
+  # farnsworth-test.py is run by an EXTERNAL python process, which has no asar
+  # support and cannot read a file inside app.asar. Through v0.1.5 it was never
+  # packaged at all and Test View resolved it inside the asar, so no test could
+  # run on an installed build (Jul 29). Resolved by resolveTestRunnerPath().
+  - from: farnsworth-test.py
+    to: test-runner/farnsworth-test.py
 
 # Native modules must be unpacked from asar (they can't be loaded from inside)
 asar: true
