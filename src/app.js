@@ -13721,6 +13721,86 @@ async function init() {
   if (window.farnsworth?.onMenuAction) {
     window.farnsworth.onMenuAction(handleMenuAction);
   }
+
+  // ---- auto-updater UI (Jul 29) ---------------------------------------
+  // Until now the updater was completely silent in the UI: it downloaded
+  // 350 MB with no indication, sat on a ready update with no way to apply it,
+  // and swallowed real failures into a console warn. The titlebar pill stays
+  // hidden unless there is something true to say, so it never becomes
+  // decoration (the pink dot it replaced was exactly that: always on, wired
+  // to nothing, and read as an update badge).
+  function renderUpdaterState(st) {
+    const pill  = document.getElementById('update-pill');
+    const label = document.getElementById('update-pill-label');
+    const bar   = document.getElementById('update-pill-bar');
+    const fill  = document.getElementById('update-pill-fill');
+    if (!pill || !label || !bar || !fill || !st) return;
+
+    pill.classList.remove('update-pill--busy', 'update-pill--ready', 'update-pill--error');
+    bar.hidden = true;
+
+    // States with no news: stay out of the way entirely. 'checking' and
+    // 'offline' included on purpose -- a routine background check is not an
+    // event, and an offline laptop must not grow a permanent badge.
+    if (st.status === 'idle' || st.status === 'checking' || st.status === 'current' || st.status === 'offline') {
+      pill.hidden = true;
+      return;
+    }
+
+    pill.hidden = false;
+
+    if (st.status === 'available') {
+      pill.classList.add('update-pill--busy');
+      label.textContent = 'Update ' + (st.version || '');
+      pill.title = 'Version ' + (st.version || '?') + ' found. Downloading in the background.';
+    } else if (st.status === 'downloading') {
+      pill.classList.add('update-pill--busy');
+      label.textContent = 'Downloading ' + (st.percent || 0) + '%';
+      bar.hidden = false;
+      fill.style.width = (st.percent || 0) + '%';
+      const got = formatBytes(st.transferred || 0);
+      const tot = formatBytes(st.total || 0);
+      const rate = st.bytesPerSecond ? ' at ' + formatBytes(st.bytesPerSecond) + '/s' : '';
+      pill.title = 'Downloading ' + (st.version || '') + ': ' + got + ' of ' + tot + rate;
+    } else if (st.status === 'ready') {
+      pill.classList.add('update-pill--ready');
+      label.textContent = 'Restart to update';
+      pill.title = 'Version ' + (st.version || '') + ' is downloaded. Click to restart and install now, or it installs the next time you quit.';
+    } else if (st.status === 'error') {
+      pill.classList.add('update-pill--error');
+      label.textContent = 'Update failed';
+      pill.title = (st.message || 'Unknown updater error') + ' -- click to retry.';
+    }
+  }
+
+  if (window.farnsworth?.onUpdaterState) {
+    window.farnsworth.onUpdaterState(renderUpdaterState);
+    // Catch up on anything that fired before this renderer was listening. The
+    // updater starts checking at app-ready, which is earlier than this code.
+    if (window.farnsworth.updaterGetState) {
+      window.farnsworth.updaterGetState()
+        .then(renderUpdaterState)
+        .catch((e) => console.warn('[updater] could not read initial state:', e));
+    }
+    const pill = document.getElementById('update-pill');
+    if (pill) {
+      pill.addEventListener('click', async () => {
+        if (pill.classList.contains('update-pill--ready')) {
+          const label = document.getElementById('update-pill-label');
+          if (label) label.textContent = 'Restarting...';
+          try {
+            const r = await window.farnsworth.updaterRestart();
+            if (r && r.ok === false) console.warn('[updater] restart refused:', r.error);
+          } catch (e) {
+            console.warn('[updater] restart failed:', e);
+          }
+        } else if (pill.classList.contains('update-pill--error')) {
+          try { await window.farnsworth.updaterCheck(); }
+          catch (e) { console.warn('[updater] retry failed:', e); }
+        }
+      });
+    }
+  }
   // Programmatic canvas preview switcher (chat agent's open_testview tool,
   // Jul 11 ~18:50 ET). Mirror the size-toggle click handler — nuke every
   // WebContentsView, set state.preview, sync the resolution dropdown,

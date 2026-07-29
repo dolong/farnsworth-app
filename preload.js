@@ -291,6 +291,25 @@ contextBridge.exposeInMainWorld('farnsworth', {
     return () => ipcRenderer.removeListener('menu:action', handler);
   },
 
+  // ---- auto-updater (Jul 29) -------------------------------------------
+  // Update state used to exist only in main-process console.log calls, so a
+  // downloaded update was invisible and a failed one doubly so. The renderer
+  // now subscribes to state and can show progress + a restart affordance.
+  //
+  // updaterGetState() matters as much as the subscription: the updater begins
+  // checking before the renderer is listening, so a fresh renderer has to ask
+  // for the current state rather than wait for an event that already fired.
+  onUpdaterState: (callback) => {
+    const handler = (_e, state) => {
+      try { callback(state); } catch (err) { console.error('[updater] handler error:', err); }
+    };
+    ipcRenderer.on('updater:state', handler);
+    return () => ipcRenderer.removeListener('updater:state', handler);
+  },
+  updaterGetState: () => ipcRenderer.invoke('updater:state'),
+  updaterCheck: () => ipcRenderer.invoke('updater:check'),
+  updaterRestart: () => ipcRenderer.invoke('updater:restart'),
+
   // Memory system (Tier 1, Jul 5 2026) — always-loaded essentials + concepts
   // + buffer + archive. Tier 1 uses LIKE-based recall; Tier 2 swaps in
   // sqlite-vec. The IPC surface is shaped so the swap is renderer-invisible.

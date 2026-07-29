@@ -93,12 +93,128 @@ function checkCdpReachable(port) {
 const { autoUpdater } = require('electron-updater');
 autoUpdater.autoDownload = true;        // download in the background
 autoUpdater.autoInstallOnAppQuit = true; // install when the user quits
-// Surface update events to the renderer so we can show an in-app banner later.
-// Right now we just log them — the native notification from
-// checkForUpdatesAndNotify() is the primary UX.
-autoUpdater.on('update-available',  (info) => console.log('[autoUpdater] update available:', info?.version));
-autoUpdater.on('update-downloaded', (info) => console.log('[autoUpdater] update downloaded:', info?.version, '— restart to apply'));
-autoUpdater.on('error',             (err)  => console.warn('[autoUpdater] error:', err?.message || err));
+
+// ---------------------------------------------------------------------------
+// Update state, broadcast to the renderer (Jul 29).
+//
+// Before this, the three updater events only called console.log/console.warn.
+// Nothing reached the UI, so an update downloaded silently and the user had no
+// way to know it was waiting, no progress while 350 MB came down, and a FAILED
+// update was completely invisible (that is how ERR_UPDATER_ZIP_FILE_NOT_FOUND
+// hid for nine releases: the only handler was a warn nobody reads).
+//
+// Why a RETAINED state object rather than pure event forwarding: the updater
+// starts checking as soon as the app is ready, which is BEFORE the renderer has
+// finished loading and subscribed. Any event fired in that gap is lost forever.
+// The renderer asks for updater:state on init and catches up to whatever
+// already happened.
+// ---------------------------------------------------------------------------
+let updaterState = {
+  status: 'idle',   // idle | checking | available | downloading | ready | current | error | offline
+  version: null,
+  percent: 0,
+  transferred: 0,
+  total: 0,
+  bytesPerSecond: 0,
+  message: null,
+  checkedAt: null,
+};
+
+function broadcastUpdaterState(patch) {
+  updaterState = { ...updaterState, ...patch };
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win || win.isDestroyed()) continue;
+    try { win.webContents.send('updater:state', updaterState); } catch {}
+  }
+}
+
+// A user who is simply offline must not get an error banner every few hours.
+// Network failures are expected and uninteresting; anything else is a real bug
+// worth showing, because the whole reason macOS auto-update was broken for nine
+// releases is that its errors were silent.
+function isNetworkError(err) {
+  const s = ((err && (err.code || err.message)) || '').toString();
+  return /ENOTFOUND|ETIMEDOUT|ECONNREFUSED|ECONNRESET|EAI_AGAIN|ENETDOWN|ENETUNREACH|net::|getaddrinfo|socket hang up/i.test(s);
+}
+
+autoUpdater.on('checking-for-update', () => {
+  console.log('[autoUpdater] checking for update');
+  broadcastUpdaterState({ status: 'checking', message: null });
+});
+
+autoUpdater.on('update-not-available', (info) => {
+  console.log('[autoUpdater] up to date:', info?.version);
+  broadcastUpdaterState({ status: 'current', version: info?.version || app.getVersion(), checkedAt: Date.now() });
+});
+
+autoUpdater.on('update-available', (info) => {
+  console.log('[autoUpdater] update available:', info?.version);
+  broadcastUpdaterState({ status: 'available', version: info?.version || null, percent: 0, checkedAt: Date.now() });
+});
+
+// This is the event that makes a 350 MB download feel like something is
+// happening instead of nothing. autoDownload is true, so it fires on its own.
+autoUpdater.on('download-progress', (p) => {
+  broadcastUpdaterState({
+    status: 'downloading',
+    percent: Math.max(0, Math.min(100, Math.round(p?.percent || 0))),
+    transferred: p?.transferred || 0,
+    total: p?.total || 0,
+    bytesPerSecond: p?.bytesPerSecond || 0,
+  });
+});
+
+autoUpdater.on('update-downloaded', (info) => {
+  console.log('[autoUpdater] update downloaded:', info?.version, '- restart to apply');
+  broadcastUpdaterState({ status: 'ready', version: info?.version || null, percent: 100 });
+});
+
+autoUpdater.on('error', (err) => {
+  const msg = (err && (err.message || err.code)) || String(err);
+  if (isNetworkError(err)) {
+    console.log('[autoUpdater] check skipped (offline/network):', msg);
+    broadcastUpdaterState({ status: 'offline', message: null });
+    return;
+  }
+  console.error('[autoUpdater] error:', msg);
+  broadcastUpdaterState({ status: 'error', message: msg });
+});
+
+// Renderer asks for this on init so it can catch up on events that fired
+// before it was listening (see the comment on updaterState above).
+ipcMain.handle('updater:state', async () => ({ ...updaterState, currentVersion: app.getVersion() }));
+
+// Manual "check now", for the user who does not want to wait for the timer.
+ipcMain.handle('updater:check', async () => {
+  if (!app.isPackaged) return { ok: false, error: 'Updates are disabled in a dev build.' };
+  try {
+    await autoUpdater.checkForUpdates();
+    return { ok: true };
+  } catch (err) {
+    const msg = (err && (err.message || err.code)) || String(err);
+    // The event handler already broadcast this; just report it back to the call.
+    return { ok: false, error: msg };
+  }
+});
+
+// Install now. autoInstallOnAppQuit is also true, so if quitAndInstall is ever
+// blocked the update still lands on the next normal quit. Verified end to end:
+// a SIGTERM quit was enough for ShipIt to swap the bundle.
+ipcMain.handle('updater:restart', async () => {
+  if (updaterState.status !== 'ready') {
+    return { ok: false, error: 'No downloaded update is waiting.' };
+  }
+  // Let the reply reach the renderer before the app goes away.
+  setTimeout(() => {
+    try {
+      autoUpdater.quitAndInstall();
+    } catch (err) {
+      console.error('[autoUpdater] quitAndInstall failed:', err?.message || err);
+      broadcastUpdaterState({ status: 'error', message: 'Could not restart to install: ' + (err?.message || err) });
+    }
+  }, 250);
+  return { ok: true };
+});
 
 // keytar (native) — try to load at startup so credential IPCs can reference
 // it directly. If the native binary is missing/broken (Linux without libsecret,
@@ -5575,15 +5691,30 @@ app.whenReady().then(async () => {
   startCodexServer();
 
   // ====================================================================
-  // Auto-updater check (packaged builds only; dev mode skips it).
-  // Runs after createWindow() so any in-app update banner has a renderer
-  // to attach to later (not wired up yet — just logs for now + native
-  // notification from checkForUpdatesAndNotify()).
+  // Auto-updater (packaged builds only; dev mode skips it).
+  //
+  // The boot check alone is not enough: Farnsworth is an app you leave open
+  // for days, and a one-shot check at launch means a long-running session
+  // never learns about a release that shipped an hour later. Re-check on a
+  // timer, and skip the check once something is already downloading or
+  // waiting to install so we do not restart a 350 MB download.
   // ====================================================================
   if (app.isPackaged) {
-    autoUpdater.checkForUpdatesAndNotify().catch((err) => {
-      console.warn('[autoUpdater] check failed:', err?.message || err);
-    });
+    const runUpdateCheck = (reason) => {
+      if (updaterState.status === 'downloading' || updaterState.status === 'ready') return;
+      console.log('[autoUpdater] check (' + reason + ')');
+      autoUpdater.checkForUpdates().catch((err) => {
+        // The 'error' event already classified and broadcast this. Logging the
+        // rejection too would double-report it.
+        console.log('[autoUpdater] check rejected:', err?.message || err);
+      });
+    };
+    runUpdateCheck('boot');
+    const SIX_HOURS = 6 * 60 * 60 * 1000;
+    const updateTimer = setInterval(() => runUpdateCheck('periodic'), SIX_HOURS);
+    // Do not hold the event loop open on quit.
+    if (updateTimer.unref) updateTimer.unref();
+    app.on('before-quit', () => clearInterval(updateTimer));
   }
 
   // Start the relay client (outbound WS to farnsworth-relay). No-op if
