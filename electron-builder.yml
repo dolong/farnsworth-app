@@ -71,6 +71,13 @@ extraResources:
     to: test-runner/farnsworth-test.py
 
 # Native modules must be unpacked from asar (they can't be loaded from inside)
+# Runs after the app is packed, BEFORE signing. Guarantees every bundled file is
+# owner-writable, because Squirrel.Mac must strip the quarantine xattr from each
+# file during an auto-update and removexattr() needs write permission. One
+# mode-555 file (Resources/bin/nono) silently killed every macOS update install
+# with "Permission denied" -> "Too many attempts to install, aborting update".
+afterPack: scripts/after-pack-ensure-writable.js
+
 asar: true
 asarUnpack:
   # Read by a spawned plain-node process (NODE_OPTIONS --import), which has
