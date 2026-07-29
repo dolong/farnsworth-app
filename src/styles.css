@@ -1479,10 +1479,52 @@ pre:hover .code-copy { opacity: 1; }
 
 .canvas__overlay-bar {
   position: absolute; top: 14px; left: 16px;
+  /* Bound the right edge (Jul 28). Previously only `left` was set, so the bar
+     grew to its natural content width and the tail -- Go Live, the devvit user
+     pill, the emulator cogwheel -- ran past the viewport and was clipped by
+     .canvas__viewport{overflow:hidden}, i.e. permanently unreachable. */
+  right: 16px;
+  max-width: calc(100% - 32px);
   z-index: 7;
   display: flex; align-items: center; gap: 8px;
+  flex-wrap: nowrap; row-gap: 8px;
   transition: top 160ms ease, left 160ms ease, right 160ms ease, bottom 160ms ease;
 }
+
+/* ===== canvas__overlay-bar overflow fit (Jul 28) =====
+   Progressive collapse tiers, applied additively by fitOverlayBar() in app.js
+   until the bar's scrollWidth fits its clientWidth. Measurement-driven rather
+   than media/container breakpoints because the bar's natural width depends on
+   runtime state: whether the custom W x H inputs are showing, whether the dev
+   server is live (adds the Live pill), and whether this is a devvit project
+   (adds the user pill + cogwheel). */
+
+/* The three groups keep their intrinsic size; the tiers below do the
+   shrinking. .canvas__live-status is the actionable tail of the bar, so it
+   must never be the thing that gets squeezed off. */
+.canvas__mode-toggles,
+.canvas__size-toggles,
+.canvas__live-status { flex: none; }
+
+/* tier1 -- size-toggle labels collapse to icons (biggest single saving: 5
+   labels). title= on each button carries the name into a tooltip. */
+.canvas__overlay-bar.is-tier1 .size-toggle .tgl-label { display: none; }
+.canvas__overlay-bar.is-tier1 .size-toggle { padding: 5px 8px; gap: 0; }
+
+/* tier2 -- mode-toggle labels collapse too. The Live Preview pulse dot is
+   NOT a .tgl-label, so the live indicator survives. */
+.canvas__overlay-bar.is-tier2 .mode-toggle .tgl-label { display: none; }
+.canvas__overlay-bar.is-tier2 .mode-toggle { padding: 5px 8px; gap: 0; }
+
+/* tier3 -- resolution <select> collapses to its chevron, custom inputs narrow. */
+.canvas__overlay-bar.is-tier3 .canvas__resolution-select {
+  width: 26px; padding-left: 2px; padding-right: 16px;
+}
+.canvas__overlay-bar.is-tier3 .canvas__resolution-input { width: 42px; }
+
+/* last resort -- allow a second row so nothing is EVER unreachable, however
+   narrow the canvas gets. */
+.canvas__overlay-bar.is-wrap { flex-wrap: wrap; }
 .canvas__viewport--code .canvas__overlay-bar {
   top: 48px; left: auto; bottom: auto; right: 16px;
 }

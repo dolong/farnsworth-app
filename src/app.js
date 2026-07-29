@@ -2815,6 +2815,68 @@ function showToast(msg) {
   }, 3200);
 }
 
+// ---- Canvas overlay-bar overflow fit (Jul 28) --------------------------
+// The overlay bar is absolutely positioned over #canvas-viewport, which is
+// overflow:hidden. It used to set only `left`, so it grew to its natural
+// content width and the tail of the bar -- Go Live / the Live pill / the
+// devvit user pill / the emulator cogwheel -- was clipped off the right edge
+// with no way to reach it. Expanding either sidebar narrowed the canvas and
+// made it worse.
+//
+// The bar is now bounded (see styles.css), and we collapse it in tiers until
+// it fits. This is measured rather than breakpoint-driven because the bar's
+// natural width is runtime-dependent: the custom W x H inputs may or may not
+// be showing, the dev server may or may not be live, and only devvit projects
+// get the user pill + cogwheel.
+const OVERLAY_FIT_TIERS = ['is-tier1', 'is-tier2', 'is-tier3', 'is-wrap'];
+let _overlayFitQueued = false;
+
+function fitOverlayBar() {
+  const bar = document.querySelector('.canvas__overlay-bar');
+  if (!bar || bar.hidden || !bar.isConnected) return;
+  // Guard so our own class writes don't retrigger the MutationObserver.
+  bar._fitting = true;
+  bar.classList.remove(...OVERLAY_FIT_TIERS);
+  for (const tier of OVERLAY_FIT_TIERS) {
+    // +1px slack: scrollWidth / clientWidth can disagree by a subpixel.
+    if (bar.scrollWidth <= bar.clientWidth + 1) break;
+    bar.classList.add(tier);
+  }
+  bar._fitting = false;
+}
+
+function scheduleOverlayFit() {
+  if (_overlayFitQueued) return;
+  _overlayFitQueued = true;
+  requestAnimationFrame(() => { _overlayFitQueued = false; fitOverlayBar(); });
+}
+
+// One-time wiring. Two triggers: viewport resize (sidebar drag/collapse,
+// window resize, zoom) and content mutation (renderLiveStatus() rebuilding
+// the tail buttons, the custom W x H row toggling its `hidden` attribute).
+// The MutationObserver means we don't have to remember to call this from
+// every site that changes the bar's contents.
+function setupOverlayBarFit() {
+  const bar = document.querySelector('.canvas__overlay-bar');
+  if (!bar || bar._overlayFitWired) return;
+  bar._overlayFitWired = true;
+
+  const viewport = document.getElementById('canvas-viewport');
+  if (viewport) new ResizeObserver(scheduleOverlayFit).observe(viewport);
+
+  new MutationObserver((records) => {
+    if (bar._fitting) return;
+    // Ignore our own tier class writes on the bar element itself.
+    if (records.every(r => r.type === 'attributes' && r.target === bar)) return;
+    scheduleOverlayFit();
+  }).observe(bar, {
+    childList: true, subtree: true,
+    attributes: true, attributeFilter: ['hidden', 'style'],
+  });
+
+  scheduleOverlayFit();
+}
+
 // Renders the dev-server status/run control in the canvas overlay bar.
 // - Live mode + server up   → green "Live" pill (click to stop)
 // - Live mode + server down → "Go Live" run button (boots the dev server)
@@ -2823,6 +2885,7 @@ function showToast(msg) {
 function renderLiveStatus() {
   const host = $('#canvas-live-status');
   if (!host) return;
+  scheduleOverlayFit();
   host.innerHTML = '';
   if (state.canvasMode !== 'live') { host.style.display = 'none'; return; }
   host.style.display = 'flex';
@@ -9593,9 +9656,14 @@ async function detectAuth() {
   if (ccRes.ok && ccRes.hasAuth) {
     state.auth.claudeCodeSubscriptionType = ccRes.subscriptionType || null;
     state.auth.claudeCodeExpiresAt = ccRes.expiresAt || null;
+    state.auth.claudeCodeMessage = null;
   } else {
     state.auth.claudeCodeSubscriptionType = null;
     state.auth.claudeCodeExpiresAt = null;
+    // Stale/rotated Keychain credential (e.g. synced from another Mac but
+    // no longer valid) gets a specific reason from verifyClaudeCodeKeychainAuth()
+    // — surface it instead of the generic "not signed in" copy.
+    state.auth.claudeCodeMessage = (ccRes.source === 'keychain_stale' || ccRes.source === 'keychain_refresh_error' || ccRes.source === 'keychain_expired') ? ccRes.message : null;
   }
   // OAuth status
   try {
@@ -9741,8 +9809,15 @@ function claudeCodeConnectedHTML(subscriptionType, expiresAt) {
 }
 
 function oauthDisconnectedHTML() {
+  // A stale/rotated credential (e.g. synced in via iCloud Keychain from
+  // another Mac but no longer valid — see verifyClaudeCodeKeychainAuth())
+  // gets a specific one-line reason instead of pretending nothing was found.
+  const staleNote = state.auth.claudeCodeMessage
+    ? `<div class="oauth-help" style="margin-top:10px; color:var(--warn, #d9a441);">${state.auth.claudeCodeMessage}</div>`
+    : '';
   return `
     <div style="flex:1;">
+      ${staleNote}
       <button class="btn btn--primary btn--full" id="oauth-import-keychain-btn">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
         Sign in with Claude Code CLI
@@ -9915,6 +9990,7 @@ function updateModeToggles() {
 }
 
 function wire() {
+  setupOverlayBarFit();
   // ⌘Z / Ctrl+Z = undo last mark-up stroke when markup mode is active.
   // Skip when typing in an input/textarea/contenteditable so we don't
   // intercept undo in the chat composer, find bar, comment box, etc.
