@@ -704,6 +704,90 @@ ipcMain.handle('dev:farnsworth:get', async (_event, appType = 'devvit', repoRoot
 //
 // repoRoot is the open workspace folder (state.folder). It must contain a
 // package.json defining the `farnsworth:<type>` script.
+// ---- node/npm discovery (Jul 28) ---------------------------------------
+// A GUI-launched Electron app inherits PATH from LaunchServices, which on
+// macOS is just /usr/bin:/bin:/usr/sbin:/sbin -- no Homebrew, no version
+// manager. Anything we spawn that needs node/npm has to be told where they
+// actually are. Rather than hardcoding a guess, ask the user's own login
+// shell, which is the one place that definitively knows (it's where nvm/fnm/
+// volta/asdf install their shims).
+let _userShellPathDirs = null;
+function getUserShellPathDirs() {
+  if (_userShellPathDirs) return _userShellPathDirs;
+  _userShellPathDirs = [];
+  try {
+    const { execFileSync } = require('child_process');
+    const shell = process.env.SHELL || '/bin/zsh';
+    // -l so profile/rc files run (that's what defines nvm etc). Markers let us
+    // ignore any banner noise an rc file prints. stderr dropped for the same
+    // reason. Timeboxed: a slow rc file must not stall Go Live.
+    const out = execFileSync(shell, ['-lc', 'printf "__FWP__%s__FWP__" "$PATH"'], {
+      encoding: 'utf8',
+      timeout: 8000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const parts = out.split('__FWP__');
+    if (parts.length >= 2) {
+      _userShellPathDirs = parts[1].split(':').filter(Boolean);
+    }
+  } catch {
+    // Non-fatal: fall through to the static candidates below.
+  }
+  return _userShellPathDirs;
+}
+
+let _npmBinCache;
+function resolveNpmBin() {
+  if (_npmBinCache !== undefined) return _npmBinCache;
+  const fs = require('fs');
+  const path = require('path');
+  const os = require('os');
+
+  const isExec = (f) => {
+    try { fs.accessSync(f, fs.constants.X_OK); return fs.statSync(f).isFile(); }
+    catch { return false; }
+  };
+
+  const candidates = [];
+  // 1. Explicit escape hatch, so a user with an exotic setup is never stuck.
+  if (process.env.FARNSWORTH_NPM) candidates.push(process.env.FARNSWORTH_NPM);
+  // 2. Whatever the user's login shell actually resolves (nvm/fnm/volta/asdf).
+  for (const d of getUserShellPathDirs()) candidates.push(path.join(d, 'npm'));
+  // 3. Static fallbacks for the common installs.
+  for (const d of ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin']) {
+    candidates.push(path.join(d, 'npm'));
+  }
+  // 4. Version managers, newest version first, in case the shell probe failed
+  //    (e.g. a login shell that refuses to run non-interactively).
+  const home = os.homedir();
+  const versionDirs = [
+    path.join(home, '.nvm', 'versions', 'node'),
+    path.join(home, 'Library', 'Application Support', 'fnm', 'node-versions'),
+    path.join(home, '.local', 'share', 'fnm', 'node-versions'),
+  ];
+  for (const base of versionDirs) {
+    try {
+      const versions = fs.readdirSync(base).sort().reverse();
+      for (const v of versions) {
+        candidates.push(path.join(base, v, 'bin', 'npm'));
+        candidates.push(path.join(base, v, 'installation', 'bin', 'npm'));
+      }
+    } catch {}
+  }
+  candidates.push(path.join(home, '.volta', 'bin', 'npm'));
+
+  for (const c of candidates) {
+    if (isExec(c)) {
+      console.log(`[dev:farnsworth:boot] resolved npm -> ${c}`);
+      _npmBinCache = c;
+      return c;
+    }
+  }
+  console.error('[dev:farnsworth:boot] npm NOT FOUND. Searched:', candidates.length, 'candidates');
+  _npmBinCache = null;
+  return null;
+}
+
 ipcMain.handle('dev:farnsworth:boot', async (_event, appType = 'devvit', repoRoot) => {
   const fs = require('fs');
   const path = require('path');
@@ -733,11 +817,41 @@ ipcMain.handle('dev:farnsworth:boot', async (_event, appType = 'devvit', repoRoo
     };
   }
 
-  // Ensure node/npm are on PATH (Apple Silicon Homebrew isn't on the default
-  // PATH inherited when the app is launched via LaunchServices/`open`).
+  // Resolve npm to an ABSOLUTE path and build a PATH that actually reflects
+  // how the user installed node (Jul 28). The old code just prepended
+  // /opt/homebrew/bin + /usr/local/bin, which silently assumes Homebrew or a
+  // pkg install. On a Mac using nvm / fnm / volta / asdf, npm is under
+  // ~/.nvm/versions/node/<v>/bin (etc.), so `spawn('npm')` threw
+  // "spawn npm ENOENT" -- an error that blames npm when the real problem is
+  // that we never looked where this machine keeps it.
+  //
+  // Same class as the nono-profile and server-runner path bugs: a hardcoded
+  // location that happened to be true on the dev machine.
+  const npmBin = resolveNpmBin();
   const env = { ...process.env };
-  const extraPaths = ['/opt/homebrew/bin', '/usr/local/bin'];
-  env.PATH = [...extraPaths, env.PATH || ''].filter(Boolean).join(':');
+  const extraPaths = [
+    ...(npmBin ? [path.dirname(npmBin)] : []),
+    ...getUserShellPathDirs(),
+    '/opt/homebrew/bin',
+    '/usr/local/bin',
+  ];
+  // De-dupe, preserving order, so the child's PATH stays sane.
+  const seen = new Set();
+  env.PATH = [...extraPaths, ...(env.PATH || '').split(':')]
+    .filter((d) => d && !seen.has(d) && (seen.add(d), true))
+    .join(':');
+
+  if (!npmBin) {
+    return {
+      ok: false,
+      error: 'npm_not_found',
+      message:
+        'Could not find npm. Farnsworth looked in your login shell PATH, ' +
+        'Homebrew, /usr/local/bin, and the common nvm/fnm/volta/asdf ' +
+        'locations. If node is installed, set FARNSWORTH_NPM to the full ' +
+        'path of your npm binary and relaunch.',
+    };
+  }
 
   // Tell the project's farnsworth:<type> script where OUR server-runner lives
   // (Jul 28). The scripts historically hardcoded
@@ -820,7 +934,10 @@ ipcMain.handle('dev:farnsworth:boot', async (_event, appType = 'devvit', repoRoo
   return await new Promise((resolve) => {
     let settled = false;
     let stderr = '';
-    const child = spawn('npm', ['run', scriptName], {
+    // Absolute path, not the bare name: a GUI-launched Electron app inherits
+    // a minimal PATH from LaunchServices, so bare-name resolution is exactly
+    // what failed here.
+    const child = spawn(npmBin, ['run', scriptName], {
       cwd: repoRoot,
       env,
       stdio: ['ignore', 'ignore', 'pipe'],
