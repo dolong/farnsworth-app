@@ -78,7 +78,9 @@ import subprocess
 import urllib.request
 import websocket
 
-CDP_PORT = 9222
+# Farnsworth passes the port it actually bound (see activeCdpPort in main.js).
+# Falls back to 9222 for standalone terminal use.
+CDP_PORT = int(os.environ.get('FARNSWORTH_CDP_PORT') or 9222)
 
 def find_renderer_target(port=CDP_PORT):
     """Find Farnsworth's OWN renderer (file://...index.html), not the game page.
@@ -204,7 +206,9 @@ class Tester:
             };
         })()''' % json.dumps(str(username))
 
-        rws = websocket.create_connection(rt['webSocketDebuggerUrl'], timeout=timeout_ms / 1000.0 + 15)
+        # suppress_origin: Chromium >=111 rejects CDP handshakes carrying an
+        # Origin header unless allow-listed. Not sending one is the safe form.
+        rws = websocket.create_connection(rt['webSocketDebuggerUrl'], timeout=timeout_ms / 1000.0 + 15, suppress_origin=True)
         try:
             res = Tester(rws).eval(js, await_promise=True) or {}
         finally:
@@ -248,7 +252,7 @@ class Tester:
             tgt = find_target(quiet=True)
             if tgt and tgt.get('webSocketDebuggerUrl'):
                 try:
-                    ws = websocket.create_connection(tgt['webSocketDebuggerUrl'], timeout=10)
+                    ws = websocket.create_connection(tgt['webSocketDebuggerUrl'], timeout=10, suppress_origin=True)
                     self.ws = ws
                     self._id = 0
                     # Prove the page actually executes JS before handing back.
@@ -720,7 +724,7 @@ def main():
     if not target:
         sys.exit(1)
     print(f'Target: {target["url"][:80]}')
-    ws = websocket.create_connection(target['webSocketDebuggerUrl'], timeout=10)
+    ws = websocket.create_connection(target['webSocketDebuggerUrl'], timeout=10, suppress_origin=True)
     t = Tester(ws)
     passed = 0
     failed = 0

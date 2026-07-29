@@ -18,6 +18,67 @@ const child_process = require('child_process');
 const crypto = require('crypto');
 const db = require('./db');
 
+// ---- CDP debugging port for the test runner (Jul 29) --------------------
+// farnsworth-test.py drives the canvas preview over the Chrome DevTools
+// Protocol, so Electron has to be LISTENING on a debugging port. Nothing in
+// main.js ever enabled one. It only ever worked on the dev machine because
+// that tree gets launched by hand with --remote-debugging-port=9222, so every
+// installed build refused the connection -- surfacing as a 40-line Python
+// traceback ending in "[Errno 61] Connection refused" that read like a bug in
+// the runner rather than a missing flag in the host app.
+//
+// Must be appended BEFORE app ready. Chromium binds this to loopback only.
+// Set FARNSWORTH_CDP_PORT to move it, or to "off" to disable entirely.
+function resolveCdpPortRequest() {
+  const fromArgv = process.argv.find((a) => a.startsWith('--remote-debugging-port='));
+  if (fromArgv) return { port: fromArgv.split('=')[1], alreadySet: true };
+  const fromEnv = process.env.FARNSWORTH_CDP_PORT;
+  if (fromEnv === 'off' || fromEnv === '0') return { port: null, alreadySet: false };
+  return { port: fromEnv || '9222', alreadySet: false };
+}
+const CDP_REQUEST = resolveCdpPortRequest();
+if (CDP_REQUEST.port && !CDP_REQUEST.alreadySet) {
+  app.commandLine.appendSwitch('remote-debugging-port', CDP_REQUEST.port);
+}
+// Chromium >=111 REJECTS any CDP WebSocket handshake that carries an Origin
+// header ("403 Rejected an incoming WebSocket connection from the ... origin")
+// unless that origin is allow-listed. Python's websocket-client sends one by
+// default, so an open port alone is not enough -- found Jul 29 while verifying
+// the port fix, and it would have shipped as a second silent failure. Scoped to
+// loopback only; NOT '*'.
+if (CDP_REQUEST.port) {
+  app.commandLine.appendSwitch(
+    'remote-allow-origins',
+    ['http://127.0.0.1:' + CDP_REQUEST.port, 'http://localhost:' + CDP_REQUEST.port].join(',')
+  );
+}
+
+// The port Chromium ACTUALLY bound is written to DevToolsActivePort in
+// userData. Prefer it over the requested value: they differ when the
+// requested port was already taken (e.g. a dev-tree instance on 9222).
+function activeCdpPort() {
+  try {
+    const f = path.join(app.getPath('userData'), 'DevToolsActivePort');
+    const first = fsSync.readFileSync(f, 'utf8').split('\n')[0].trim();
+    if (first) return first;
+  } catch {}
+  return CDP_REQUEST.port;
+}
+
+// Probe the port before spawning python. Without this the failure arrives as
+// a Python traceback; with it, one readable line.
+function checkCdpReachable(port) {
+  return new Promise((resolve) => {
+    if (!port) return resolve({ ok: false, reason: 'disabled' });
+    const req = require('http').get(
+      { host: '127.0.0.1', port: Number(port), path: '/json/version', timeout: 2000 },
+      (res) => { res.resume(); resolve({ ok: res.statusCode === 200 }); }
+    );
+    req.on('timeout', () => { req.destroy(); resolve({ ok: false, reason: 'timeout' }); });
+    req.on('error', () => resolve({ ok: false, reason: 'refused' }));
+  });
+}
+
 // =============================================================================
 // Auto-updater (electron-updater, reads app-update.yml bundled in app.asar).
 // GitHub Releases channel: dolong/farnsworth-app. `checkForUpdatesAndNotify()`
@@ -1870,7 +1931,7 @@ function checkTestRunnerDeps(pythonBin, env) {
 // Returns { proc } on success, or { error, message } when the runner could not
 // be started. Callers must surface the message field -- swallowing it is what made this
 // bug class invisible for so long.
-function spawnTestRunner(testPath, runnerEnv) {
+async function spawnTestRunner(testPath, runnerEnv) {
   const { spawn } = require('child_process');
 
   const runner = resolveTestRunnerPath();
@@ -1910,6 +1971,26 @@ function spawnTestRunner(testPath, runnerEnv) {
 
   const deps = checkTestRunnerDeps(pythonBin, env);
   if (!deps.ok) return { error: 'python_dep_missing', message: deps.message };
+
+  // Tell the runner which port to use rather than letting it assume 9222.
+  const cdpPort = activeCdpPort();
+  if (cdpPort) env.FARNSWORTH_CDP_PORT = String(cdpPort);
+  const cdp = await checkCdpReachable(cdpPort);
+  if (!cdp.ok) {
+    return {
+      error: 'cdp_unavailable',
+      message:
+        cdp.reason === 'disabled'
+          ? 'The test runner drives the app over the DevTools protocol, but the ' +
+            'debugging port is disabled (FARNSWORTH_CDP_PORT=off). Unset it and ' +
+            'restart Farnsworth.'
+          : 'Farnsworth is not listening on DevTools port ' + cdpPort + ', so the ' +
+            'test runner has nothing to attach to (connection ' + cdp.reason + ').\n\n' +
+            'This port is enabled at startup, so a restart of Farnsworth usually ' +
+            'fixes it. If another Farnsworth instance already holds ' + cdpPort + ', ' +
+            'quit it, or set FARNSWORTH_CDP_PORT to a free port and restart.',
+    };
+  }
 
   // cwd must be a real DIRECTORY. This is the line that broke every packaged
   // build: app.getAppPath() is app.asar, a file.
@@ -2058,7 +2139,7 @@ ipcMain.handle('test:run', async (_event, { path: testPath }) => {
         rc.send({ type: 'test:state', testId: testPath, status: 'running', ts: Date.now() });
       }
     } catch {}
-    const launch = spawnTestRunner(testPath, runnerEnv);
+    const launch = await spawnTestRunner(testPath, runnerEnv);
     if (launch.error) {
       try {
         const rc = getRelayClient();
@@ -4283,7 +4364,7 @@ async function executeAgentTool(name, input) {
     }
     const testModel = testingModelApiId();
     if (testModel) runnerEnv.FARNSWORTH_TEST_MODEL = testModel;
-    const launch = spawnTestRunner(input.path, runnerEnv);
+    const launch = await spawnTestRunner(input.path, runnerEnv);
     if (launch.error) return { ok: false, error: launch.error, message: launch.message };
     return await new Promise((resolve) => {
       const proc = launch.proc;

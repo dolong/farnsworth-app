@@ -6001,6 +6001,9 @@ pre:hover .code-copy { opacity: 1; }
   padding: 8px 0;
 }
 .testview__output-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   font-weight: 700;
   color: #fff;
   margin-bottom: 8px;
@@ -6008,6 +6011,24 @@ pre:hover .code-copy { opacity: 1; }
   border-bottom: 1px solid #2a2d33;
   letter-spacing: 0.3px;
 }
+/* Test View output must be SELECTABLE (Jul 29, Long). body sets
+   user-select:none as the app-chrome default and this panel never opted back
+   in, so a stack trace could be read but not copied out of the app. */
+.testview__output-pre,
+.testview__output-empty { user-select: text; }
+.testview__copy {
+  margin-left: auto;
+  flex: 0 0 auto;
+  background: none;
+  border: 0;
+  padding: 2px 4px;
+  cursor: pointer;
+  color: #8b949e;
+  line-height: 0;
+  border-radius: 4px;
+}
+.testview__copy:hover { color: #fff; background: #23262c; }
+.testview__copy.is-copied { color: #3fb950; }
 .testview__output-pre {
   margin: 0;
   white-space: pre-wrap;
