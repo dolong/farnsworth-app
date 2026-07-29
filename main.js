@@ -1777,6 +1777,12 @@ ipcMain.handle('canvas:debugView', (_event, { viewId }) => {
 // against the real install, and say so out loud when the resolve fails.
 
 function resolveTestRunnerPath() {
+  // Module-scope `fs` in this file is fs/promises (see the note at the top),
+  // which has no statSync. Every sync helper here shadows it locally, and this
+  // one must too -- without it the statSync call threw TypeError, the catch
+  // swallowed it, and the function reported "runner not found" on a machine
+  // where the file was sitting right there (Jul 29, shipped broken in v0.1.6).
+  const fs = require('fs');
   const candidates = [];
   if (process.env.FARNSWORTH_TEST_RUNNER) candidates.push(process.env.FARNSWORTH_TEST_RUNNER);
   if (app.isPackaged) {
@@ -1797,6 +1803,7 @@ let _pythonBinCache;
 function resolvePythonBin() {
   if (_pythonBinCache !== undefined) return _pythonBinCache;
   const os = require('os');
+  const fs = require('fs'); // NOT the module-scope fs/promises -- see above.
   const isExec = (f) => {
     try { fs.accessSync(f, fs.constants.X_OK); return fs.statSync(f).isFile(); }
     catch { return false; }
