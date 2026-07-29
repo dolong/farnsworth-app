@@ -94,8 +94,22 @@ asarUnpack:
 mac:
   category: public.app-category.developer-tools
   icon: Resources/farnsworth-icon.icns
+  # BOTH targets are required, for different jobs:
+  #   dmg — what a human downloads for a FIRST install.
+  #   zip — what electron-updater/Squirrel.Mac consumes for AUTO-UPDATE.
+  # Through v0.1.9 this list was dmg-only, so macOS auto-update was broken for
+  # every installed user of every version. electron-updater's MacUpdater calls
+  # findFile(files, 'zip', ['pkg','dmg']) and throws
+  # ERR_UPDATER_ZIP_FILE_NOT_FOUND when no .zip is in latest-mac.yml. The error
+  # only reached a console.warn, so it failed invisibly (Jul 29).
+  # The arch suffix in the filename is load-bearing: MacUpdater.filterFilesForArch
+  # selects by matching the literal string "arm64" in the file name.
   target:
     - target: dmg
+      arch:
+        - arm64
+        - x64
+    - target: zip
       arch:
         - arm64
         - x64
