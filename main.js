@@ -144,6 +144,9 @@ function findClaudePath() {
   } catch {}
   // 3) Common install locations
   const candidates = [
+    // Login-shell PATH (nvm/fnm/volta/asdf/mise) -- `which` above runs with
+    // Electron's launchd PATH, which never sees a version manager's shims.
+    ...getUserShellPathDirs().map((d) => path.join(d, 'claude')),
     '/opt/homebrew/bin/claude',
     '/usr/local/bin/claude',
     '/usr/bin/claude',
@@ -174,6 +177,9 @@ function findCodexPath() {
     if (found) return found;
   } catch {}
   const candidates = [
+    // Login-shell PATH (nvm/fnm/volta/asdf/mise) -- `which` above runs with
+    // Electron's launchd PATH, which never sees a version manager's shims.
+    ...getUserShellPathDirs().map((d) => path.join(d, 'codex')),
     '/opt/homebrew/bin/codex',
     '/usr/local/bin/codex',
     '/usr/bin/codex',
@@ -199,6 +205,9 @@ function findNonoPath() {
     if (found) return found;
   } catch {}
   const candidates = [
+    // Login-shell PATH (nvm/fnm/volta/asdf/mise) -- `which` above runs with
+    // Electron's launchd PATH, which never sees a version manager's shims.
+    ...getUserShellPathDirs().map((d) => path.join(d, 'nono')),
     '/opt/homebrew/bin/nono',
     '/usr/local/bin/nono',
     path.join(process.env.HOME || '', '.local', 'bin', 'nono'),
@@ -795,6 +804,63 @@ function getUserShellPathDirs() {
     // Non-fatal: fall through to the static candidates below.
   }
   return _userShellPathDirs;
+}
+
+// ---- toolchain PATH + sandbox grants (Jul 29) ---------------------------
+// Every child-process PATH in this file used to be hand-assembled from
+// '/opt/homebrew/bin' + '/usr/local/bin'. That is only correct on a machine
+// where the toolchain came from Homebrew. On a Mac using a Node version
+// manager (nvm/fnm/volta/asdf/mise/bun), node + npm live under $HOME and are
+// invisible -- the chat agent reported "npm: command not found ... no node
+// under homebrew or nvm" while node v22 was installed and working in Terminal.
+// composeChildPath() puts the user's real login-shell PATH first, then the
+// static fallbacks.
+function composeChildPath(extra = [], base = process.env.PATH) {
+  const seen = new Set();
+  return [
+    ...extra,
+    ...getUserShellPathDirs(),
+    '/opt/homebrew/bin',
+    '/opt/homebrew/sbin',
+    '/usr/local/bin',
+    ...(base || '/usr/bin:/bin:/usr/sbin:/sbin').split(':'),
+  ]
+    .filter((d) => d && !seen.has(d) && (seen.add(d), true))
+    .join(':');
+}
+
+// A correct PATH is necessary but NOT sufficient inside nono: its Seatbelt
+// profile denies reading $HOME outside the workspace, so a version-manager
+// node is unreadable even when PATH points straight at it -- a PATH lookup
+// returns nothing because access(X_OK) is denied. Proven by experiment Jul 29:
+// with PATH alone the sandboxed shell found nothing; adding a read-only grant
+// on the manager root made node -v + npm -v work.
+//
+// Grant READ-ONLY (never write), scoped to the toolchain root rather than all
+// of $HOME: ~/.nvm, ~/.volta, ~/.asdf, ~/.bun, ~/.local/<x>, and for ~/Library
+// three levels deep (never all of ~/Library).
+function toolchainGrantRoot(dir) {
+  const home = os.homedir();
+  if (!dir || !dir.startsWith(home + path.sep)) return null; // system dirs need no grant
+  const rel = dir.slice(home.length + 1).split(path.sep).filter(Boolean);
+  if (!rel.length) return null;
+  if (rel[0] === 'Library') return rel.length >= 3 ? path.join(home, rel[0], rel[1], rel[2]) : null;
+  if (rel[0] === '.local') return rel.length >= 2 ? path.join(home, rel[0], rel[1]) : null;
+  return path.join(home, rel[0]);
+}
+
+function toolchainReadDirs() {
+  const fs = require('fs');
+  const out = [];
+  const seen = new Set();
+  for (const dir of getUserShellPathDirs()) {
+    const root = toolchainGrantRoot(dir);
+    if (!root || seen.has(root)) continue;
+    seen.add(root);
+    try { if (fs.statSync(root).isDirectory()) out.push(root); } catch {}
+    if (out.length >= 12) break; // sanity cap on argv length
+  }
+  return out;
 }
 
 let _npmBinCache;
@@ -5705,8 +5771,9 @@ function startTerminalServer() {
       // Electron's process.env.PATH from a `open`-launched bundle does NOT
       // include /opt/homebrew/bin (LaunchServices doesn't load shell rc
       // files), which is why `npm run dev` was giving "command not found".
-      const pathWithBrew = (process.env.PATH || '')
-        + ':/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin';
+      // Login-shell PATH first so version-manager node/npm resolve here too
+      // (was Homebrew-only, which broke on Macs using nvm/fnm/volta/asdf).
+      const pathWithBrew = composeChildPath();
       try {
         term = pty.spawn(shell, [], {
           name: 'xterm-256color',
@@ -6007,9 +6074,7 @@ function startClaudeCodeServer() {
         // first, then homebrew, then /usr/local. This makes claude +
         // nono self-contained inside Farnsworth.app.
         const bundledBin = path.join(process.resourcesPath || '', 'bin');
-        const newPath = [bundledBin, '/opt/homebrew/bin', '/usr/local/bin', process.env.PATH || '']
-          .filter(Boolean)
-          .join(':');
+        const newPath = composeChildPath([bundledBin]);
         term = pty.spawn(spawnBin, spawnArgs, {
           name: 'xterm-256color',
           cols: 80,
@@ -6365,9 +6430,7 @@ function startCodexServer() {
       markCodexTrusted(cwd);
       try {
         const bundledBin = path.join(process.resourcesPath || '', 'bin');
-        const newPath = [bundledBin, '/opt/homebrew/bin', '/usr/local/bin', process.env.PATH || '']
-          .filter(Boolean)
-          .join(':');
+        const newPath = composeChildPath([bundledBin]);
         term = pty.spawn(codexBin, [], {
           name: 'xterm-256color',
           cols: 80,
@@ -6617,9 +6680,17 @@ async function runSandboxedCommand(nonoBin, profileName, command, folder) {
     let stdout = '';
     let stderr = '';
     let timedOut = false;
+    // Farnsworth launched from Finder inherits launchd's bare PATH, so the
+    // toolchain is invisible to the sandboxed shell. composeChildPath() adds
+    // the user's login-shell PATH (version managers included) and the --read
+    // grants make those dirs readable through Seatbelt. BOTH halves are
+    // required: see toolchainReadDirs().
+    const readGrants = [];
+    for (const d of toolchainReadDirs()) readGrants.push('--read', d);
     const child = spawn(
       nonoBin,
-      ['wrap', '--profile', resolveNonoProfile(profileName), '--allow-cwd', '--', '/bin/sh', '-c', command],
+      ['wrap', '--profile', resolveNonoProfile(profileName), '--allow-cwd',
+       ...readGrants, '--', '/bin/sh', '-c', command],
       {
         cwd: folder,
         // Farnsworth launched from Finder / `open .app` inherits launchd's bare
@@ -6628,15 +6699,7 @@ async function runSandboxedCommand(nonoBin, profileName, command, folder) {
         // chat agent sees `command -v node` return nothing even though Node is
         // installed. Prepend the Homebrew + /usr/local bins. Same class of fix
         // as the terminal PTY PATH fix (Jul 4) — this call site never got it.
-        env: {
-          ...process.env,
-          PATH: [
-            '/opt/homebrew/bin',
-            '/opt/homebrew/sbin',
-            '/usr/local/bin',
-            process.env.PATH || '/usr/bin:/bin:/usr/sbin:/sbin',
-          ].join(':'),
-        },
+        env: { ...process.env, PATH: composeChildPath() },
       }
     );
     child.stdout.on('data', d => { stdout += d.toString(); });
