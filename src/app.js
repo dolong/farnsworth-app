@@ -146,6 +146,8 @@ const state = {
     },
     canvas: {
       defaultZoom: 100, fitOnOpen: false,
+      // storybook: UPCOMING feature, off by default. See renderCanvasSettings().
+      storybook: false,
       defaults: { markup: false, comments: false, tweaks: true },
       engine: { devtools: true, cookieIsolation: false, network: true },
     },
@@ -2843,6 +2845,11 @@ function fitOverlayBar() {
     bar.classList.add(tier);
   }
   bar._fitting = false;
+  // Publish the measured height so code mode can reserve a band for the bar
+  // (see .canvas__viewport--code .code-view). Measured AFTER the collapse
+  // tiers settle, so a bar that wrapped to two rows reports its real height.
+  const vp = document.getElementById('canvas-viewport');
+  if (vp) vp.style.setProperty('--fw-overlay-bar-h', bar.offsetHeight + 'px');
 }
 
 function scheduleOverlayFit() {
@@ -4485,35 +4492,9 @@ function renderCodeView() {
   // the editor instance. On the first render (no editor yet), create a
   // fresh container and let initMonacoEditor() claim it later.
   const activeFile = openFiles[activeFileIdx] || null;
-  const externalChange = activeFile && externalChanges.has(activeFile.path.startsWith(state.folder + '/') ? activeFile.path.slice(state.folder.length + 1) : activeFile.path);
-  if (externalChange) {
-    const relPath = activeFile.path.startsWith(state.folder + '/') ? activeFile.path.slice(state.folder.length + 1) : activeFile.path;
-    const banner = el('div', { class: 'code-view__extbanner' });
-    banner.innerHTML = `
-      <div class="code-view__extbanner-icon">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg>
-      </div>
-      <div class="code-view__extbanner-text">
-        <strong>File modified on disk</strong>
-        <span class="code-view__extbanner-path">${escapeHtml(relPath)}</span>
-      </div>
-      <div class="code-view__extbanner-actions">
-        <button class="code-view__extbanner-btn code-view__extbanner-btn--diff" id="extbanner-diff">Show diff</button>
-        <button class="code-view__extbanner-btn code-view__extbanner-btn--reload" id="extbanner-reload">Reload from disk</button>
-        <button class="code-view__extbanner-btn code-view__extbanner-btn--discard" id="extbanner-discard">Keep my changes</button>
-      </div>
-    `;
-    view.appendChild(banner);
-    // Wire buttons after the element is appended to the DOM
-    setTimeout(() => {
-      const diffBtn = document.getElementById('extbanner-diff');
-      const reloadBtn = document.getElementById('extbanner-reload');
-      const discardBtn = document.getElementById('extbanner-discard');
-      if (diffBtn) diffBtn.onclick = () => showExternalDiff(relPath);
-      if (reloadBtn) reloadBtn.onclick = () => reloadFileFromDisk(relPath);
-      if (discardBtn) discardBtn.onclick = () => discardExternalChange(relPath);
-    }, 0);
-  }
+  // Modified-on-disk banner. Rendered through syncExtBanner() so the exact same
+  // code path can refresh it later without a full re-render (focusActiveFile).
+  syncExtBanner(view);
 
   const body = el('div', { class: 'code-view__body' });
   let monacoEl;
@@ -4544,7 +4525,12 @@ function renderCodeView() {
   openFiles.forEach((f, i) => {
     const tab = el('div', { class: 'code-view__tab' + (i === activeFileIdx ? ' is-active' : '') });
     tab.dataset.fileIdx = i;
-    tab.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#f0883e" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg><span>' + escapeHtml(f.name) + '</span><span class="code-view__tab--dot' + (f.dirty ? ' is-dirty' : '') + '"></span><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#6d7178" stroke-width="2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>';
+    // A file changed on disk while you were looking at a DIFFERENT tab used to
+    // have no indicator at all -- the banner only ever described the active
+    // file, so a background change was invisible until you happened to switch.
+    const extChanged = externalChanges.has(relPathOf(f.path));
+    if (extChanged) tab.title = 'Modified on disk - open this tab to reload or keep your changes';
+    tab.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#f0883e" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg><span>' + escapeHtml(f.name) + '</span><span class="code-view__tab--dot' + (extChanged ? ' is-ext' : (f.dirty ? ' is-dirty' : '')) + '"></span><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#6d7178" stroke-width="2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>';
     tab.addEventListener('click', () => { activeFileIdx = i; focusActiveFile(); });
     tabs.appendChild(tab);
   });
@@ -4897,7 +4883,8 @@ function startInlineRenameForEntry(entry) {
     if (open) {
       open.path = absNew;
       open.name = next;
-      renderTabs();
+      updateTabUI();  // was renderTabs() -- undefined, threw, and took the
+                      // Files-panel refresh on the next line down with it.
     }
     await loadFolderFiles(state.folder, true);
   };
@@ -6873,31 +6860,7 @@ function openFile(f) {
   state.files.entries.forEach(x => { if (x.type === 'file') x.current = false; });
   f.current = true;
   state.files.current = f.path;
-  state.codeFile = f.name;
-  $('#canvas-file-name').textContent = f.name.replace(/\.(html|jsx|css|json|js|ts|tsx)$/, '');
-  // Jul 14: file-type tag + subline were static mock text ("HTML" / "screens/
-  // · 7 agents · edited 2m ago") left over from when the-last-draft was the
-  // only project. Show the real extension + folder-relative path; hide both
-  // when no file is open (see index.html defaults + closeFolder reset).
-  const typeEl = document.querySelector('.canvas__file-type');
-  if (typeEl) {
-    if (f.ext) {
-      typeEl.textContent = f.ext.toUpperCase();
-      typeEl.hidden = false;
-    } else {
-      typeEl.hidden = true;
-    }
-  }
-  const subEl = document.querySelector('.canvas__title-sub');
-  if (subEl) {
-    if (f.path) {
-      subEl.textContent = f.path;
-      subEl.hidden = false;
-    } else {
-      subEl.hidden = true;
-    }
-  }
-  updateStatusBar(); // status bar reads state.files.current (set above)
+  applyCanvasFileChrome({ name: f.name, relPath: f.path, ext: f.ext });
   // Switch to code mode and open the file in Monaco
   if (['html','htm','jsx','tsx','js','mjs','cjs','ts','css','scss','less','json','jsonc','md','mdx','py','go','rs','rb','java','c','cpp','cc','h','hpp','sh','bash','zsh','yaml','yml','toml','ini','xml','svg','sql','txt'].includes(f.ext)) {
     state.canvasMode = 'code';
@@ -8140,6 +8103,19 @@ function renderCanvasSettings() {
   zoomRow.appendChild(zoomBtn);
   sec1.appendChild(zoomRow);
   sec1.appendChild(makeToggleRow('Fit to viewport on open', 'Auto-fit the artboard to the window instead of the default zoom.', s.fitOnOpen, v => { s.fitOnOpen = v; persistSettings(); }));
+  sec1.appendChild(makeToggleRow(
+    'Storybook mode',
+    'UPCOMING FEATURE - not implemented yet. Adds the Storybook tab to the canvas toggles, but the tab still renders a placeholder layout with hardcoded cards rather than your real components. Off by default so it does not look shipped.',
+    !!s.storybook,
+    v => {
+      s.storybook = v;
+      persistSettings();
+      // Turning it off while you are IN storybook mode would leave the canvas
+      // on a view whose toggle no longer exists -- fall back to live preview.
+      if (!v && state.canvasMode === 'storybook') { state.canvasMode = 'live'; renderCanvas(); }
+      updateModeToggles();
+      scheduleOverlayFit();
+    }));
 
   const defaults = el('div', { class: 'settings-section' });
   defaults.innerHTML = '<div class="settings-section__title" style="margin-bottom:2px;">Default view modes</div><div style="font-size:11px;color:#80848e;margin-bottom:8px;">Overlays switched on when a folder opens.</div>';
@@ -8350,6 +8326,10 @@ function persistSettings() {
 function reconcileHonestSettings(loaded) {
   const CANVAS_DEFAULTS = {
     defaultZoom: 100, fitOnOpen: false,
+    // New key (Jul 29). Spread order below means an existing canvasV=2 payload
+    // without it picks up the default rather than undefined, so no version bump
+    // is needed and nobody's other canvas settings get reset.
+    storybook: false,
     defaults: { markup: false, comments: false, tweaks: true },
     engine: { devtools: true, cookieIsolation: false, network: true },
   };
@@ -8688,6 +8668,85 @@ function stopUiFolderWatcher() {
 // editor banner + tab indicator. Cleared when the user reloads or discards.
 const externalChanges = new Map();
 
+// Absolute path -> workspace-relative. externalChanges is keyed by relPath, so
+// EVERY lookup must go through this. Doing the slice inline at each call site
+// is how the banner and the flag-setter came to disagree.
+function relPathOf(absPath) {
+  if (!absPath) return '';
+  if (state.folder && absPath.startsWith(state.folder + '/')) return absPath.slice(state.folder.length + 1);
+  return absPath;
+}
+
+// Canvas header chrome for the active file. SINGLE WRITER, called from both the
+// Files-panel path (openFile) and the editor/tab path (focusActiveFile).
+//
+// Jul 29: there were two competing notions of "the current file" -- state.codeFile
+// (written only by openFile) and openFiles[activeFileIdx] (written by tab clicks
+// and focusActiveFile) -- and they drifted. Long saw "File modified on disk
+// README.md" sitting above package.json's contents, because the header had moved
+// on and the banner had not.
+function applyCanvasFileChrome({ name, relPath, ext }) {
+  state.codeFile = name || null;
+  const nameEl = $('#canvas-file-name');
+  if (nameEl) nameEl.textContent = (name || '-').replace(/\.(html|jsx|css|json|js|ts|tsx)$/, '');
+  const typeEl = document.querySelector('.canvas__file-type');
+  if (typeEl) {
+    if (ext) { typeEl.textContent = String(ext).toUpperCase(); typeEl.hidden = false; }
+    else { typeEl.hidden = true; }
+  }
+  const subEl = document.querySelector('.canvas__title-sub');
+  if (subEl) {
+    if (relPath) { subEl.textContent = relPath; subEl.hidden = false; }
+    else { subEl.hidden = true; }
+  }
+  updateStatusBar(); // reads state.files.current
+}
+
+// Render / refresh / remove the "File modified on disk" banner for whichever file
+// is active RIGHT NOW.
+//
+// This has to work outside a full renderCanvas(): switching to an already-open
+// file swaps the Monaco model and returns early (openFileInEditor), so a banner
+// built during an earlier render used to survive and keep naming the old file.
+// That mattered more than a cosmetic mislabel -- the banner is the ONLY affordance
+// for reloading an externally-changed file, so a stale banner meant the real
+// change could never be resolved and the editor kept serving stale content.
+function syncExtBanner(viewEl) {
+  const root = viewEl || document.querySelector('.code-view');
+  if (!root) return;
+  root.querySelectorAll('.code-view__extbanner').forEach(n => n.remove());
+  const file = openFiles[activeFileIdx] || null;
+  if (!file) return;
+  const relPath = relPathOf(file.path);
+  if (!externalChanges.has(relPath)) return;
+
+  const banner = el('div', { class: 'code-view__extbanner' });
+  banner.innerHTML = `
+    <div class="code-view__extbanner-icon">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg>
+    </div>
+    <div class="code-view__extbanner-text">
+      <strong>File modified on disk</strong>
+      <span class="code-view__extbanner-path">${escapeHtml(relPath)}</span>
+    </div>
+    <div class="code-view__extbanner-actions">
+      <button class="code-view__extbanner-btn code-view__extbanner-btn--diff" data-act="diff">Show diff</button>
+      <button class="code-view__extbanner-btn code-view__extbanner-btn--reload" data-act="reload">Reload from disk</button>
+      <button class="code-view__extbanner-btn code-view__extbanner-btn--discard" data-act="discard">Keep my changes</button>
+    </div>
+  `;
+  // Order inside .code-view is findbar -> banner -> body, so anchor on the body.
+  const body = root.querySelector('.code-view__body');
+  if (body) root.insertBefore(banner, body);
+  else root.appendChild(banner);
+
+  // Wire on THIS element. The previous version used document.getElementById in a
+  // setTimeout, which binds to whatever banner happens to be in the document.
+  banner.querySelector('[data-act="diff"]').onclick = () => showExternalDiff(relPath);
+  banner.querySelector('[data-act="reload"]').onclick = () => reloadFileFromDisk(relPath);
+  banner.querySelector('[data-act="discard"]').onclick = () => discardExternalChange(relPath);
+}
+
 async function flagExternalChange(relPath, openIdx) {
   if (!state.folder || !openFiles[openIdx]) return;
   const file = openFiles[openIdx];
@@ -8709,7 +8768,7 @@ async function flagExternalChange(relPath, openIdx) {
     renderCanvas();
   } else {
     // Just refresh the tab UI to add an indicator dot.
-    renderTabs();
+    updateTabUI();
   }
 }
 
@@ -8734,7 +8793,8 @@ async function reloadFileFromDisk(relPath) {
   file.diskContent = res.content;
   file.dirty = false;
   externalChanges.delete(relPath);
-  renderTabs();
+  updateTabUI();
+  syncExtBanner();   // clear the banner even when this file is not active
   if (wasActive) renderCanvas();
 }
 
@@ -8744,7 +8804,8 @@ function discardExternalChange(relPath) {
   if (!relPath) return;
   externalChanges.delete(relPath);
   if (state.canvasMode === 'code') renderCanvas();
-  renderTabs();
+  updateTabUI();
+  syncExtBanner();
 }
 
 // Show an inline diff between the buffer and disk content. Uses Monaco's
@@ -10000,6 +10061,13 @@ async function refreshOAuth() {
 // EVENT WIRING
 // ============================================================================
 function updateModeToggles() {
+  // Storybook is gated behind Settings > Canvas > Storybook mode (default OFF)
+  // because it is not implemented -- the view is a placeholder. Uses inline
+  // display rather than the `hidden` attribute: .mode-toggle sets its own
+  // display, which would win over [hidden].
+  const sbToggle = document.querySelector('.mode-toggle[data-mode="storybook"]');
+  if (sbToggle) sbToggle.style.display = state.settings?.canvas?.storybook ? '' : 'none';
+
   $$('.mode-toggle').forEach(t => {
     t.classList.toggle('is-active', t.dataset.mode === state.canvasMode);
     // Pulse the Live Preview chip only when the Farnsworth dev server
@@ -10017,6 +10085,17 @@ function updateModeToggles() {
 
 function wire() {
   setupOverlayBarFit();
+
+  // Titlebar "Search files ⌘K" chip. It looked like a control and named its
+  // own shortcut, but had zero handlers -- clicking it did nothing. Opens the
+  // command palette, i.e. exactly what the ⌘K it advertises already does.
+  const tbSearch = document.getElementById('titlebar-search');
+  if (tbSearch) {
+    tbSearch.addEventListener('click', () => openCommandPalette());
+    tbSearch.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openCommandPalette(); }
+    });
+  }
   // ⌘Z / Ctrl+Z = undo last mark-up stroke when markup mode is active.
   // Skip when typing in an input/textarea/contenteditable so we don't
   // intercept undo in the chat composer, find bar, comment box, etc.
@@ -13332,7 +13411,22 @@ function focusActiveFile() {
   const file = openFiles[activeFileIdx];
   if (!file) return;
   monacoEditor.setModel(file.model);
+  // Move EVERY "current file" surface together: header, state.codeFile, the
+  // Files-panel highlight, the tab row, and the modified-on-disk banner. Before
+  // this, switching to an already-open file moved the model and the header but
+  // left the banner behind, so it named the previously active file.
+  // Deliberately NOT renderCanvas() -- renderCanvas calls focusActiveFile, so
+  // that would recurse. syncExtBanner patches the banner in place instead.
+  const relPath = relPathOf(file.path);
+  const dotIdx = file.name.lastIndexOf('.');
+  const ext = dotIdx > 0 ? file.name.slice(dotIdx + 1).toLowerCase() : '';
+  state.files.current = relPath;
+  if (Array.isArray(state.files.entries)) {
+    state.files.entries.forEach(x => { if (x.type === 'file') x.current = (x.path === relPath); });
+  }
+  applyCanvasFileChrome({ name: file.name, relPath, ext });
   updateTabUI();
+  syncExtBanner();
   monacoEditor.focus();
 }
 
@@ -13345,10 +13439,15 @@ function updateTabUI() {
     const tab = document.createElement('div');
     tab.className = 'code-view__tab' + (i === activeFileIdx ? ' is-active' : '');
     tab.dataset.fileIdx = i;
+    // Same external-change marker as renderCodeView's tab row. (These are two
+    // separate tab renderers with different DOM -- pre-existing duplication;
+    // both need the indicator or it disappears depending on which ran last.)
+    const extChanged = externalChanges.has(relPathOf(f.path));
+    if (extChanged) tab.title = 'Modified on disk - open this tab to reload or keep your changes';
     const dot = document.createElement('span');
-    dot.className = 'code-view__tab--dot' + (f.dirty ? ' is-dirty' : '');
+    dot.className = 'code-view__tab--dot' + (extChanged ? ' is-ext' : (f.dirty ? ' is-dirty' : ''));
     dot.style.width = '6px'; dot.style.height = '6px'; dot.style.borderRadius = '50%';
-    dot.style.background = f.dirty ? '#f0883e' : 'transparent';
+    dot.style.background = extChanged ? '#f0b232' : (f.dirty ? '#f0883e' : 'transparent');
     dot.style.marginRight = '4px';
     tab.appendChild(dot);
     const nameSpan = document.createElement('span');

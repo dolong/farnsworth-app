@@ -1576,7 +1576,20 @@ pre:hover .code-copy { opacity: 1; }
    narrow the canvas gets. */
 .canvas__overlay-bar.is-wrap { flex-wrap: wrap; }
 .canvas__viewport--code .canvas__overlay-bar {
-  top: 48px; left: auto; bottom: auto; right: 16px;
+  top: 10px; left: auto; bottom: auto; right: 16px;
+}
+/* Reserve a band at the top of the code view for the floating overlay bar
+   (Jul 29). The bar is position:absolute, so it does not participate in
+   layout -- any full-width row in the code view would render UNDERNEATH it
+   and become unclickable. Long hit exactly that: the "File modified on disk"
+   banner's Show diff / Reload / Keep-my-changes buttons were covered by the
+   Live Preview / Storybook / Code toggles, so the only affordance for
+   resolving an external change was unreachable.
+   The height comes from fitOverlayBar(), which measures the bar after its
+   collapse tiers settle -- so this stays correct when the bar wraps to two
+   rows on a narrow canvas, which a hardcoded value would not. */
+.canvas__viewport--code .code-view {
+  padding-top: calc(var(--fw-overlay-bar-h, 34px) + 20px);
 }
 /* In code mode the Mark up / Comments / Edit / Tweaks toolbar chips
    are for marking / story / preview only — hide them. */
@@ -7128,6 +7141,13 @@ pre:hover .code-copy { opacity: 1; }
 /* ===========================================================================
    EXTERNAL FILE CHANGE — banner + diff overlay (Jul 7 ~20:35 ET)
    =========================================================================== */
+/* Tab dot for a file changed on disk (Jul 29). Distinct from the dirty dot:
+   dirty = your unsaved edits (orange), is-ext = disk moved under you (yellow). */
+.code-view__tab--dot.is-ext {
+  background: #f0b232;
+  box-shadow: 0 0 0 2px rgba(240, 178, 50, .18);
+}
+
 .code-view__extbanner {
   display: flex;
   align-items: center;
