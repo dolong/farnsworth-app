@@ -3470,6 +3470,89 @@ async function importFromKeychainCore() {
   };
 }
 
+// Both `auth:checkClaudeCode` (Settings → AI) and `claudeCode:checkAuth`
+// (the Claude Code panel's pre-launch gate) used to report "signed in" the
+// instant a Keychain entry with an `accessToken` field existed — a presence
+// check, not a validity check. That false-positives hard on a second Mac
+// where iCloud Keychain sync carries the item over from another device:
+// the blob "exists" but its access token may be expired AND its refresh
+// token may already be rotated-invalid (Anthropic issues a new refresh
+// token on every refresh and kills the old one — if the mini refreshed
+// after the sync snapshot was taken, the synced copy is dead on arrival).
+// Symptom Long hit Jul 28: Settings said "Signed in via Claude Code CLI"
+// on a machine he'd never signed into; opening the real Claude Code panel
+// still prompted the full login-method chooser because the actual `claude`
+// binary does its own (correct) validation and found nothing usable.
+// Fix: actually attempt a live refresh when the access token looks stale,
+// and only report hasAuth:true if the credential is proven to still work.
+async function verifyClaudeCodeKeychainAuth() {
+  const { execSync } = require('child_process');
+  if (process.platform !== 'darwin') return null; // caller falls back to file-path check
+  let out;
+  try {
+    out = execSync('security find-generic-password -s "Claude Code-credentials" -w', { encoding: 'utf8', timeout: 5000 }).trim();
+  } catch {
+    return { ok: true, hasAuth: false, source: 'keychain_empty' };
+  }
+  if (!out || !out.startsWith('{')) return { ok: true, hasAuth: false, source: 'keychain_empty' };
+  let blob;
+  try {
+    blob = JSON.parse(out);
+  } catch {
+    return { ok: true, hasAuth: false, source: 'keychain_corrupt', message: 'Keychain entry is not valid JSON.' };
+  }
+  const oauth = blob.claudeAiOauth || blob;
+  if (!oauth.accessToken) return { ok: true, hasAuth: false, source: 'keychain_empty' };
+
+  const expiresAt = oauth.expiresAt ? new Date(oauth.expiresAt) : null;
+  const stillFresh = expiresAt && expiresAt.getTime() - Date.now() > 60 * 1000; // >1min left
+  if (stillFresh) {
+    return { ok: true, hasAuth: true, source: 'keychain', subscriptionType: oauth.subscriptionType || null, expiresAt: oauth.expiresAt || null };
+  }
+  // Access token is expired, missing an expiry, or expiring within 60s —
+  // don't trust presence alone. Try a live refresh against Anthropic;
+  // that's the only way to tell "just needs a refresh" apart from
+  // "refresh token already dead" (cross-device rotation race).
+  if (!oauth.refreshToken) {
+    return { ok: true, hasAuth: false, source: 'keychain_expired', message: 'Stored credential has no refresh token and its access token is expired.' };
+  }
+  try {
+    const tokenRes = await fetch(OAUTH_TOKEN_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'anthropic-beta': 'oauth-2025-04-20,claude-code-20250219' },
+      body: new URLSearchParams({ grant_type: 'refresh_token', client_id: OAUTH_CLIENT_ID, refresh_token: oauth.refreshToken }).toString(),
+    });
+    if (!tokenRes.ok) {
+      return { ok: true, hasAuth: false, source: 'keychain_stale', message: `Synced credential no longer works (refresh rejected, HTTP ${tokenRes.status}). Sign in again.` };
+    }
+    const tokenData = await tokenRes.json();
+    const newExpiresAt = new Date(Date.now() + (tokenData.expires_in || 3600) * 1000).toISOString();
+    // Write the refreshed token back so this machine's Keychain (and any
+    // future sync) carries a live credential instead of the dead snapshot.
+    const refreshedBlob = {
+      claudeAiOauth: {
+        accessToken: tokenData.access_token,
+        refreshToken: tokenData.refresh_token || oauth.refreshToken,
+        expiresAt: newExpiresAt,
+        scopes: oauth.scopes,
+        subscriptionType: oauth.subscriptionType,
+        rateLimitTier: oauth.rateLimitTier,
+      },
+    };
+    try {
+      execSync('security delete-generic-password -s "Claude Code-credentials"', { encoding: 'utf8', timeout: 5000 });
+    } catch {}
+    try {
+      execSync('security add-generic-password -s "Claude Code-credentials" -a "Claude Code" -w ' + "'" + JSON.stringify(refreshedBlob).replace(/'/g, "'\\''") + "'", { encoding: 'utf8', timeout: 5000, shell: true });
+    } catch (e) {
+      console.warn('[auth] refreshed token verified but failed to write back to Keychain: ' + e.message);
+    }
+    return { ok: true, hasAuth: true, source: 'keychain_refreshed', subscriptionType: oauth.subscriptionType || null, expiresAt: newExpiresAt };
+  } catch (e) {
+    return { ok: true, hasAuth: false, source: 'keychain_refresh_error', message: 'Could not reach Anthropic to verify the synced credential: ' + e.message };
+  }
+}
+
 // Re-store Farnsworth's current auth_tokens row back to the OS credential
 // store so Claude Code CLI sees the same entry (and so a Farnsworth restart
 // on Windows/Linux doesn't need a fresh `claude auth login`).
@@ -3533,34 +3616,13 @@ ipcMain.handle('auth:reStoreToKeychain', async () => {
 // panel showed "signed in" but Settings → AI still prompted to sign in.
 // Check Keychain first, fall back to the file path for non-mac platforms.
 ipcMain.handle('auth:checkClaudeCode', async () => {
-  const { execSync } = require('child_process');
-
-  // macOS: read Keychain entry "Claude Code-credentials" (same as the
-  // working claudeCode:checkAuth handler below).
+  // macOS: read + validate Keychain entry "Claude Code-credentials" (same
+  // helper the claudeCode:checkAuth panel gate uses below) — a live
+  // refresh check, not just presence. See verifyClaudeCodeKeychainAuth()
+  // for why presence alone false-positives on synced-but-dead credentials.
   if (process.platform === 'darwin') {
-    try {
-      const out = execSync(
-        'security find-generic-password -s "Claude Code-credentials" -w',
-        { encoding: 'utf8', timeout: 5000 }
-      ).trim();
-      if (out && out.startsWith('{')) {
-        const blob = JSON.parse(out);
-        const oauth = blob.claudeAiOauth || blob;
-        if (oauth.accessToken) {
-          return {
-            ok: true,
-            hasAuth: true,
-            source: 'keychain',
-            subscriptionType: oauth.subscriptionType || null,
-            expiresAt: oauth.expiresAt || null,
-          };
-        }
-      }
-      return { ok: true, hasAuth: false, source: 'keychain_empty' };
-    } catch {
-      // Keychain lookup failed (no entry, denied, etc.) — fall through
-      // to file-path check in case Long has both.
-    }
+    const result = await verifyClaudeCodeKeychainAuth();
+    if (result) return result;
   }
 
   // Linux / Windows: read ~/.claude/.credentials.json.
@@ -5761,25 +5823,11 @@ ipcMain.handle('claudeCode:checkAuth', async () => {
     return { ok: false, hasAuth: false, source: 'no_binary', message: 'Claude Code CLI not found. Install with: npm i -g @anthropic-ai/claude-code' };
   }
   // Check Keychain directly — that's where Claude Code stores OAuth tokens.
-  // `claude auth status` prints "Not logged in" if no Keychain entry, but
-  // reading Keychain directly is faster and doesn't fork a process.
-  const { execSync: exec } = require('child_process');
+  // Validated (live refresh if stale), not just presence — see
+  // verifyClaudeCodeKeychainAuth() above auth:checkClaudeCode.
   try {
-    const out = exec('security find-generic-password -s "Claude Code-credentials" -w', { encoding: 'utf8', timeout: 5000 }).trim();
-    if (out && out.startsWith('{')) {
-      const blob = JSON.parse(out);
-      const oauth = blob.claudeAiOauth || blob;
-      if (oauth.accessToken && oauth.refreshToken) {
-        return {
-          ok: true,
-          hasAuth: true,
-          source: 'keychain',
-          subscriptionType: oauth.subscriptionType || null,
-          expiresAt: oauth.expiresAt || null,
-        };
-      }
-    }
-    return { ok: true, hasAuth: false, source: 'keychain_empty', message: 'No OAuth token in Keychain' };
+    const result = await verifyClaudeCodeKeychainAuth();
+    return result || { ok: true, hasAuth: false, source: 'keychain_empty', message: 'No OAuth token in Keychain' };
   } catch (e) {
     return { ok: false, hasAuth: false, source: 'keychain_error', message: 'Keychain lookup failed: ' + e.message };
   }
