@@ -1049,7 +1049,8 @@ function logToolchainOnce() {
     console.log('[toolchain] login-shell dirs=' + shellDirs.length +
       ' discovered=' + discovered.length +
       ' node=' + nodeFrom +
-      ' sandboxReadGrants=[' + toolchainReadDirs().join(', ') + ']');
+      ' sandboxReadGrants=[' + toolchainReadDirs().join(', ') + ']' +
+      ' devvitGrants=[' + devvitStateDirs().join(', ') + ']');
   } catch (err) {
     console.warn('[toolchain] resolution log failed:', err && err.message);
   }
@@ -1148,14 +1149,64 @@ function gitConfigReadFiles() {
   return out;
 }
 
+// The devvit CLI keeps its state in two places outside the workspace, and it
+// touches BOTH during startup -- before it does any useful work:
+//   ~/.devvit                  session-id (telemetry UUID) + token (Reddit OAuth)
+//   ~/Library/Caches/devvit    version-check cache + error.log
+// The Seatbelt profile denies $HOME outside the workspace, so EVERY devvit
+// subcommand died in `getTelemetrySessionId` with
+//   Error: EPERM: operation not permitted, mkdir '/Users/<u>/.devvit'
+// making the whole CLI unusable from the chat agent (Long, Jul 30, on the
+// MacBook Pro). Same class as the git-config EPERM above: a denial during
+// startup, so the failure is total rather than partial, and the agent sees a
+// crash it can't attribute.
+//
+// These are --allow (read+WRITE), not read-only, and that is forced by the
+// tool's own behavior rather than chosen for convenience. Verified by
+// experiment Jul 30, all three cases:
+//   - no grant          -> EPERM mkdir ~/.devvit
+//   - --read (RO) grant -> gets past that, then EPERM mkdir ~/Library/Caches/devvit
+//   - --allow on both   -> `devvit whoami` succeeds
+// Read-only cannot work even in principle: `devvit whoami` ROTATES the token
+// and rewrites it ("Your Devvit authentication token has been saved to
+// ~/.devvit/token"), and the cache dir takes version + error.log writes.
+//
+// Deliberately NOT stat-gated, unlike gitConfigReadFiles(). The dirs are
+// frequently ABSENT on a machine where devvit hasn't run yet -- which is
+// exactly the reported failure -- so they must be granted so the CLI can
+// CREATE them. nono accepts a grant on a not-yet-existing path (verified with
+// a throwaway HOME: devvit created session-id + the cache dir itself and then
+// reached its own honest "Not currently logged in" instead of an EPERM crash).
+//
+// SECURITY TRADE, stated plainly: this makes ~/.devvit/token readable to the
+// sandboxed agent, and the profile's network allowlist is best-effort only
+// (nono 0.66 enforces strict egress from a CLI flag, not the profile field),
+// so the token is exfiltratable by a prompt-injected agent. Accepted because
+// the point of the grant is to let the agent run devvit AS the user -- upload,
+// playtest, publish -- which is already that same authority. Not narrowed by
+// sniffing the command string for "devvit": the agent authors the command, so
+// it could name anything devvit-something to earn the grant. That would be
+// theater, not a control. The real containment remains the profile's deny list
+// (~/.aws, ~/.ssh, ~/.gnupg, ~/.config/gh) and the workspace write boundary.
+function devvitStateDirs() {
+  const home = os.homedir();
+  return [
+    path.join(home, '.devvit'),
+    path.join(home, 'Library', 'Caches', 'devvit'),
+  ];
+}
+
 // The full argv fragment of Seatbelt grants every nono wrap site needs:
 // toolchain dirs so node/npm resolve at all (v0.1.9), plus the git config files
-// so git doesn't exit 128. nono flags: --read is directories only, --read-file
-// is the single-file form (passing a file to --read is a hard config error).
+// so git doesn't exit 128, plus the devvit state dirs so the devvit CLI can
+// start at all. nono flags: --read is directories only (read-only), --read-file
+// is the single-file form (passing a file to --read is a hard config error),
+// --allow is read+write.
 function sandboxGrantArgs() {
   const args = [];
   for (const d of toolchainReadDirs()) args.push('--read', d);
   for (const f of gitConfigReadFiles()) args.push('--read-file', f);
+  for (const d of devvitStateDirs()) args.push('--allow', d);
   return args;
 }
 
