@@ -11100,6 +11100,17 @@ async function stopChatTurn() {
   const turn = activeChatTurn;
   if (!turn) return;
   turn.cancelled = true;
+  // Release the slot NOW rather than waiting for the tool loop's own `finally`.
+  // Aborting the fetch only helps while an inference stream is actually open —
+  // if Stop is pressed while a TOOL is mid-execution (e.g. run_command), there's
+  // no stream to abort and the loop is parked at `await executeTool(...)`, which
+  // may not resolve for a long time (or ever, if the tool IPC wedges). Without
+  // this, the composer stays locked in Stop state until that await finally
+  // returns. Safe to null here because the loop's `finally` re-checks identity
+  // (`if (activeChatTurn === turn)`) before clearing — so if the user has
+  // already started a NEW turn by the time this stale loop unwinds, it won't
+  // clobber the new one's slot or button state.
+  activeChatTurn = null;
   try {
     if (window.farnsworth?.cancelStream) await window.farnsworth.cancelStream(turn.requestId);
   } catch {}
