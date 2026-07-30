@@ -2984,7 +2984,7 @@ async function refreshDevvitUserPill() {
 async function openDevvitUserMenu() {
   // Toggle closed if already open.
   const existing = document.querySelector('.devvit-user-menu');
-  if (existing) { existing.remove(); return; }
+  if (existing) { existing.remove(); showAllCanvasViews(); return; }
 
   if (!window.farnsworth?.devvitListUsers || !state.folder) {
     showToast?.('Devvit emulator not available.');
@@ -3022,11 +3022,18 @@ async function openDevvitUserMenu() {
     menu.style.top = (rect.bottom + 8) + 'px';
     menu.style.right = Math.max(8, window.innerWidth - rect.right) + 'px';
   }
+  // Hide canvas WebContentsViews so the iframe doesn't cover the dropdown.
+  // Same fix as openDevvitConfig's cogwheel popover (Jul 10): WebContentsViews
+  // are a separate composited layer above the DOM, so CSS z-index does not
+  // apply. This quick-switch menu was missed when that fix shipped -- restore
+  // on every close path below.
+  hideAllCanvasViews();
   // Click handler — switch + reload dev server.
   menu.querySelectorAll('.devvit-user-menu-item').forEach((btn) => {
     btn.addEventListener('click', async () => {
       const userId = Number(btn.getAttribute('data-user-id'));
       menu.remove();
+      showAllCanvasViews();
       try {
         await window.farnsworth.devvitSetProjectSettings(state.folder, userId, settings?.current_subreddit_id || null);
         showToast?.(`Switched to ${btn.querySelector('.devvit-user-menu-username')?.textContent}. Restarting dev server…`);
@@ -3040,6 +3047,7 @@ async function openDevvitUserMenu() {
   });
   menu.querySelector('#devvit-user-menu-configure')?.addEventListener('click', () => {
     menu.remove();
+    showAllCanvasViews();
     openDevvitConfig();
   });
   // Click-outside closes.
@@ -3047,6 +3055,7 @@ async function openDevvitUserMenu() {
     const onClick = (e) => {
       if (!menu.contains(e.target) && e.target !== anchor) {
         menu.remove();
+        showAllCanvasViews();
         document.removeEventListener('click', onClick);
       }
     };
