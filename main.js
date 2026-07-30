@@ -629,7 +629,7 @@ function buildMenu() {
     {
       label: 'File',
       submenu: [
-        { label: 'New Window', accelerator: 'Cmd+N', click: () => createWindow() },
+        { label: 'New Window', accelerator: 'Cmd+N', click: () => createWindow({ fresh: true }) },
         { label: 'New File', accelerator: 'Cmd+Alt+N', click: () => sendMenuAction('newFile') },
         { type: 'separator' },
         {
@@ -801,7 +801,7 @@ function buildMenu() {
     {
       label: 'Window',
       submenu: [
-        { label: 'New Window', accelerator: 'Cmd+Shift+N', click: () => createWindow() },
+        { label: 'New Window', accelerator: 'Cmd+Shift+N', click: () => createWindow({ fresh: true }) },
         { type: 'separator' },
         ...windowItems,
         { type: 'separator' },
@@ -844,7 +844,13 @@ function buildMenu() {
   return Menu.buildFromTemplate(template);
 }
 
-function createWindow() {
+// `fresh: true` opens a window in the unopened-folder state (welcome overlay,
+// no project loaded) instead of restoring the most recent folder. Every window
+// used to restore recent[0], so File > New Window produced a second copy of the
+// project you were already in, canvas and all -- there was no way to open a
+// window FOR a different folder. The flag rides in as a query param because the
+// renderer needs it during init(), before any IPC round-trip would resolve.
+function createWindow({ fresh = false } = {}) {
   mainWindow = new BrowserWindow({
     width: 1512,
     height: 1320,
@@ -880,7 +886,10 @@ function createWindow() {
       app.focus({ steal: true });
     }
   });
-  mainWindow.loadFile(path.join(__dirname, 'index.html'));
+  mainWindow.loadFile(
+    path.join(__dirname, 'index.html'),
+    fresh ? { query: { fresh: '1' } } : undefined,
+  );
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     openExternalSafe(url);
@@ -906,16 +915,21 @@ function createWindow() {
   //   (2) make window-all-closed call app.quit() unconditionally so
   //       darwin also exits, so the next `open` launches cleanly.
   // ------------------------------------------------------------
-  mainWindow.on('close', async (event) => {
-    if (mainWindow._closeInProgress) return;
+  // Capture THIS window. Every reference below used the module-global
+  // `mainWindow`, which createWindow() reassigns -- so once a second window
+  // existed, closing the FIRST one read the second window's _closeInProgress
+  // flag, flushed the second window's renderer, and marked it mid-close.
+  const win = mainWindow;
+  win.on('close', async (event) => {
+    if (win._closeInProgress) return;
     event.preventDefault();
-    mainWindow._closeInProgress = true;
+    win._closeInProgress = true;
     try {
       // Ask the renderer to flush any pending save synchronously. The
       // 500ms debounce in saveActiveConversation would otherwise lose
       // data on a quick X-click. executeJavaScript awaits the promise,
       // so we know the DB write has flushed before we close.
-      await mainWindow.webContents.executeJavaScript(
+      await win.webContents.executeJavaScript(
         '(async () => { try { if (typeof saveActiveConversation === "function") await saveActiveConversation(); ' +
         'if (typeof persistClaudeCodeTabs === "function") persistClaudeCodeTabs(); ' +
         'if (typeof persistCodexTabs === "function") persistCodexTabs(); ' +
@@ -926,18 +940,26 @@ function createWindow() {
       // indefinitely. Long had to force-quit last time; don't repeat.
       await new Promise((r) => setTimeout(r, 250));
     } finally {
-      app.quit();
+      // Quit only when this was the last window. Unconditional app.quit()
+      // meant closing any one window killed every other open window with it,
+      // which made multi-window unusable the moment you used it.
+      const others = BrowserWindow.getAllWindows()
+        .filter((w) => w !== win && !w.isDestroyed());
+      if (others.length === 0) app.quit();
+      else { try { win.destroy(); } catch { /* already gone */ } }
     }
   });
 
   // Track this window in openWindows so the Window menu can list it.
   // When a window closes, remove it and rebuild the menu so the list
   // stays accurate.
-  openWindows.push(mainWindow);
-  mainWindow.on('closed', () => {
-    const idx = openWindows.indexOf(mainWindow);
+  openWindows.push(win);
+  win.on('closed', () => {
+    const idx = openWindows.indexOf(win);
     if (idx >= 0) openWindows.splice(idx, 1);
-    if (mainWindow && mainWindow === openWindows[0]) mainWindow = openWindows[0] || null;
+    // Was `mainWindow === openWindows[0]` then reassigned to openWindows[0]:
+    // a no-op that left the global pointing at a destroyed window.
+    if (mainWindow === win) mainWindow = openWindows[0] || null;
     try { Menu.setApplicationMenu(buildMenu()); } catch {}
   });
   // Rebuild the menu whenever a new window opens so the Window list

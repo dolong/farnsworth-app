@@ -14229,10 +14229,15 @@ async function init() {
     renderChat();
     await refreshChatHistoryList();
   }
-  // Restore last opened folder if recent has one
+  // Restore last opened folder if recent has one -- UNLESS this window was
+  // opened via File > New Window, which passes ?fresh=1. Restoring in every
+  // window meant "New Window" duplicated the project you were already in
+  // (canvas live, files loaded) with no way to point it at a different folder.
+  // A fresh window lands in the same unopened state as a first-ever launch.
+  const freshWindow = new URLSearchParams(location.search).get('fresh') === '1';
   let recent = [];
   if (window.farnsworth) recent = await window.farnsworth.getRecent();
-  if (recent.length > 0) {
+  if (!freshWindow && recent.length > 0) {
     await handleFolderPicked(recent[0].path);
   } else {
     showWelcome();
