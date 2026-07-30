@@ -116,7 +116,12 @@ function resolveCdpPortRequest() {
   if (fromArgv) return { port: fromArgv.split('=')[1], alreadySet: true };
   const fromEnv = process.env.FARNSWORTH_CDP_PORT;
   if (fromEnv === 'off' || fromEnv === '0') return { port: null, alreadySet: false };
-  return { port: fromEnv || '9222', alreadySet: false };
+  if (fromEnv) return { port: fromEnv, alreadySet: false };
+  // Named instances must not fight the default instance for 9222 -- the loser
+  // gets "bind() failed: Address already in use" and no devtools server at
+  // all. '0' asks Chromium for any free port; activeCdpPort() reads the real
+  // one back from DevToolsActivePort, which is per-instance now.
+  return { port: IS_DEFAULT_INSTANCE ? '9222' : '0', alreadySet: false };
 }
 const CDP_REQUEST = resolveCdpPortRequest();
 if (CDP_REQUEST.port && !CDP_REQUEST.alreadySet) {
@@ -128,7 +133,7 @@ if (CDP_REQUEST.port && !CDP_REQUEST.alreadySet) {
 // default, so an open port alone is not enough -- found Jul 29 while verifying
 // the port fix, and it would have shipped as a second silent failure. Scoped to
 // loopback only; NOT '*'.
-if (CDP_REQUEST.port) {
+if (CDP_REQUEST.port && CDP_REQUEST.port !== '0') {
   app.commandLine.appendSwitch(
     'remote-allow-origins',
     ['http://127.0.0.1:' + CDP_REQUEST.port, 'http://localhost:' + CDP_REQUEST.port].join(',')
@@ -6280,7 +6285,7 @@ function startTerminalServer() {
       spawnPty(null); // falls back to currentFolder / homedir
     }, 2000);
   });
-  console.log(`[terminal] WebSocket server listening on ws://localhost:${TERMINAL_WS_PORT}`);
+  wsBoundPort(terminalWss).then((p) => console.log(`[terminal] WebSocket server listening on ws://localhost:${p ?? '(bind failed)'}`));
 }
 
 // Claude Code panel — separate WebSocket server + PTY pool that spawns the
@@ -6624,7 +6629,7 @@ function startClaudeCodeServer() {
       try { term && term.kill(); } catch {}
     });
   });
-  console.log(`[claude-code] WebSocket server listening on ws://localhost:${CLAUDE_CODE_WS_PORT}`);
+  wsBoundPort(claudeCodeWss).then((p) => console.log(`[claude-code] WebSocket server listening on ws://localhost:${p ?? '(bind failed)'}`));
 }
 
 ipcMain.handle('claudeCode:getWsUrl', async () => {
@@ -6920,7 +6925,7 @@ function startCodexServer() {
       try { term && term.kill(); } catch {}
     });
   });
-  console.log(`[codex] WebSocket server listening on ws://localhost:${CODEX_WS_PORT}`);
+  wsBoundPort(codexWss).then((p) => console.log(`[codex] WebSocket server listening on ws://localhost:${p ?? '(bind failed)'}`));
 }
 
 ipcMain.handle('codex:getWsUrl', async () => {
