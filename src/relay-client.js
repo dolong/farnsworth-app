@@ -46,7 +46,18 @@ const MACHINE_ID_HASH = crypto
   .update(os.hostname() + (os.userInfo()?.username || ''))
   .digest('hex')
   .slice(0, 8);
-const SUB = `farnsworth:${os.hostname()}-${MACHINE_ID_HASH}`;
+// Instance name, set by main.js from --instance=<name> before this module is
+// required. Machine identity alone is not enough any more: two Farnsworths can
+// run on one Mac and the companion has to tell them apart.
+const INSTANCE_NAME = String(process.env.FARNSWORTH_INSTANCE || 'default')
+  .trim().toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 32) || 'default';
+const IS_DEFAULT_INSTANCE = INSTANCE_NAME === 'default';
+
+// The default instance keeps its historic sub verbatim so an already-paired
+// desktop does not appear as a brand new device after upgrading.
+const SUB = IS_DEFAULT_INSTANCE
+  ? `farnsworth:${os.hostname()}-${MACHINE_ID_HASH}`
+  : `farnsworth:${os.hostname()}-${MACHINE_ID_HASH}:${INSTANCE_NAME}`;
 
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 30000;
@@ -57,6 +68,7 @@ class RelayClient {
     this.secret = opts.secret || RELAY_JWT_SECRET;
     this.tenantId = opts.tenantId || RELAY_TENANT_ID;
     this.sub = opts.sub || SUB;
+    this.instanceName = opts.instanceName || INSTANCE_NAME;
     this.deviceToken = opts.deviceToken || RELAY_DEVICE_TOKEN;
     this.ws = null;
     this.reconnectAttempt = 0;
@@ -79,6 +91,35 @@ class RelayClient {
   }
 
   get paired() { return !!this.deviceToken; }
+
+  /**
+   * Swap the device token at runtime and reconnect with the new identity.
+   *
+   * Pairing from Settings → Account would otherwise need an app relaunch,
+   * because the token is read from the Keychain by the launcher and handed in
+   * as RELAY_DEVICE_TOKEN at process start. Passing null reverts to the
+   * unpaired self-signed path.
+   *
+   * Returns true if a reconnect was actually kicked off.
+   */
+  applyDeviceToken(token) {
+    const next = token || null;
+    if (next === this.deviceToken) return false;
+    this.deviceToken = next;
+    if (this.stopped) return false;
+    // Drop the current socket; connect() re-reads token() on the way out.
+    this.reconnectAttempt = 0;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.ws) {
+      try { this.ws.close(); } catch { /* already closing */ }
+      this.ws = null;
+    }
+    this.connect();
+    return true;
+  }
 
   start() {
     if (process.env.RELAY_DISABLED === '1') {
@@ -103,7 +144,13 @@ class RelayClient {
   connect() {
     if (this.stopped) return;
     this._setStatus('connecting');
-    const url = `${this.url}?token=${this.token()}`;
+    // The device token is minted per DEVICE and lives in one Keychain slot, so
+    // every instance on this Mac presents the SAME token. The instance
+    // qualifier is what lets the relay tell them apart without re-pairing.
+    const qualifier = this.instanceName && this.instanceName !== 'default'
+      ? `&instance=${encodeURIComponent(this.instanceName)}`
+      : '';
+    const url = `${this.url}?token=${this.token()}${qualifier}`;
     console.log(`[relay-client] connecting to ${this.url} (tenant=${this.tenantId})`);
 
     let ws;
@@ -118,7 +165,7 @@ class RelayClient {
     this.ws = ws;
 
     ws.on('open', () => {
-      console.log(`[relay-client] connected as sub=${this.sub}`);
+      console.log(`[relay-client] connected as sub=${this.sub} instance=${this.instanceName}`);
       this.reconnectAttempt = 0;
       this._setStatus('connected');
     });

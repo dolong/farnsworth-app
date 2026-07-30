@@ -7050,6 +7050,7 @@ function renderSettings() {
   else if (state.settingsPage === 'canvas') pane.appendChild(renderCanvasSettings());
   else if (state.settingsPage === 'workspace') pane.appendChild(renderWorkspaceSettings());
   else if (state.settingsPage === 'appearance') pane.appendChild(renderAppearanceSettings());
+  else if (state.settingsPage === 'pairing') pane.appendChild(renderAccountSettings());
   else if (state.settingsPage === 'account') pane.appendChild(renderAboutSettings());
 }
 
@@ -8271,6 +8272,142 @@ function renderAppearanceSettings() {
 // "Mara Blake / mara@studio.gg / Farnsworth Pro $30/mo" was design-mock
 // data with dead Edit/Manage/Sign out buttons. There is no account system;
 // this page now shows real install facts (app:info IPC) + live auth state.
+// Settings → Account. Runs the RFC 8628 device flow in-app; before this the
+// only way to pair a desktop was `node src/pair-device.js` from a terminal.
+// The poll itself lives in main, so closing this panel mid-pair does not
+// abandon the flow — reopening it picks the state back up.
+function renderAccountSettings() {
+  const wrap = el('div');
+  wrap.innerHTML = `
+    <div style="margin-bottom:24px;"><div class="settings-page__title">Account</div><div class="settings-page__sub">Pair this Farnsworth with your farnsworth.tv account so you can reach it from the companion.</div></div>
+    <div class="settings-section"><div class="settings-section__title" style="margin-bottom:13px;">This instance</div><div id="account-body"><div style="font-size:12px;color:#6d7178;">Checking…</div></div></div>
+  `;
+  const body = wrap.querySelector('#account-body');
+
+  const card = (children, extra = '') => el('div', {
+    style: `display:flex;flex-direction:column;gap:10px;background:#1a1b1e;border:1px solid var(--border-default);border-radius:10px;padding:14px;${extra}`,
+  }, ...children);
+
+  const row = (label, value, mono) => el('div', { style: 'display:flex;align-items:center;justify-content:space-between;gap:12px;' },
+    el('div', { style: 'font-size:12px;color:#6d7178;' }, label),
+    el('div', { style: `font-size:12px;color:#dbdee1;${mono ? 'font-family:ui-monospace,SFMono-Regular,Menlo,monospace;' : ''}` }, value || '—'));
+
+  let unsubscribe = null;
+  const teardown = () => { if (unsubscribe) { unsubscribe(); unsubscribe = null; } };
+
+  async function refresh() {
+    let st = null;
+    try { st = await window.farnsworth?.accountStatus?.(); } catch {}
+    body.innerHTML = '';
+
+    if (!st) {
+      body.appendChild(el('div', { style: 'font-size:12px;color:#6d7178;' }, 'Account status unavailable.'));
+      return;
+    }
+
+    if (st.locked) {
+      // Distinguish this loudly — a locked Keychain looks exactly like
+      // "not paired" if you only check whether the token read succeeded.
+      body.appendChild(card([
+        el('div', { style: 'font-size:12.5px;color:#e5c07b;' }, 'Keychain is locked'),
+        el('div', { style: 'font-size:12px;color:#6d7178;line-height:1.5;' },
+          'Farnsworth cannot read the stored device token until this Mac is unlocked. Unlock the screen, then reopen this panel.'),
+      ]));
+      const retry = el('button', { class: 'btn' }, 'Check again');
+      retry.addEventListener('click', refresh);
+      body.appendChild(retry);
+      return;
+    }
+
+    if (st.paired) {
+      body.appendChild(card([
+        el('div', { style: 'display:flex;align-items:center;gap:8px;' },
+          el('span', { style: 'width:8px;height:8px;border-radius:50%;background:#4ade80;display:inline-block;' }),
+          el('div', { style: 'font-size:12.5px;color:#dbdee1;' }, 'Paired')),
+        row('Account', st.userId, true),
+        row('Instance', st.instanceId, true),
+        row('Machine', st.hostname),
+      ]));
+      const unpair = el('button', { class: 'btn' }, 'Unpair this device');
+      unpair.addEventListener('click', async () => {
+        unpair.disabled = true;
+        unpair.textContent = 'Unpairing…';
+        const r = await window.farnsworth?.accountUnpair?.();
+        if (!r?.ok) {
+          unpair.disabled = false;
+          unpair.textContent = 'Unpair this device';
+          body.appendChild(el('div', { style: 'font-size:12px;color:#e06c75;margin-top:8px;' }, r?.error || 'Unpair failed.'));
+          return;
+        }
+        refresh();
+      });
+      body.appendChild(unpair);
+      return;
+    }
+
+    // Unpaired.
+    body.appendChild(card([
+      el('div', { style: 'font-size:12.5px;color:#dbdee1;' }, 'Not paired'),
+      el('div', { style: 'font-size:12px;color:#6d7178;line-height:1.5;' },
+        `Pairing links this machine (${st.hostname}) to your account. The companion can then connect to it from anywhere.`),
+    ]));
+    const pair = el('button', { class: 'btn btn--primary' }, 'Pair this device');
+    pair.addEventListener('click', async () => {
+      pair.disabled = true;
+      pair.textContent = 'Requesting code…';
+      const r = await window.farnsworth?.accountPairStart?.();
+      if (!r?.ok) {
+        pair.disabled = false;
+        pair.textContent = 'Pair this device';
+        body.appendChild(el('div', { style: 'font-size:12px;color:#e06c75;margin-top:8px;' }, r?.error || 'Could not start pairing.'));
+      }
+    });
+    body.appendChild(pair);
+  }
+
+  function showCode(p) {
+    body.innerHTML = '';
+    body.appendChild(card([
+      el('div', { style: 'font-size:12px;color:#6d7178;' }, 'Enter this code at'),
+      el('div', { style: 'font-size:12.5px;color:#dbdee1;' }, p.verificationUri || 'app.farnsworth.tv/link'),
+      el('div', { style: 'font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:26px;letter-spacing:4px;color:#fff;padding:10px 0;text-align:center;' }, p.userCode || ''),
+      el('div', { style: 'font-size:12px;color:#6d7178;' }, 'Waiting for approval…'),
+    ]));
+    const openBtn = el('button', { class: 'btn btn--primary' }, 'Open pairing page');
+    openBtn.addEventListener('click', () => {
+      const url = p.verificationUriComplete || p.verificationUri;
+      if (url) window.farnsworth?.openExternal?.(url);
+    });
+    const cancel = el('button', { class: 'btn' }, 'Cancel');
+    cancel.addEventListener('click', async () => {
+      await window.farnsworth?.accountPairCancel?.();
+      refresh();
+    });
+    body.appendChild(el('div', { style: 'display:flex;gap:8px;' }, openBtn, cancel));
+  }
+
+  if (window.farnsworth?.onPairing) {
+    unsubscribe = window.farnsworth.onPairing((p) => {
+      // The panel may have been torn down and rebuilt; bail if we are detached.
+      if (!wrap.isConnected) { teardown(); return; }
+      if (p.state === 'awaiting') return showCode(p);
+      if (p.state === 'paired') return refresh();
+      if (p.state === 'cancelled') return refresh();
+      body.innerHTML = '';
+      const label = p.state === 'expired'
+        ? 'The code expired before it was approved.'
+        : p.error || `Pairing ${p.state || 'failed'}.`;
+      body.appendChild(el('div', { style: 'font-size:12px;color:#e06c75;margin-bottom:10px;' }, label));
+      const again = el('button', { class: 'btn' }, 'Try again');
+      again.addEventListener('click', refresh);
+      body.appendChild(again);
+    });
+  }
+
+  refresh();
+  return wrap;
+}
+
 function renderAboutSettings() {
   const wrap = el('div');
   wrap.innerHTML = `

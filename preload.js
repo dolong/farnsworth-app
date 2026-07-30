@@ -245,6 +245,20 @@ contextBridge.exposeInMainWorld('farnsworth', {
 
   // Terminal panel (Phase 2)
   getTerminalWsUrl: () => ipcRenderer.invoke('terminal:getWsUrl'),
+
+  // Account / device pairing (Settings → Account). The RFC 8628 poll runs in
+  // main, so onPairing is how the renderer learns the user code and the
+  // eventual outcome.
+  openExternal: (url) => ipcRenderer.invoke('app:openExternal', url),
+  accountStatus: () => ipcRenderer.invoke('account:status'),
+  accountPairStart: () => ipcRenderer.invoke('account:pairStart'),
+  accountPairCancel: () => ipcRenderer.invoke('account:pairCancel'),
+  accountUnpair: () => ipcRenderer.invoke('account:unpair'),
+  onPairing: (cb) => {
+    const handler = (_e, payload) => cb(payload);
+    ipcRenderer.on('account:pairing', handler);
+    return () => ipcRenderer.removeListener('account:pairing', handler);
+  },
   // Terminal command pipe-in (Phase 5) — agent's run_command pipes into the active PTY
   terminalRunCommand: (command) => ipcRenderer.invoke('terminal:runCommand', command),
   // Close a specific terminal tab by id (killed its PTY + WS)

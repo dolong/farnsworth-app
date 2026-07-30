@@ -9,70 +9,44 @@
 //   node src/pair-device.js
 //
 // Env overrides: FARNSWORTH_API, FARNSWORTH_DEVICE_KEYCHAIN.
+//
+// The flow itself lives in ./device-pairing.js, shared with the in-app
+// Settings → Account panel, so both paths mint and store tokens identically.
+// This file is just the terminal presentation of it.
 // ----------------------------------------------------------------------------
 
-const os = require('node:os');
-const { execFileSync } = require('node:child_process');
-
-const API = process.env.FARNSWORTH_API || 'https://api.farnsworth.tv';
-const KEYCHAIN_SERVICE = process.env.FARNSWORTH_DEVICE_KEYCHAIN || 'farnsworth-device-token';
-
-function platformName() {
-  if (process.platform === 'darwin') return 'macos';
-  if (process.platform === 'win32') return 'windows';
-  return 'linux';
-}
-
-async function postJson(path, body) {
-  const res = await fetch(`${API}${path}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  return res.json();
-}
+const { runDeviceFlow, KEYCHAIN_SERVICE } = require('./device-pairing');
 
 async function main() {
-  const code = await postJson('/api/device/code', {
-    name: os.hostname(),
-    platform: platformName(),
+  const result = await runDeviceFlow({
+    onCode: (code) => {
+      console.log('\n  ┌─ Pair this device ───────────────────────────────');
+      console.log(`  │  1. Open  ${code.verificationUri}`);
+      console.log('  │  2. Sign in, then enter this code:');
+      console.log('  │');
+      console.log(`  │        ${code.userCode}`);
+      console.log('  │');
+      console.log(`  │  (shortcut: ${code.verificationUriComplete})`);
+      console.log('  └──────────────────────────────────────────────────\n');
+      process.stdout.write('  waiting for approval…\n');
+    },
   });
-  if (!code.user_code) throw new Error('no user_code from server');
 
-  console.log('\n  ┌─ Pair this device ───────────────────────────────');
-  console.log(`  │  1. Open  ${code.verification_uri}`);
-  console.log(`  │  2. Sign in, then enter this code:`);
-  console.log(`  │`);
-  console.log(`  │        ${code.user_code}`);
-  console.log(`  │`);
-  console.log(`  │  (shortcut: ${code.verification_uri_complete})`);
-  console.log('  └──────────────────────────────────────────────────\n');
-  process.stdout.write('  waiting for approval');
-
-  const deadline = Date.now() + (code.expires_in || 600) * 1000;
-  const interval = (code.interval || 5) * 1000;
-
-  while (Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, interval));
-    const t = await postJson('/api/device/token', { device_code: code.device_code });
-
-    if (t.status === 'pending') { process.stdout.write('.'); continue; }
-    if (t.status === 'approved' && t.token) {
-      execFileSync('security', [
-        'add-generic-password', '-U',
-        '-s', KEYCHAIN_SERVICE,
-        '-a', t.instanceId,
-        '-w', t.token,
-      ]);
-      console.log(`\n\n  ✓ Paired.  instance ${t.instanceId}`);
-      console.log(`  ✓ Device token stored in Keychain (${KEYCHAIN_SERVICE}).`);
-      console.log('  → Relaunch Farnsworth to connect with your account.\n');
-      return;
-    }
-    console.log(`\n\n  ✗ Pairing ${t.status || 'failed'}. Run pairing again.\n`);
+  if (result.status === 'approved') {
+    console.log(`\n  ✓ Paired.  instance ${result.instanceId}`);
+    console.log(`  ✓ Device token stored in Keychain (${KEYCHAIN_SERVICE}).`);
+    console.log('  → Relaunch Farnsworth to connect with your account.\n');
     return;
   }
-  console.log('\n\n  ✗ Code expired before approval. Run pairing again.\n');
+  if (result.status === 'expired') {
+    console.log('\n  ✗ Code expired before approval. Run pairing again.\n');
+    return;
+  }
+  console.log(`\n  ✗ Pairing ${result.status}. Run pairing again.\n`);
+  process.exitCode = 1;
 }
 
-main().catch((e) => { console.error('\n  pairing error:', e.message, '\n'); process.exit(1); });
+main().catch((e) => {
+  console.error('\n  pairing error:', e.message, '\n');
+  process.exit(1);
+});

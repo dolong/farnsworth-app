@@ -18,6 +18,88 @@ const child_process = require('child_process');
 const crypto = require('crypto');
 const db = require('./db');
 
+// ---- Instance identity (Jul 30) ------------------------------------------
+// Farnsworth can now run more than once on a machine:
+//
+//     open -n -a Farnsworth --args --instance=lastdraft
+//
+// Each named instance is independently addressable from the companion, so
+// "mini running last-draft" and "mini running dontdie" are two things you can
+// pick between on your phone.
+//
+// What actually blocked this before: three fixed WebSocket ports
+// (9223/9224/9225), a fixed CDP port, one SQLite DB, and
+// app.requestSingleInstanceLock(). The lock was added Jul 28 because without
+// it a second launch collided on all of them and half-initialized.
+//
+// The split below is deliberately narrow. Only the CHROMIUM PROFILE is
+// per-instance; the SQLite DB, memory and settings stay shared. That gets us:
+//   - an independent single-instance lock per name (Chromium's ProcessSingleton
+//     is keyed on the user-data dir, so this comes for free and still stops
+//     the SAME instance opening twice)
+//   - an independent DevToolsActivePort per instance
+//   - independent window state
+// while keeping one set of API keys, one memory store and one conversation
+// history across every instance. Splitting the DB too would mean re-entering
+// credentials per instance, which is not what anyone wants.
+function resolveInstanceName() {
+  const fromArgv = process.argv.find((a) => a.startsWith('--instance='));
+  const raw = fromArgv
+    ? fromArgv.slice('--instance='.length)
+    : (process.env.FARNSWORTH_INSTANCE || '');
+  // Used in file paths and a relay identity, so keep it boring.
+  const cleaned = String(raw).trim().toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 32);
+  return cleaned || 'default';
+}
+const INSTANCE_NAME = resolveInstanceName();
+const IS_DEFAULT_INSTANCE = INSTANCE_NAME === 'default';
+
+// Captured BEFORE setPath so shared state keeps resolving to the canonical
+// location for every instance. Must run before app ready and before anything
+// touches userData.
+const SHARED_USER_DATA = app.getPath('userData');
+if (!IS_DEFAULT_INSTANCE) {
+  app.setPath('userData', path.join(SHARED_USER_DATA, 'instances', INSTANCE_NAME));
+  process.env.FARNSWORTH_INSTANCE = INSTANCE_NAME; // inherited by child processes
+}
+
+// The workspace folder is per-instance — that is the whole point of running
+// two. Everything else in settings stays global. Reads and writes both go
+// through this so the renderer can keep saying 'currentFolder'.
+function scopedSettingKey(key) {
+  if (key === 'currentFolder' && !IS_DEFAULT_INSTANCE) {
+    return `currentFolder:${INSTANCE_NAME}`;
+  }
+  return key;
+}
+function currentFolderSetting() {
+  if (!db.getSetting) return null;
+  return db.getSetting(scopedSettingKey('currentFolder')) || null;
+}
+
+// Fixed WebSocket ports are the reason only one Farnsworth could run per
+// machine. The DEFAULT instance keeps its historic ports so anything pointing
+// at 9223/9224/9225 by hand still works; every named instance binds port 0 and
+// lets the OS assign. The renderer never hardcoded these -- it always asked
+// main via terminal:getWsUrl / claudeCode:getWsUrl / codex:getWsUrl -- so this
+// is invisible to the UI.
+function preferredWsPort(defaultPort) {
+  return IS_DEFAULT_INSTANCE ? defaultPort : 0;
+}
+
+// Resolves to the port the OS actually bound, or null if the server failed to
+// start. getWsUrl awaits this so a renderer that asks early doesn't race the
+// bind.
+function wsBoundPort(wss) {
+  return new Promise((resolve) => {
+    if (!wss) return resolve(null);
+    const addr = wss.address && wss.address();
+    if (addr && addr.port) return resolve(addr.port);
+    wss.on('listening', () => resolve(wss.address().port));
+    wss.on('error', () => resolve(null));
+  });
+}
+
 // ---- CDP debugging port for the test runner (Jul 29) --------------------
 // farnsworth-test.py drives the canvas preview over the Chrome DevTools
 // Protocol, so Electron has to be LISTENING on a debugging port. Nothing in
@@ -379,6 +461,7 @@ try {
 }
 const WebSocket = require('ws');
 const { getRelayClient } = require('./src/relay-client');
+const devicePairing = require('./src/device-pairing');
 
 let mainWindow;
 // Track all open Farnsworth windows so the Window menu can list them and
@@ -846,7 +929,9 @@ ipcMain.handle('setting:get', async (_event, key) => {
 });
 ipcMain.handle('setting:set', async (_event, key, value) => {
   if (!key || typeof key !== 'string') return { ok: false, error: 'bad_key' };
-  db.setSetting(key, value);
+  // scopedSettingKey maps 'currentFolder' to a per-instance key when this
+  // process was launched with --instance=<name>. The renderer is unaware.
+  db.setSetting(scopedSettingKey(key), value);
   return { ok: true };
 });
 
@@ -1990,7 +2075,7 @@ ipcMain.handle('clipboard:saveImage', async (_event, { dataUrl, name } = {}) => 
     // Pick a folder: workspace .farnsworth-clipboard/ if a folder is
     // open, else user-data. Both are project-scoped so old refs aren't
     // left lying around forever.
-    const folder = (db.getSetting && db.getSetting('currentFolder')) || app.getPath('userData');
+    const folder = currentFolderSetting() || app.getPath('userData');
     const dir = path.join(folder, '.farnsworth-clipboard');
     await fs.mkdir(dir, { recursive: true });
     const ext = mime === 'image/jpeg' ? 'jpg'
@@ -4652,7 +4737,7 @@ async function executeAgentTool(name, input) {
     const sz = img.getSize();
     return { ok: true, path: outPath, base64: pngBuf.toString('base64'), width: sz.width, height: sz.height };
   }
-  const folder = db.getSetting('currentFolder');
+  const folder = currentFolderSetting();
   if (!folder) {
     return { ok: false, error: 'no_folder', message: 'No workspace folder open. Open a folder first.' };
   }
@@ -5295,7 +5380,7 @@ ipcMain.handle('inference:agentTools', async () => {
 const GIT_DIFF_CHAR_LIMIT = 50000;
 
 function resolveGitCwd(explicit) {
-  const c = explicit || (db.getSetting && db.getSetting('currentFolder'));
+  const c = explicit || currentFolderSetting();
   return (typeof c === 'string' && c) ? c : null;
 }
 
@@ -6081,6 +6166,7 @@ app.on('window-all-closed', () => {
 
 const TERMINAL_WS_PORT = 9223;
 let terminalWss = null;
+let terminalWsReady = null;
 
 function startTerminalServer() {
   if (!pty) {
@@ -6088,7 +6174,8 @@ function startTerminalServer() {
     return;
   }
   if (terminalWss) return;
-  terminalWss = new WebSocket.Server({ port: TERMINAL_WS_PORT });
+  terminalWss = new WebSocket.Server({ port: preferredWsPort(TERMINAL_WS_PORT) });
+  terminalWsReady = wsBoundPort(terminalWss);
   // Without an 'error' listener, an EADDRINUSE on this port becomes an
   // unhandled 'error' event -> uncaught exception -> the "A JavaScript error
   // occurred in the main process" dialog, and it ABORTS the rest of
@@ -6115,7 +6202,7 @@ function startTerminalServer() {
     let term = null;
     const spawnPty = (initCwd) => {
       const cwd = initCwd
-        || (db.getSetting && db.getSetting('currentFolder'))
+        || currentFolderSetting()
         || os.homedir();
       // Prepend homebrew to PATH so `npm`, `node`, `claude`, etc. resolve.
       // Electron's process.env.PATH from a `open`-launched bundle does NOT
@@ -6207,6 +6294,7 @@ function startTerminalServer() {
 // the same OAUTH credentials it would if launched from Terminal.app.
 const CLAUDE_CODE_WS_PORT = 9224;
 let claudeCodeWss = null;
+let claudeCodeWsReady = null;
 // Companion Claude Code bridge (Jul 16 2026) — tracks live Claude Code
 // PTYs by tabId so the companion-side relay handler can piggyback onto
 // the desktop's active session. Populated on successful pty.spawn inside
@@ -6250,7 +6338,7 @@ function startClaudeCodeServer() {
   };
   // Run once at server boot for the default cwd; also called per-spawn
   // when the cwd changes (rare — only if Long opens a folder elsewhere).
-  markWorkspaceTrusted((db.getSetting && db.getSetting('currentFolder')) || os.homedir());
+  markWorkspaceTrusted(currentFolderSetting() || os.homedir());
   if (claudeCodeWss) return;
 
   // Locate the `claude` binary. Electron's main process inherits a minimal
@@ -6262,7 +6350,8 @@ function startClaudeCodeServer() {
     console.log(`[claude-code] using claude at: ${claudePath}`);
   }
 
-  claudeCodeWss = new WebSocket.Server({ port: CLAUDE_CODE_WS_PORT });
+  claudeCodeWss = new WebSocket.Server({ port: preferredWsPort(CLAUDE_CODE_WS_PORT) });
+  claudeCodeWsReady = wsBoundPort(claudeCodeWss);
   // See startTerminalServer() — an unhandled 'error' here crashes the whole
   // main process and aborts the remainder of app.whenReady().
   claudeCodeWss.on('error', (err) => {
@@ -6277,7 +6366,7 @@ function startClaudeCodeServer() {
   });
   claudeCodeWss.on('connection', (ws) => {
     // [DEBUG Jul 6 ~00:05 ET] trace cwd at connection
-    const initialCwd = (db.getSetting && db.getSetting('currentFolder')) || os.homedir();
+    const initialCwd = currentFolderSetting() || os.homedir();
     console.log('[claude-code] WS connect: initial cwd =', JSON.stringify(initialCwd), 'from currentFolder =', JSON.stringify(db.getSetting?.('currentFolder')));
     // CWD priority: renderer's `state.folder` (via init message) > currentFolder setting > homedir.
     // `cwd` is `let` (not `const`) so the init handler can update it before spawnFor runs.
@@ -6289,7 +6378,7 @@ function startClaudeCodeServer() {
     // had been frozen as homedir → sessions landed in `~/.claude/projects/-Users-long/` not
     // `-Users-long-Documents-lastdraft-the-last-draft/`). Mirror the terminal panel's init
     // protocol (lines 2216-2320) so the renderer can correct the cwd before spawn.
-    let cwd = (db.getSetting && db.getSetting('currentFolder')) || os.homedir();
+    let cwd = currentFolderSetting() || os.homedir();
     const tabId = 'cc-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6);
     let term = null;
     let spawned = false;
@@ -6538,7 +6627,10 @@ function startClaudeCodeServer() {
   console.log(`[claude-code] WebSocket server listening on ws://localhost:${CLAUDE_CODE_WS_PORT}`);
 }
 
-ipcMain.handle('claudeCode:getWsUrl', () => `ws://localhost:${CLAUDE_CODE_WS_PORT}`);
+ipcMain.handle('claudeCode:getWsUrl', async () => {
+  const port = await wsBoundPort(claudeCodeWss);
+  return port ? `ws://localhost:${port}` : null;
+});
 ipcMain.handle('claudeCode:close', async (_event, tabId) => {
   // The renderer tracks the WS per tab; this is a no-op marker for symmetry
   // with terminal:close — the WS close handler in main does the actual cleanup.
@@ -6698,6 +6790,7 @@ ipcMain.handle('claudeCode:runLogin', async () => {
 // `codex resume` picker support is a v2 item.
 const CODEX_WS_PORT = 9225;
 let codexWss = null;
+let codexWsReady = null;
 
 function startCodexServer() {
   if (!pty) {
@@ -6728,7 +6821,7 @@ function startCodexServer() {
       console.warn('[codex] could not mark workspace trusted:', e.message);
     }
   };
-  markCodexTrusted((db.getSetting && db.getSetting('currentFolder')) || os.homedir());
+  markCodexTrusted(currentFolderSetting() || os.homedir());
   if (codexWss) return;
 
   const codexPathAtBoot = findCodexPath();
@@ -6738,7 +6831,8 @@ function startCodexServer() {
     console.log(`[codex] using codex at: ${codexPathAtBoot}`);
   }
 
-  codexWss = new WebSocket.Server({ port: CODEX_WS_PORT });
+  codexWss = new WebSocket.Server({ port: preferredWsPort(CODEX_WS_PORT) });
+  codexWsReady = wsBoundPort(codexWss);
   // See startTerminalServer() — an unhandled 'error' here crashes the whole
   // main process and aborts the remainder of app.whenReady().
   codexWss.on('error', (err) => {
@@ -6755,7 +6849,7 @@ function startCodexServer() {
     // cwd protocol mirrors the Claude Code panel: renderer sends `init`
     // with state.folder before `spawn`, so the PTY lands in the project
     // folder even when the panel mounts before a folder is opened.
-    let cwd = (db.getSetting && db.getSetting('currentFolder')) || os.homedir();
+    let cwd = currentFolderSetting() || os.homedir();
     const tabId = 'cx-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6);
     let term = null;
     let spawned = false;
@@ -6829,7 +6923,10 @@ function startCodexServer() {
   console.log(`[codex] WebSocket server listening on ws://localhost:${CODEX_WS_PORT}`);
 }
 
-ipcMain.handle('codex:getWsUrl', () => `ws://localhost:${CODEX_WS_PORT}`);
+ipcMain.handle('codex:getWsUrl', async () => {
+  const port = await wsBoundPort(codexWss);
+  return port ? `ws://localhost:${port}` : null;
+});
 ipcMain.handle('codex:close', async (_event, tabId) => {
   // Symmetry with claudeCode:close — the WS close handler in main does
   // the actual PTY cleanup.
@@ -6938,7 +7035,111 @@ ipcMain.handle('codex:runLogin', async () => {
   });
 });
 
-ipcMain.handle('terminal:getWsUrl', () => `ws://localhost:${TERMINAL_WS_PORT}`);
+ipcMain.handle('terminal:getWsUrl', async () => {
+  const port = await wsBoundPort(terminalWss);
+  return port ? `ws://localhost:${port}` : null;
+});
+
+// --- Account / device pairing (Settings → Account) -------------------------
+// Pairing used to require dropping to a terminal and running
+// `node src/pair-device.js`. These IPCs run the same RFC 8628 flow in-app.
+// The long poll lives in main (not the renderer) so it survives the settings
+// overlay being closed mid-flow.
+let pairingAbort = null;
+
+// The renderer had no way to open a URL in the real browser — links only
+// escaped via setWindowOpenHandler. The pairing panel needs an explicit one.
+// Restricted to http/https so a compromised renderer can't launch file:// or
+// a custom scheme handler.
+ipcMain.handle('app:openExternal', (_event, url) => {
+  try {
+    const parsed = new URL(String(url));
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return { ok: false, error: 'unsupported scheme' };
+    }
+    openExternalSafe(parsed.toString());
+    return { ok: true };
+  } catch {
+    return { ok: false, error: 'invalid url' };
+  }
+});
+
+function broadcastPairing(payload) {
+  for (const w of BrowserWindow.getAllWindows()) {
+    if (!w.isDestroyed()) w.webContents.send('account:pairing', payload);
+  }
+}
+
+ipcMain.handle('account:status', async () => {
+  try {
+    return await devicePairing.pairingStatus();
+  } catch (e) {
+    return { paired: false, locked: false, error: e.message };
+  }
+});
+
+ipcMain.handle('account:pairStart', async () => {
+  if (pairingAbort) return { ok: false, error: 'Pairing already in progress.' };
+  const controller = new AbortController();
+  pairingAbort = controller;
+
+  // Kick the flow off without awaiting it — the renderer gets the user code
+  // through the 'account:pairing' broadcast and the poll continues in main.
+  (async () => {
+    try {
+      const result = await devicePairing.runDeviceFlow({
+        signal: controller.signal,
+        onCode: (code) => broadcastPairing({ state: 'awaiting', ...code }),
+      });
+      if (result.status === 'approved') {
+        // Reconnect the relay with the new identity so pairing takes effect
+        // without a relaunch.
+        let reconnected = false;
+        try {
+          reconnected = getRelayClient().applyDeviceToken(result.token);
+        } catch (e) {
+          console.warn('[account] relay reconnect after pairing failed:', e.message);
+        }
+        broadcastPairing({
+          state: 'paired',
+          instanceId: result.instanceId,
+          reconnected,
+        });
+      } else {
+        broadcastPairing({ state: result.status });
+      }
+    } catch (e) {
+      broadcastPairing({ state: 'error', error: e.message });
+    } finally {
+      pairingAbort = null;
+    }
+  })();
+
+  return { ok: true };
+});
+
+ipcMain.handle('account:pairCancel', async () => {
+  if (pairingAbort) {
+    pairingAbort.abort();
+    pairingAbort = null;
+    broadcastPairing({ state: 'cancelled' });
+  }
+  return { ok: true };
+});
+
+ipcMain.handle('account:unpair', async () => {
+  try {
+    await devicePairing.deleteStoredToken();
+    try {
+      getRelayClient().applyDeviceToken(null);
+    } catch (e) {
+      console.warn('[account] relay reset after unpair failed:', e.message);
+    }
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
 
 // Relay IPC: renderer → main → relay
 ipcMain.handle('relay:send', async (_event, msg) => {
@@ -6971,7 +7172,7 @@ function getActiveTerminalPty() {
 }
 
 async function runShellCommand(command, opts = {}) {
-  const folder = db.getSetting('currentFolder');
+  const folder = currentFolderSetting();
   if (!folder) return { ok: false, error: 'no_folder', message: 'No workspace folder open' };
   if (!command || typeof command !== 'string') return { ok: false, error: 'bad_input', message: 'command required' };
   const pipeToActiveTerminal = opts.pipeToActiveTerminal !== false;
@@ -7118,7 +7319,7 @@ ipcMain.handle('terminal:close', async (_event, tabId) => {
 // and can switch between them or start a new one.
 // ------------------------------------------------------------
 function getActiveWorkspacePath() {
-  return db.getSetting('currentFolder') || null;
+  return currentFolderSetting();
 }
 
 ipcMain.handle('chatConv:list', async () => {
