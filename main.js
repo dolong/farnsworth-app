@@ -701,6 +701,17 @@ function buildMenu() {
       role: 'help',
       submenu: [
         {
+          label: 'Check for Updates…',
+          // Manual trigger for the same autoUpdater.checkForUpdates() the
+          // 6-hour background timer calls (Jul 29, v0.1.13). Routed through
+          // 'menu:action' -> renderer so the result can surface as a toast:
+          // the pill itself stays silent for 'current'/'offline' on purpose
+          // (see updaterState comments), but a user who explicitly asked
+          // deserves an answer even when the answer is "nothing to do".
+          click: () => sendMenuAction('checkForUpdates'),
+        },
+        { type: 'separator' },
+        {
           label: 'Farnsworth on GitHub',
           click: () => openExternalSafe('https://github.com/TheAnomalyXYZ/farnsworth'),
         },

@@ -8996,6 +8996,43 @@ async function handleMenuAction(action) {
     case 'focusFileFinder':
       openFileFinderOverlay();
       break;
+    case 'checkForUpdates':
+      runManualUpdateCheck();
+      break;
+  }
+}
+
+// Help → Check for Updates… (Jul 29). The background 6-hour timer and this
+// share the same autoUpdater.checkForUpdates() call in main.js -- the only
+// difference is that a manual check owes the user an answer even when the
+// pill has nothing to show. The pill stays silent for 'current'/'offline'
+// by design (see updater:state comments in main.js): that's correct for a
+// background poll nobody asked for, but wrong for someone who just clicked
+// a menu item. This surfaces the same three quiet states as a toast instead.
+async function runManualUpdateCheck() {
+  if (!window.farnsworth?.updaterCheck) return;
+  try {
+    const res = await window.farnsworth.updaterCheck();
+    // updater:check returns { ok:false, error } directly (no state change)
+    // when updates are disabled -- e.g. a dev build. Surface that too,
+    // rather than silently doing nothing.
+    if (res && res.ok === false) {
+      showToast(res.error || 'Update check failed.');
+      return;
+    }
+    const st = await window.farnsworth.updaterGetState?.();
+    if (!st) return;
+    if (st.status === 'current') {
+      showToast(`You're up to date (v${st.version || st.currentVersion || '?'}).`);
+    } else if (st.status === 'offline') {
+      showToast("Couldn't check for updates -- you appear to be offline.");
+    } else if (st.status === 'error') {
+      showToast('Update check failed: ' + (st.message || 'unknown error'));
+    }
+    // 'available' / 'downloading' / 'ready' need no toast -- the titlebar
+    // pill already covers those.
+  } catch (e) {
+    showToast('Update check failed: ' + (e?.message || e));
   }
 }
 
