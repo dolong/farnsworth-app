@@ -122,8 +122,10 @@ class RelayClient {
       this.reconnectTimer = null;
     }
     if (this.ws) {
-      try { this.ws.close(); } catch { /* already closing */ }
-      this.ws = null;
+      const dying = this.ws;
+      // Do NOT null this.ws here -- connect() overwrites it a line later, and
+      // the close guard identifies the dying socket by comparison.
+      try { dying.close(); } catch { /* already closing */ }
     }
     this.connect();
     return true;
@@ -190,6 +192,20 @@ class RelayClient {
     });
 
     ws.on('close', (code, reason) => {
+      // Only the CURRENT socket may drive reconnection.
+      //
+      // WebSocket.close() is asynchronous, so a socket we deliberately
+      // superseded (applyDeviceToken swapping identity, or a racing
+      // reconnect) fires its 'close' AFTER its replacement is already live.
+      // Without this guard that late event nulled `this.ws` -- clobbering the
+      // healthy socket -- and scheduled another connect. That second socket
+      // made the relay evict the first as "replaced", whose close scheduled
+      // another connect, and so on: a self-sustaining flap that reconnected
+      // ~35 times in 45 seconds and never settled.
+      if (this.ws !== ws) {
+        console.log(`[relay-client] stale socket closed (code=${code}) — ignoring`);
+        return;
+      }
       console.log(`[relay-client] disconnected (code=${code} reason=${reason || ''})`);
       this.ws = null;
       this._setStatus('disconnected');
@@ -197,6 +213,7 @@ class RelayClient {
     });
 
     ws.on('error', (err) => {
+      if (this.ws !== ws) return; // superseded socket; its close is ignored too
       console.warn(`[relay-client] ws error: ${err.message}`);
       // 'close' fires after, which handles reconnect
     });
