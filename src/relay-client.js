@@ -34,7 +34,15 @@ function signJwt(payload, secret) {
   return `${h}.${p}.${sig}`;
 }
 
-const RELAY_URL = process.env.RELAY_URL || 'ws://localhost:7778/api/v1/ws';
+// Default to the live relay, not localhost. RELAY_URL is exported by the
+// /Applications wrapper script, but that is only ONE of the ways this app
+// starts -- a dev-tree launch, or a second instance started with
+// --instance=<name>, inherits no wrapper env at all and would silently dial a
+// local relay that isn't running. It reconnects forever, never reaches the
+// account, and never appears in the companion picker.
+//
+// Local relay development now opts IN by exporting RELAY_URL explicitly.
+const RELAY_URL = process.env.RELAY_URL || 'wss://relay.farnsworth.tv/api/v1/ws';
 const RELAY_JWT_SECRET = process.env.RELAY_JWT_SECRET || 'dev-secret';
 const RELAY_TENANT_ID = process.env.RELAY_TENANT_ID || 'default';
 // A paired desktop presents a long-lived device token (minted by

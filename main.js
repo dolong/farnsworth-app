@@ -5921,6 +5921,32 @@ app.whenReady().then(async () => {
   try {
     const relayClient = getRelayClient();
     relayClient.start();
+
+    // Hydrate the device token from the Keychain when the environment did not
+    // supply one.
+    //
+    // RELAY_DEVICE_TOKEN is injected by the /Applications wrapper script,
+    // which is only one of several ways this app starts: a dev-tree launch, a
+    // second instance started with --instance=<name>, or anything spawned
+    // outside that wrapper all begin life UNPAIRED and quietly fall back to
+    // shared-secret tenantId routing -- so they never show up under the
+    // account in the companion picker.
+    //
+    // Settings -> Account reads the Keychain directly, so without this the UI
+    // would report "Paired" while the live relay socket was anything but.
+    if (!process.env.RELAY_DEVICE_TOKEN) {
+      devicePairing.readStoredToken()
+        .then(({ token, locked }) => {
+          if (locked) {
+            console.warn('[relay] Keychain locked; staying unpaired until unlock');
+            return;
+          }
+          if (!token) return;
+          relayClient.applyDeviceToken(token);
+          console.log('[relay] device token hydrated from Keychain');
+        })
+        .catch((e) => console.warn('[relay] Keychain token read failed:', e.message));
+    }
     // Forward ALL incoming relay messages to the renderer over IPC (wildcard).
     // Previously this registered four specific types (chat / command /
     // canvas:subscribe / canvas:state); the wildcard makes new protocol types
