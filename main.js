@@ -495,7 +495,19 @@ let mainWindow;
 // "New Window" can spawn a sibling instead of stealing focus from the
 // focused one. mainWindow stays as a reference for single-window flows.
 const openWindows = [];
-const userDataPath = () => path.join(app.getPath('userData'), 'farnsworth');
+// Deliberately SHARED_USER_DATA, not app.getPath('userData').
+//
+// A named instance calls app.setPath('userData', .../instances/<name>) so
+// Chromium gets its own profile (and, usefully, its own ProcessSingleton
+// lock). But this path is the DATA root -- SQLite db, settings, memory,
+// encrypted API keys. Deriving it from the relocated userData gave every
+// named instance a brand-new EMPTY database: no API keys, no chat history,
+// no workspace folder. Verified: launching --instance=<name> silently
+// created .../instances/<name>/farnsworth/farnsworth.db.
+//
+// It also made "the shared DB is untouched" look true when checked by mtime,
+// because the instance was busy writing a different file entirely.
+const userDataPath = () => path.join(SHARED_USER_DATA, 'farnsworth');
 
 // Helper: send a menu action to the focused window (or the most recent
 // one if nothing is focused). Lets the native menu drive renderer state
@@ -1605,7 +1617,7 @@ ipcMain.handle('recent:get', async () => db.getRecentFolders(10));
 // Real install facts for Settings -> About (Jul 13). The DB can live one
 // level deeper than userData (CFBundleName nesting) -- probe both.
 ipcMain.handle('app:info', async () => {
-  const userData = app.getPath('userData');
+  const userData = SHARED_USER_DATA; // the db is shared across instances
   let dbPath = null, dbSize = 0;
   for (const cand of [path.join(userData, 'farnsworth', 'farnsworth.db'), path.join(userData, 'farnsworth.db')]) {
     try { const st = fsSync.statSync(cand); if (st.size > 0) { dbPath = cand; dbSize = st.size; break; } } catch {}
@@ -4570,11 +4582,15 @@ const AGENT_TOOLS = [
   },
   {
     name: 'run_command',
-    description: 'Run a shell command in the workspace directory. Returns stdout, stderr, and exit code. Timeout 30s.',
+    description: 'Run a shell command in the workspace directory. Returns stdout, stderr, and exit code. Defaults to a 30s timeout; pass timeout_ms for slow commands (builds, test suites, installs, deploys/uploads) so they are not killed mid-flight.',
     input_schema: {
       type: 'object',
       properties: {
-        command: { type: 'string', description: 'Shell command to execute (e.g. "ls -la", "node -v")' }
+        command: { type: 'string', description: 'Shell command to execute (e.g. "ls -la", "node -v")' },
+        timeout_ms: {
+          type: 'number',
+          description: 'Optional timeout in milliseconds. Default 30000 (30s), maximum 900000 (15 min). Use a larger value for npm install / builds / test suites / publish or deploy commands, which routinely exceed 30s.'
+        }
       },
       required: ['command']
     }
@@ -4804,6 +4820,7 @@ async function executeAgentTool(name, input) {
     return await runShellCommand(input.command, {
       pipeToActiveTerminal: false,
       sandboxProfile: 'farnsworth-chat-run',
+      timeoutMs: input.timeout_ms,
     });
   }
   // -------------------------------------------------------------------
@@ -7224,12 +7241,28 @@ function getActiveTerminalPty() {
   return best;
 }
 
+// Command timeout budget. The default stays 30s so ordinary commands still
+// fail fast, but a hardcoded 30s made whole classes of real work impossible
+// from the chat agent: `npm install`, a full build, a test suite, or
+// `npm run launch` (type-check && lint && test && devvit upload && publish)
+// all blow past it and got SIGTERM'd mid-flight, which for an upload or a
+// publish means killing it partway through a network operation.
+const DEFAULT_COMMAND_TIMEOUT_MS = 30000;
+const MAX_COMMAND_TIMEOUT_MS = 15 * 60 * 1000;
+
+function resolveCommandTimeout(requested) {
+  const n = Number(requested);
+  if (!Number.isFinite(n) || n <= 0) return DEFAULT_COMMAND_TIMEOUT_MS;
+  return Math.min(Math.floor(n), MAX_COMMAND_TIMEOUT_MS);
+}
+
 async function runShellCommand(command, opts = {}) {
   const folder = currentFolderSetting();
   if (!folder) return { ok: false, error: 'no_folder', message: 'No workspace folder open' };
   if (!command || typeof command !== 'string') return { ok: false, error: 'bad_input', message: 'command required' };
   const pipeToActiveTerminal = opts.pipeToActiveTerminal !== false;
   const sandboxProfile = opts.sandboxProfile || null;
+  const timeoutMs = resolveCommandTimeout(opts.timeoutMs);
   // If a sandbox profile is requested, spawn through nono wrap so the
   // command runs under Seatbelt. This is the chat-agent run_command
   // path -- without it, an LLM could prompt-inject into reading
@@ -7242,7 +7275,7 @@ async function runShellCommand(command, opts = {}) {
   if (sandboxProfile) {
     const nonoBin = findNonoPath();
     if (nonoBin) {
-      return await runSandboxedCommand(nonoBin, sandboxProfile, command, folder);
+      return await runSandboxedCommand(nonoBin, sandboxProfile, command, folder, timeoutMs);
     }
     console.warn('[runShellCommand] sandbox profile requested but nono not found, running unsandboxed');
   }
@@ -7255,7 +7288,7 @@ async function runShellCommand(command, opts = {}) {
   // (b) re-execute side-effecting commands a second time. The terminal chip
   // in the chat message renders the captured output inline.
   return await new Promise((resolve) => {
-    exec(command, { cwd: folder, maxBuffer: 1024 * 1024, timeout: 30000 }, (err, stdout, stderr) => {
+    exec(command, { cwd: folder, maxBuffer: 8 * 1024 * 1024, timeout: timeoutMs }, (err, stdout, stderr) => {
       if (pipeToActiveTerminal) {
         const activePty = getActiveTerminalPty();
         if (activePty) {
@@ -7283,7 +7316,7 @@ async function runShellCommand(command, opts = {}) {
 // npm scripts, etc.) recursively walks the entire macOS filesystem,
 // easily exceeding the 30s timeout and orphaning the spawn. See
 // [[farnsworth-chat-agent]] § run_command nono-wrap cwd bug (Jul 14).
-async function runSandboxedCommand(nonoBin, profileName, command, folder) {
+async function runSandboxedCommand(nonoBin, profileName, command, folder, timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS) {
   const { spawn } = require('child_process');
   return await new Promise((resolve) => {
     let stdout = '';
@@ -7325,13 +7358,19 @@ async function runSandboxedCommand(nonoBin, profileName, command, folder) {
     const timer = setTimeout(() => {
       timedOut = true;
       try { child.kill('SIGTERM'); } catch {}
-    }, 30000);
+    }, timeoutMs);
     child.on('close', code => {
       clearTimeout(timer);
       resolve({
         ok: code === 0 && !timedOut,
         stdout,
-        stderr: timedOut ? stderr + '\ntimeout (30s)' : stderr,
+        // Name the budget and how to raise it. A bare "timeout" reads like the
+        // command failed, and the agent then invents a reason it failed.
+        stderr: timedOut
+          ? stderr + `\ntimeout: killed after ${Math.round(timeoutMs / 1000)}s.`
+            + ` If this command is legitimately slow (build, test suite, install, upload/publish),`
+            + ` re-run it with a larger timeout_ms (max ${MAX_COMMAND_TIMEOUT_MS / 1000}s).`
+          : stderr,
         exitCode: timedOut ? 124 : (typeof code === 'number' ? code : 1),
       });
     });
