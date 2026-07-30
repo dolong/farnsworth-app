@@ -271,9 +271,31 @@ autoUpdater.on('error', (err) => {
 // before it was listening (see the comment on updaterState above).
 ipcMain.handle('updater:state', async () => ({ ...updaterState, currentVersion: app.getVersion() }));
 
+// `app.isPackaged` LIES in this dev tree. Electron implements it as
+// `path.basename(process.execPath) !== 'electron'` -- and we renamed the dev
+// Electron bundle to Farnsworth.app (for the Dock icon), so execPath ends in
+// "Farnsworth" and isPackaged reports TRUE while running from source.
+//
+// Result: the boot update check fired on the dev tree and electron-updater
+// died on ENOENT app-update.yml, leaving a permanent "Update failed" pill.
+//
+// `process.defaultApp` is the honest signal (set when Electron is launched
+// with a path argument, i.e. `electron <dir>`), and the app-update.yml probe
+// is belt-and-braces: it is the exact file electron-updater needs, so if it
+// is absent there is nothing to check against no matter how we got here.
+function updatesSupported() {
+  if (process.defaultApp) return false;
+  if (!app.isPackaged) return false;
+  try {
+    return fsSync.existsSync(path.join(process.resourcesPath, 'app-update.yml'));
+  } catch {
+    return false;
+  }
+}
+
 // Manual "check now", for the user who does not want to wait for the timer.
 ipcMain.handle('updater:check', async () => {
-  if (!app.isPackaged) return { ok: false, error: 'Updates are disabled in a dev build.' };
+  if (!updatesSupported()) return { ok: false, error: 'Updates are disabled in a dev build.' };
   try {
     await autoUpdater.checkForUpdates();
     return { ok: true };
@@ -5897,7 +5919,7 @@ app.whenReady().then(async () => {
   // timer, and skip the check once something is already downloading or
   // waiting to install so we do not restart a 350 MB download.
   // ====================================================================
-  if (app.isPackaged) {
+  if (updatesSupported()) {
     const runUpdateCheck = (reason) => {
       if (updaterState.status === 'downloading' || updaterState.status === 'ready') return;
       console.log('[autoUpdater] check (' + reason + ')');
