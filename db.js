@@ -332,6 +332,18 @@ function init(userDataPath, electronSafeStorage) {
   if (!taskCols.includes('file_link')) {
     try { db.exec('ALTER TABLE tasks ADD COLUMN file_link TEXT'); } catch (_) {}
   }
+  // Per-folder provenance for conversational memory (Aug 1 2026). The Tier 2
+  // code index was always per-workspace (workspace_path is part of
+  // memory_indexed_files' primary key), but facts were fully global — there
+  // was no way to tell a the-last-draft fact from a dontdie-reddit one.
+  // These columns record WHERE a fact came from; recall still spans projects
+  // so identity/preference facts stay global.
+  for (const [table, col] of [['memory_buffer', 'workspace_path'], ['memory_archive', 'workspace_path']]) {
+    try {
+      const cols = db.prepare(`PRAGMA table_info(${table})`).all().map(r => r.name);
+      if (cols.length && !cols.includes(col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} TEXT`);
+    } catch (_) {}
+  }
   db.pragma('foreign_keys = ON');
   db.exec(SCHEMA);
   // Always create the codebase indexer tables (Tier 2 baseline). These
@@ -374,6 +386,7 @@ function init(userDataPath, electronSafeStorage) {
   // migration (idempotent — skips when rows already exist).
   try { memoryRebuildAllSections(false); } catch (e) { console.warn('[memory v3] boot rebuild failed:', e.message); }
   try { memoryEnsureLanes(); } catch (e) { console.warn('[memory v3.1] lane ensure failed:', e.message); }
+  try { memoryBackfillWorkspacePaths(); } catch (e) { console.warn('[memory] workspace backfill failed:', e.message); }
   try { memoryRebuildAllConversationsFts(false); } catch (e) { console.warn('[memory v3.1] conversations fts backfill failed:', e.message); }
   return db;
 }
@@ -1006,12 +1019,12 @@ function memoryDeleteConcept(slug) {
 }
 
 // ---- Buffer (raw facts learned this session) ----
-function memoryBufferAppend(content, context = null, source = null) {
+function memoryBufferAppend(content, context = null, source = null, workspacePath = null) {
   if (!db || !content) return { ok: false, error: 'missing_content' };
   try {
     const info = db.prepare(`
-      INSERT INTO memory_buffer (content, context, source) VALUES (?, ?, ?)
-    `).run(content, context, source);
+      INSERT INTO memory_buffer (content, context, source, workspace_path) VALUES (?, ?, ?, ?)
+    `).run(content, context, source, workspacePath);
     return { ok: true, id: info.lastInsertRowid };
   } catch (e) {
     return { ok: false, error: e.message };
@@ -1021,8 +1034,42 @@ function memoryBufferAppend(content, context = null, source = null) {
 function memoryBufferList(onlyUnconsolidated = true, limit = 50) {
   if (!db) return [];
   return onlyUnconsolidated
-    ? db.prepare('SELECT id, content, context, source, created_at FROM memory_buffer WHERE consolidated = 0 ORDER BY id ASC LIMIT ?').all(limit)
-    : db.prepare('SELECT id, content, context, source, created_at, consolidated FROM memory_buffer ORDER BY id DESC LIMIT ?').all(limit);
+    ? db.prepare('SELECT id, content, context, source, workspace_path, created_at FROM memory_buffer WHERE consolidated = 0 ORDER BY id ASC LIMIT ?').all(limit)
+    : db.prepare('SELECT id, content, context, source, workspace_path, created_at, consolidated FROM memory_buffer ORDER BY id DESC LIMIT ?').all(limit);
+}
+
+// Recover per-folder provenance for rows written before workspace_path
+// existed. Two joins: chat rows carry context 'conv=<id>' and
+// chat_conversations knows the workspace; retrospective rows carry
+// 'retrospective: <title>' and join on the conversation title instead.
+// Idempotent — only fills rows that are still NULL.
+function memoryBackfillWorkspacePaths() {
+  if (!db) return { ok: false, error: 'no_db' };
+  const out = { conv: 0, retro: 0 };
+  try {
+    const convCols = db.prepare('PRAGMA table_info(chat_conversations)').all().map(r => r.name);
+    if (!convCols.includes('workspace_path')) return { ok: true, skipped: 'no_workspace_path_on_conversations' };
+    out.conv = db.prepare(`
+      UPDATE memory_buffer SET workspace_path = (
+        SELECT c.workspace_path FROM chat_conversations c
+        WHERE 'conv=' || c.id = memory_buffer.context AND c.workspace_path IS NOT NULL
+      )
+      WHERE workspace_path IS NULL AND context LIKE 'conv=%'
+    `).run().changes;
+    out.retro = db.prepare(`
+      UPDATE memory_buffer SET workspace_path = (
+        SELECT c.workspace_path FROM chat_conversations c
+        WHERE 'retrospective: ' || c.title = memory_buffer.context AND c.workspace_path IS NOT NULL
+        ORDER BY c.id DESC LIMIT 1
+      )
+      WHERE workspace_path IS NULL AND context LIKE 'retrospective: %'
+    `).run().changes;
+    if (out.conv || out.retro) console.log(`[memory] workspace backfill: ${out.conv} conv + ${out.retro} retrospective rows tagged`);
+    return { ok: true, ...out };
+  } catch (e) {
+    console.warn('[memory] workspace backfill failed:', e.message);
+    return { ok: false, error: e.message };
+  }
 }
 
 function memoryBufferMarkConsolidated(id) {
@@ -1036,16 +1083,16 @@ function memoryBufferMarkConsolidated(id) {
 }
 
 // ---- Archive (immutable daily log) ----
-function memoryArchiveAppend(kind, content, metadata = null, day = null) {
+function memoryArchiveAppend(kind, content, metadata = null, day = null, workspacePath = null) {
   if (!db || !kind || !content) return { ok: false, error: 'missing_kind_or_content' };
   const now = new Date();
   const d = day || now.toISOString().slice(0, 10);
   const ts = now.toISOString();
   try {
     const info = db.prepare(`
-      INSERT INTO memory_archive (day, ts, kind, content, metadata)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(d, ts, kind, content, metadata ? JSON.stringify(metadata) : null);
+      INSERT INTO memory_archive (day, ts, kind, content, metadata, workspace_path)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(d, ts, kind, content, metadata ? JSON.stringify(metadata) : null, workspacePath);
     return { ok: true, id: info.lastInsertRowid };
   } catch (e) {
     return { ok: false, error: e.message };
@@ -2020,7 +2067,7 @@ module.exports = {
   devvitGetProjectSettings, devvitSetProjectSettings, devvitInitDefaultsForProject,
   memoryListEssentials, memoryGetEssential, memorySetEssential, memoryDeleteEssential,
   memoryListConcepts, memoryGetConcept, memoryUpsertConcept, memoryDeleteConcept,
-  memoryBufferAppend, memoryBufferList, memoryBufferMarkConsolidated,
+  memoryBufferAppend, memoryBufferList, memoryBufferMarkConsolidated, memoryBackfillWorkspacePaths,
   memoryArchiveAppend, memoryArchiveList,
   memoryRecall, memoryBootstrap, memoryConsolidate,
   // v3 — section-grain concepts + stage stats

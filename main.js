@@ -2817,7 +2817,7 @@ ipcMain.handle('test:delete', async (_event, { folder, name }) => {
 
 const MEMORY_STAGE_DEFAULTS = {
   extraction:    { enabled: true, model: 'Haiku 4.5', tier: 'speed',    extract: ['Corrections', 'Preferences', 'Decisions'], noiseFilter: true },
-  consolidation: { enabled: true, model: 'Sonnet 5',  tier: 'balanced', schedule: 'Daily', autoOnBuffer: true, bufferThreshold: 50 },
+  consolidation: { enabled: true, model: 'Sonnet 5',  tier: 'balanced', schedule: 'Daily', autoOnBuffer: true, bufferThreshold: 50, batchSize: 12, maxTokens: 8192 },
   retrieval:     { enabled: true, model: 'Sonnet 5',  tier: 'balanced', depth: 'Standard', summariesFirst: true, graphSpread: true },
   router:        { enabled: true, model: 'Haiku 4.5', tier: 'speed',    bucketBudget: 3, gate: true },
   l2selector:    { enabled: true, model: 'Haiku 4.5', tier: 'speed' },
@@ -2854,10 +2854,40 @@ function memoryParseJson(text) {
   try { return JSON.parse(t.slice(start, end + 1)); } catch { return null; }
 }
 
+// Recover the complete op objects from a TRUNCATED ops array. The model emits
+// ops in order, so everything before the cut is perfectly good — but the old
+// all-or-nothing JSON.parse threw away an entire pass because the last op was
+// half-written. Scans balanced braces outside of string literals.
+function memorySalvageOps(text) {
+  if (!text || typeof text !== 'string') return [];
+  const key = text.indexOf('"ops"');
+  if (key === -1) return [];
+  const arrStart = text.indexOf('[', key);
+  if (arrStart === -1) return [];
+  const ops = [];
+  let depth = 0, objStart = -1, inStr = false, esc = false;
+  for (let i = arrStart + 1; i < text.length; i++) {
+    const ch = text[i];
+    if (esc) { esc = false; continue; }
+    if (ch === '\\') { esc = true; continue; }
+    if (ch === '"') { inStr = !inStr; continue; }
+    if (inStr) continue;
+    if (ch === '{') { if (depth === 0) objStart = i; depth++; }
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0 && objStart !== -1) {
+        try { ops.push(JSON.parse(text.slice(objStart, i + 1))); } catch {}
+        objStart = -1;
+      }
+    } else if (ch === ']' && depth === 0) break;
+  }
+  return ops;
+}
+
 // One inference call for a pipeline stage, on the stage's configured model.
 // Returns the response text, or null (stage disabled / no auth / API error).
 // Callers MUST degrade to their non-model behavior on null.
-async function memoryStageInference(stage, system, user, maxTokens = 512) {
+async function memoryStageInference(stage, system, user, maxTokens = 512, meta = null) {
   const conf = memoryStageConf(stage);
   if (!conf.enabled) return null;
   const auth = await getValidAccessToken();
@@ -2886,8 +2916,31 @@ async function memoryStageInference(stage, system, user, maxTokens = 512) {
       return null;
     }
     const data = await res.json();
-    const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text || '').join('');
-    db.memoryStageStatsPatch(stage, { lastRun: new Date().toISOString(), ms, model, lastError: null }, true);
+    const blocks = data.content || [];
+    const text = blocks.filter(b => b.type === 'text').map(b => b.text || '').join('');
+    // A 200 OK is NOT success for this pipeline. Two silent failure modes,
+    // both of which stalled consolidation from Jul 14 → Aug 1 2026 while
+    // lastError stayed null and the run counter kept climbing:
+    //   1. the model burns the whole budget on thinking blocks → text is ''
+    //      → the caller sees a falsy result and reports 'inference_unavailable'
+    //   2. the model stops mid-JSON at max_tokens → JSON.parse throws
+    //      → the caller reports 'bad_model_output'
+    // Neither was an HTTP error, so neither was ever recorded. Record them.
+    const truncated = data.stop_reason === 'max_tokens';
+    if (meta) {
+      meta.stopReason = data.stop_reason;
+      meta.blockTypes = blocks.map(b => b.type);
+      meta.textLen = text.length;
+      meta.outputTokens = data.usage?.output_tokens ?? null;
+      meta.truncated = truncated;
+    }
+    const softError = !text
+      ? `empty_text (stop=${data.stop_reason}, blocks=${blocks.map(b => b.type).join('+') || 'none'}, max_tokens=${maxTokens})`
+      : truncated
+        ? `truncated at max_tokens=${maxTokens} (output_tokens=${data.usage?.output_tokens ?? '?'})`
+        : null;
+    db.memoryStageStatsPatch(stage, { lastRun: new Date().toISOString(), ms, model, lastError: softError }, true);
+    if (softError) console.warn(`[memory tier3] ${stage}: ${softError}`);
     return text;
   } catch (e) {
     db.memoryStageStatsPatch(stage, { lastRun: new Date().toISOString(), ms: Date.now() - t0, model, lastError: e.message }, true);
@@ -2904,15 +2957,56 @@ async function runConsolidationPass(reason = 'manual') {
   if (consolidationRunning) return { ok: false, error: 'already_running' };
   consolidationRunning = true;
   try {
-    const buffer = db.memoryBufferList(true, 50);
-    if (!buffer.length) return { ok: true, processed: 0, reason };
+    return await drainConsolidation(reason);
+  } finally {
+    consolidationRunning = false;
+  }
+}
+
+// Drain the buffer in bounded batches. One batch per invocation meant a buffer
+// growing faster than the schedule could never catch up — with a daily tick and
+// a stuck pass, 228 rows had piled up by Aug 1 2026.
+async function drainConsolidation(reason) {
+  const MAX_BATCHES = 25;
+  const totals = { append: 0, create: 0, essential: 0, drop: 0, lane: 0 };
+  let processed = 0, batches = 0, last = null;
+  for (let i = 0; i < MAX_BATCHES; i++) {
+    last = await runConsolidationBatch(reason);
+    if (!last.ok || !last.processed) break; // error, or no forward progress
+    batches++;
+    processed += last.processed;
+    for (const k of Object.keys(totals)) totals[k] += (last.applied?.[k] || 0);
+    if (db.memoryUnconsolidatedCount() === 0) break;
+  }
+  const remaining = db.memoryUnconsolidatedCount();
+  console.log(`[memory tier3] consolidation drain (${reason}): ${processed} rows in ${batches} batches → ${JSON.stringify(totals)}; ${remaining} remaining`);
+  if (!batches && last && !last.ok) return { ...last, reason };
+  return { ok: true, processed, batches, applied: totals, remaining, reason };
+}
+
+async function runConsolidationBatch(reason = 'manual') {
+  {
     const conf = memoryStageConf('consolidation');
-    if (!conf.enabled) return db.memoryConsolidate(null); // Tier-1 behavior: flip flags
+    // Every buffered fact has to round-trip through the model's OUTPUT budget
+    // as a JSON op, so the batch size and the token ceiling are one decision.
+    // 50 rows never fit in the old hardcoded 2048 tokens.
+    const batchSize = Math.max(1, Math.min(50, Number(conf.batchSize) || 12));
+    const maxTokens = Math.max(2048, Math.min(16384, Number(conf.maxTokens) || 8192));
+    const buffer = db.memoryBufferList(true, batchSize);
+    if (!buffer.length) return { ok: true, processed: 0, reason };
+    if (!conf.enabled) return { ...db.memoryConsolidate(null), processed: 0 }; // Tier-1: flip flags
     const concepts = db.memoryListConcepts(100);
     const articleIndex = concepts.map(c => `- ${c.slug} — ${c.title}${c.lead ? ': ' + String(c.lead).slice(0, 120) : ''}`).join('\n') || '(no articles yet)';
-    const bufferLines = buffer.map(b => `[${b.id}] (${b.source || 'chat'}) ${String(b.content).slice(0, 400)}`).join('\n');
+    // Facts carry the project they came from so the model can attribute them
+    // instead of blending two codebases into one article.
+    const projectOf = (p) => (p ? String(p).split('/').filter(Boolean).pop() : null);
+    const bufferLines = buffer.map(b => {
+      const proj = projectOf(b.workspace_path);
+      return `[${b.id}] (${b.source || 'chat'}${proj ? `, project: ${proj}` : ''}) ${String(b.content).slice(0, 400)}`;
+    }).join('\n');
     const system = `You are the consolidation stage of an IDE assistant's memory system. Merge buffered facts into wiki-style concept articles. Prefer appending to existing articles; create an article only for a genuinely new durable topic. Use "essential" only for identity-level facts that must load every session. Use "drop" for noise, duplicates, and transient status.
 Two special always-loaded articles exist: 'threads' (open loops — active commitments, follow-ups, waiting-on-someone) and 'recent' (rolling digest of notable events, newest first). Keep them current: file open-loop facts into 'threads' and notable events into 'recent' (append, or a "lane" op to REPLACE the whole body when entries resolved or went stale — keep each lane under ~20 lines). "lane" ops take ids:[] and don't consume buffer ids.
+Buffer lines may carry "project: <name>" — that is the workspace the fact came from. Keep project-specific facts in project-specific articles (prefer a slug that names the project) and never merge facts from two different projects into one article. Facts about the user, their preferences, or their tools are global and carry no project.
 Every buffer id must appear in exactly one non-lane op. Return ONLY JSON:
 {"ops":[
  {"op":"append","ids":[1],"slug":"existing-slug","section":"section heading","content":"markdown to append"},
@@ -2922,13 +3016,23 @@ Every buffer id must appear in exactly one non-lane op. Return ONLY JSON:
  {"op":"drop","ids":[5]}
 ]}`;
     const user = `EXISTING ARTICLES:\n${articleIndex}\n\nBUFFER (unconsolidated facts):\n${bufferLines}`;
-    const text = await memoryStageInference('consolidation', system, user, 2048);
-    if (!text) return { ok: false, error: 'inference_unavailable', reason };
+    const meta = {};
+    const text = await memoryStageInference('consolidation', system, user, maxTokens, meta);
+    if (!text) {
+      db.memoryStageStatsSetGlobal('lastConsolidationError', `inference_unavailable (stop=${meta.stopReason || '?'}, blocks=${(meta.blockTypes || []).join('+') || 'none'})`);
+      return { ok: false, error: 'inference_unavailable', reason, meta };
+    }
     const parsed = memoryParseJson(text);
-    if (!parsed || !Array.isArray(parsed.ops)) return { ok: false, error: 'bad_model_output', reason };
+    // Truncated output is still partially usable — salvage the complete ops
+    // rather than discarding the whole pass.
+    const ops = (parsed && Array.isArray(parsed.ops)) ? parsed.ops : memorySalvageOps(text);
+    if (!ops.length) {
+      db.memoryStageStatsSetGlobal('lastConsolidationError', `bad_model_output (stop=${meta.stopReason || '?'}, textLen=${text.length})`);
+      return { ok: false, error: 'bad_model_output', reason, meta };
+    }
     const applied = { append: 0, create: 0, essential: 0, drop: 0, lane: 0 };
     const doneIds = new Set();
-    for (const op of parsed.ops) {
+    for (const op of ops) {
       const ids = Array.isArray(op.ids) ? op.ids.filter(id => buffer.find(b => b.id === id)) : [];
       try {
         if (op.op === 'append' && op.slug && op.content) {
@@ -2963,10 +3067,9 @@ Every buffer id must appear in exactly one non-lane op. Return ONLY JSON:
     }
     if (doneIds.size) db.memoryConsolidate([...doneIds]);
     db.memoryStageStatsSetGlobal('lastConsolidationAt', new Date().toISOString());
-    console.log(`[memory tier3] consolidation (${reason}): ${doneIds.size}/${buffer.length} buffer rows → ${JSON.stringify(applied)}`);
-    return { ok: true, processed: doneIds.size, total: buffer.length, applied, reason };
-  } finally {
-    consolidationRunning = false;
+    db.memoryStageStatsSetGlobal('lastConsolidationError', doneIds.size ? null : `applied_nothing (ops=${ops.length}, stop=${meta.stopReason || '?'})`);
+    console.log(`[memory tier3] consolidation batch (${reason}): ${doneIds.size}/${buffer.length} buffer rows → ${JSON.stringify(applied)}${meta.truncated ? ' [salvaged from truncated output]' : ''}`);
+    return { ok: true, processed: doneIds.size, total: buffer.length, applied, reason, meta };
   }
 }
 
@@ -3049,7 +3152,7 @@ async function runRetrospective(convId) {
   const items = Array.isArray(parsed?.items) ? parsed.items.slice(0, 8) : [];
   for (const item of items) {
     if (!item || !item.content) continue;
-    db.memoryBufferAppend(`[${item.kind || 'fact'}] ${item.content}`, `retrospective: ${conv.title || convId}`, 'retrospective');
+    db.memoryBufferAppend(`[${item.kind || 'fact'}] ${item.content}`, `retrospective: ${conv.title || convId}`, 'retrospective', conv.workspace_path || currentFolderSetting());
   }
   memoryRetroMarkDone(convId, conv.updated_at);
   if (items.length) maybeAutoConsolidate();
@@ -3129,7 +3232,8 @@ ipcMain.handle('memory:remember', async (_event, content, opts) => {
   const src = opts?.source || 'chat';
   const kind = opts?.kind || 'fact';
   // The immutable daily log always gets the raw content, extraction or not.
-  db.memoryArchiveAppend(kind, content, ctx ? { context: ctx, source: src } : { source: src });
+  const wsPath = opts?.workspacePath || currentFolderSetting();
+  db.memoryArchiveAppend(kind, content, ctx ? { context: ctx, source: src } : { source: src }, null, wsPath);
 
   // Stage 1: extraction. A cheap model distills the raw turn into durable
   // facts before anything enters the buffer. Disabled / no auth / bad
@@ -3159,7 +3263,7 @@ ipcMain.handle('memory:remember', async (_event, content, opts) => {
           let last = null;
           for (const item of parsed.items.slice(0, 6)) {
             if (!item || !item.content) continue;
-            last = db.memoryBufferAppend(`[${item.kind || 'fact'}] ${item.content}`, ctx, 'extraction');
+            last = db.memoryBufferAppend(`[${item.kind || 'fact'}] ${item.content}`, ctx, 'extraction', wsPath);
           }
           maybeAutoConsolidate();
           return { ok: true, extracted: parsed.items.length, id: last?.id };
@@ -3169,7 +3273,7 @@ ipcMain.handle('memory:remember', async (_event, content, opts) => {
       console.warn('[memory tier3] extraction failed, raw buffering:', e.message);
     }
   }
-  const bufferRes = db.memoryBufferAppend(content, ctx, src);
+  const bufferRes = db.memoryBufferAppend(content, ctx, src, wsPath);
   maybeAutoConsolidate();
   return bufferRes;
 });

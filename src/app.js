@@ -137,7 +137,7 @@ const state = {
     perCallSiteRouting: ROUTING_CALL_SITES.map(r => ({ ...r })),
     memory: {
       extraction: { enabled: true, model: 'Haiku 4.5', tier: 'speed', extract: ['Corrections', 'Preferences', 'Decisions'], noiseFilter: true },
-      consolidation: { enabled: true, model: 'Sonnet 5', tier: 'balanced', schedule: 'Daily', autoOnBuffer: true, bufferThreshold: 50 },
+      consolidation: { enabled: true, model: 'Sonnet 5', tier: 'balanced', schedule: 'Daily', autoOnBuffer: true, bufferThreshold: 50, batchSize: 12, maxTokens: 8192 },
       retrieval: { enabled: true, model: 'Sonnet 5', tier: 'balanced', depth: 'Standard', summariesFirst: true, graphSpread: true },
       router: { enabled: true, model: 'Haiku 4.5', tier: 'speed', bucketBudget: 3, gate: true },
       l2selector: { enabled: true, model: 'Haiku 4.5', tier: 'speed' },
@@ -8583,7 +8583,7 @@ async function loadSettings() {
     // chips were dead UI, so persisted models were never a user choice.
     const memDefaults = {
       extraction:    { enabled: true, model: 'Haiku 4.5', tier: 'speed',    extract: ['Corrections', 'Preferences', 'Decisions'], noiseFilter: true },
-      consolidation: { enabled: true, model: 'Sonnet 5',  tier: 'balanced', schedule: 'Daily', autoOnBuffer: true, bufferThreshold: 50 },
+      consolidation: { enabled: true, model: 'Sonnet 5',  tier: 'balanced', schedule: 'Daily', autoOnBuffer: true, bufferThreshold: 50, batchSize: 12, maxTokens: 8192 },
       retrieval:     { enabled: true, model: 'Sonnet 5',  tier: 'balanced', depth: 'Standard', summariesFirst: true, graphSpread: true },
       router:        { enabled: true, model: 'Haiku 4.5', tier: 'speed',    bucketBudget: 3, gate: true },
       l2selector:    { enabled: true, model: 'Haiku 4.5', tier: 'speed' },
