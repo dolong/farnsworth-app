@@ -4122,7 +4122,7 @@ pre:hover .code-copy { opacity: 1; }
   font-weight: 600;
   cursor: pointer;
   transition: all 0.15s ease;
-  margin-bottom: 28px;
+  margin-bottom: 10px;
 }
 
 .welcome__primary:hover {
@@ -4143,6 +4143,73 @@ pre:hover .code-copy { opacity: 1; }
 
 .welcome__recent {
   margin-bottom: 24px;
+}
+
+/* "Start from scratch" — scaffolds a new project from the Devvit template. */
+.welcome__secondary {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  width: 100%;
+  background: rgba(255, 255, 255, 0.04);
+  color: #d7dae1;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 10px;
+  padding: 13px 20px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  margin-bottom: 28px;
+}
+
+.welcome__secondary:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.07);
+  border-color: rgba(255, 255, 255, 0.18);
+  transform: translateY(-1px);
+}
+
+.welcome__secondary:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.welcome__tag {
+  margin-left: auto;
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 5px;
+  padding: 2px 7px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #8b90a0;
+}
+
+.welcome__scaffold {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: -18px 0 22px;
+  font-size: 12px;
+  color: #a5acc4;
+}
+
+.welcome__scaffold--error {
+  color: #ff7b72;
+}
+
+.welcome__scaffold-spinner {
+  flex: none;
+  width: 12px;
+  height: 12px;
+  border: 2px solid rgba(255, 255, 255, 0.18);
+  border-top-color: #5865f2;
+  border-radius: 50%;
+  animation: welcomeScaffoldSpin 0.7s linear infinite;
+}
+
+@keyframes welcomeScaffoldSpin {
+  to { transform: rotate(360deg); }
 }
 
 .welcome__recent-label {

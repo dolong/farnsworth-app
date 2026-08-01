@@ -8651,6 +8651,52 @@ async function openFolderPicker() {
   await handleFolderPicked(folderPath);
 }
 
+// "Start from scratch" — clone the Devvit vibe-coding template fork into a
+// new folder, personalize it, then open it like any other project.
+async function startFromScratch() {
+  if (!window.farnsworth?.newProjectDialog) return;
+  const btn = $('#welcome-scratch-btn');
+  const status = $('#welcome-scaffold-status');
+
+  const setStatus = (text, isError = false) => {
+    if (!status) return;
+    status.hidden = false;
+    status.className = 'welcome__scaffold' + (isError ? ' welcome__scaffold--error' : '');
+    status.innerHTML = isError ? '' : '<div class="welcome__scaffold-spinner"></div>';
+    status.appendChild(document.createTextNode(text));
+  };
+
+  const targetPath = await window.farnsworth.newProjectDialog();
+  if (!targetPath) return;
+
+  if (btn) btn.disabled = true;
+  setStatus('Creating project…');
+  const off = window.farnsworth.onScaffoldProgress?.((p) => setStatus(p?.detail || 'Working…'));
+
+  let res;
+  try {
+    res = await window.farnsworth.scaffoldProject(targetPath);
+  } catch (e) {
+    res = { ok: false, error: e?.message || String(e) };
+  }
+
+  if (off) off();
+  if (btn) btn.disabled = false;
+
+  if (!res?.ok) {
+    setStatus(res?.error || 'Could not create the project.', true);
+    return;
+  }
+
+  if (status) status.hidden = true;
+  if (res.installError) {
+    showToast(`Project created, but dependencies failed to install — run npm install in ${res.name}.`);
+  } else {
+    showToast(`Created ${res.name} — ready to Go Live.`);
+  }
+  await handleFolderPicked(res.path);
+}
+
 async function handleFolderPicked(folderPath) {
   state.folder = folderPath;
   // Persist to the global setting so PTYs spawned before the WS init
@@ -10855,6 +10901,10 @@ function wire() {
   // Welcome overlay open folder button
   const welcomeBtn = $('#welcome-open-btn');
   if (welcomeBtn) welcomeBtn.addEventListener('click', openFolderPicker);
+
+  // Welcome overlay "Start from scratch" — scaffold from the Devvit template
+  const scratchBtn = $('#welcome-scratch-btn');
+  if (scratchBtn) scratchBtn.addEventListener('click', startFromScratch);
 
   // App type picker cards
   $$('.apptype__card').forEach(card => {

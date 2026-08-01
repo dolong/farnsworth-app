@@ -1727,6 +1727,188 @@ ipcMain.handle('dialog:openFolder', async () => {
 });
 
 // ============================================================
+// NEW PROJECT SCAFFOLD (Aug 1 2026)
+// "Start from scratch" on the welcome screen clones Long's Devvit
+// vibe-coding template fork, personalizes it, gives it fresh git
+// history and a .farnsworth config, then installs dependencies.
+// ============================================================
+
+const FARNSWORTH_TEMPLATE_REPO = 'https://github.com/dolong/vibe-farnsworth-template.git';
+// Offline fallback. We clone the local repo's COMMITTED state (file:// clone),
+// never the working tree, so a dirty checkout can't leak into a new project.
+const FARNSWORTH_TEMPLATE_LOCAL = path.join(os.homedir(), 'Documents', 'vibe-farnsworth-template');
+const TEMPLATE_NAME_TOKEN = '<% name %>';
+
+// devvit.json's schema constrains the app name: ^[a-z][a-z0-9-]*$, 3-20 chars.
+// (Verified against developers.reddit.com/schema/config-file.v1.json.) An
+// invalid name here fails much later at `devvit upload`, so normalize now.
+function devvitSafeName(raw) {
+  let n = String(raw || '').toLowerCase()
+    .replace(/[^a-z0-9-]+/g, '-')
+    .replace(/-{2,}/g, '-')
+    .replace(/^[^a-z]+/, '')      // must start with a letter
+    .replace(/-+$/, '');
+  if (n.length > 20) n = n.slice(0, 20).replace(/-+$/, '');
+  if (n.length < 3) n = 'my-devvit-app';
+  return n;
+}
+
+function execFileAsync(file, args, opts = {}) {
+  const { execFile } = require('child_process');
+  return new Promise((resolve, reject) => {
+    execFile(file, args, { maxBuffer: 8 * 1024 * 1024, ...opts }, (err, stdout, stderr) => {
+      if (err) { err.stderr = stderr; err.stdout = stdout; return reject(err); }
+      resolve({ stdout, stderr });
+    });
+  });
+}
+
+ipcMain.handle('dialog:newProject', async (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender) || BrowserWindow.getFocusedWindow() || mainWindow;
+  const result = await dialog.showSaveDialog(win, {
+    title: 'Create new Farnsworth project',
+    defaultPath: path.join(app.getPath('documents'), 'my-devvit-game'),
+    buttonLabel: 'Create',
+    nameFieldLabel: 'Project name:',
+    properties: ['createDirectory'],
+  });
+  if (result.canceled || !result.filePath) return null;
+  return result.filePath;
+});
+
+ipcMain.handle('project:scaffold', async (event, targetPath) => {
+  const send = (detail) => {
+    try { event.sender.send('project:scaffold-progress', { detail }); } catch {}
+  };
+  try {
+    if (!targetPath) return { ok: false, error: 'No project path given.' };
+
+    const parent = path.dirname(targetPath);
+    if (!fsSync.existsSync(parent)) return { ok: false, error: `Parent folder does not exist: ${parent}` };
+    if (fsSync.existsSync(targetPath)) {
+      const entries = fsSync.readdirSync(targetPath).filter((f) => f !== '.DS_Store');
+      if (entries.length) return { ok: false, error: 'That folder already exists and is not empty.' };
+      fsSync.rmdirSync(targetPath); // git clone wants to create it itself
+    }
+
+    const name = devvitSafeName(path.basename(targetPath));
+
+    // 1. Clone the template (network first, local committed state as fallback).
+    send('Fetching the Devvit template…');
+    let cloneErr = null;
+    try {
+      await execFileAsync('git', ['clone', '--depth', '1', FARNSWORTH_TEMPLATE_REPO, targetPath], {
+        timeout: 180000,
+        env: { ...process.env, PATH: composeChildPath(), GIT_TERMINAL_PROMPT: '0' },
+      });
+    } catch (e) {
+      cloneErr = e;
+      if (fsSync.existsSync(path.join(FARNSWORTH_TEMPLATE_LOCAL, '.git'))) {
+        send('Network unavailable — using the local template copy…');
+        try {
+          if (fsSync.existsSync(targetPath)) fsSync.rmSync(targetPath, { recursive: true, force: true });
+          await execFileAsync('git', ['clone', '--depth', '1', `file://${FARNSWORTH_TEMPLATE_LOCAL}`, targetPath], {
+            timeout: 180000,
+            env: { ...process.env, PATH: composeChildPath(), GIT_TERMINAL_PROMPT: '0' },
+          });
+          cloneErr = null;
+        } catch (e2) { cloneErr = e2; }
+      }
+    }
+    if (cloneErr) {
+      const detail = String(cloneErr.stderr || cloneErr.message || '').trim().split('\n').slice(-1)[0];
+      return { ok: false, error: `Could not fetch the template: ${detail || cloneErr.message}` };
+    }
+
+    // 2. Replace the template's <% name %> placeholders.
+    send('Personalizing project files…');
+    const TEXT_EXT = new Set(['.json', '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.md', '.html', '.css', '.yml', '.yaml', '.txt']);
+    let replaced = 0;
+    const walk = (dir) => {
+      for (const entry of fsSync.readdirSync(dir, { withFileTypes: true })) {
+        if (entry.name === 'node_modules' || entry.name === '.git') continue;
+        const p = path.join(dir, entry.name);
+        if (entry.isDirectory()) { walk(p); continue; }
+        if (!TEXT_EXT.has(path.extname(entry.name))) continue;
+        try {
+          const txt = fsSync.readFileSync(p, 'utf8');
+          if (!txt.includes(TEMPLATE_NAME_TOKEN)) continue;
+          fsSync.writeFileSync(p, txt.split(TEMPLATE_NAME_TOKEN).join(name));
+          replaced++;
+        } catch {}
+      }
+    };
+    walk(targetPath);
+    console.log(`[scaffold] personalized ${replaced} file(s) with name "${name}"`);
+
+    // 3. Fresh git history — this is the user's project, not a fork of ours.
+    send('Initializing a fresh git repository…');
+    try {
+      fsSync.rmSync(path.join(targetPath, '.git'), { recursive: true, force: true });
+      const gitEnv = { ...process.env, PATH: composeChildPath() };
+      await execFileAsync('git', ['init', '-b', 'main'], { cwd: targetPath, env: gitEnv, timeout: 30000 });
+      await execFileAsync('git', ['add', '-A'], { cwd: targetPath, env: gitEnv, timeout: 60000 });
+      await execFileAsync('git', ['commit', '-m', `Initial commit — ${name} from vibe-farnsworth-template`], {
+        cwd: targetPath, env: gitEnv, timeout: 60000,
+      });
+    } catch (e) {
+      // Non-fatal: a missing user.name/user.email shouldn't block the project.
+      console.warn('[scaffold] git init/commit skipped:', e.message);
+    }
+
+    // 4. Farnsworth workspace config, so the app-type picker doesn't appear.
+    send('Writing the Farnsworth config…');
+    try {
+      const cfgDir = path.join(targetPath, '.farnsworth');
+      fsSync.mkdirSync(cfgDir, { recursive: true });
+      const cfgPath = path.join(cfgDir, 'config.json');
+      let cfg = {};
+      try { cfg = JSON.parse(fsSync.readFileSync(cfgPath, 'utf8')); } catch {}
+      cfg.appType = 'devvit';
+      cfg.createdAt = new Date().toISOString();
+      cfg.liveGameId = cfg.liveGameId ?? null;
+      cfg.live = { projectName: name, subredditName: '', url: '', postName: '', ...(cfg.live || {}) };
+      cfg.live.projectName = name;
+      fsSync.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + '\n');
+    } catch (e) {
+      console.warn('[scaffold] config write failed:', e.message);
+    }
+
+    // 5. Dependencies. Without node_modules, Go Live can't work.
+    send('Installing dependencies… (this can take a minute)');
+    let installError = null;
+    try {
+      const npmBin = resolveNpmBin();
+      if (!npmBin) throw new Error('npm not found on PATH');
+      await execFileAsync(npmBin, ['install', '--no-audit', '--no-fund'], {
+        cwd: targetPath,
+        timeout: 600000,
+        env: {
+          ...process.env,
+          PATH: composeChildPath(path.dirname(npmBin) ? [path.dirname(npmBin)] : []),
+          // @devvit/test pulls redis-memory-server, whose postinstall compiles
+          // RedisJSON/RedisTimeSeries from source and needs GNU Make >= 4.
+          // macOS ships Make 3.81 (2006, GPLv2), so that build always fails
+          // here and would fail the whole install. Skip it: the emulator
+          // replaces Redis locally, and the package fetches on demand if a
+          // test ever genuinely needs it.
+          REDISMS_DISABLE_POSTINSTALL: '1',
+        },
+      });
+    } catch (e) {
+      installError = String(e.stderr || e.message || '').trim().split('\n').slice(-1)[0] || 'npm install failed';
+      console.warn('[scaffold] npm install failed:', installError);
+    }
+
+    console.log(`[scaffold] created ${targetPath} (name=${name}, install=${installError ? 'FAILED' : 'ok'})`);
+    return { ok: true, path: targetPath, name, installError };
+  } catch (e) {
+    console.error('[scaffold] failed:', e);
+    return { ok: false, error: e.message || String(e) };
+  }
+});
+
+// ============================================================
 // IPC: Workspace config (per-folder .farnsworth/config.json)
 // ============================================================
 ipcMain.handle('workspace:loadConfig', async (_event, folderPath) => {

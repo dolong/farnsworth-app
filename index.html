@@ -429,13 +429,21 @@
           <div class="welcome__brand-name">Farnsworth</div>
         </div>
         <div class="welcome__title">Open a folder to start designing</div>
-        <div class="welcome__sub">An AI-based IDE for games. Pick a project to begin — chat becomes the design surface.</div>
+        <div class="welcome__sub">An AI-based IDE for games. Open a project or start a fresh one — chat becomes the design surface.</div>
 
         <button class="welcome__primary" id="welcome-open-btn">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
           Open Folder…
           <span class="welcome__kbd">⌘O</span>
         </button>
+
+        <button class="welcome__secondary" id="welcome-scratch-btn">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+          Start from scratch
+          <span class="welcome__tag">Devvit template</span>
+        </button>
+
+        <div class="welcome__scaffold" id="welcome-scaffold-status" hidden></div>
 
         <div class="welcome__recent" id="welcome-recent">
           <div class="welcome__recent-label">RECENT</div>

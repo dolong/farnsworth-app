@@ -84,6 +84,17 @@ contextBridge.exposeInMainWorld('farnsworth', {
   // Folder picker
   openFolderDialog: () => ipcRenderer.invoke('dialog:openFolder'),
 
+  // New project scaffold ("Start from scratch" on the welcome screen).
+  newProjectDialog: () => ipcRenderer.invoke('dialog:newProject'),
+  scaffoldProject: (targetPath) => ipcRenderer.invoke('project:scaffold', targetPath),
+  onScaffoldProgress: (callback) => {
+    const handler = (_e, payload) => {
+      try { callback(payload); } catch (e) { console.error('[preload] scaffold progress handler:', e); }
+    };
+    ipcRenderer.on('project:scaffold-progress', handler);
+    return () => ipcRenderer.removeListener('project:scaffold-progress', handler);
+  },
+
   // Workspace config
   loadWorkspaceConfig: (folderPath) => ipcRenderer.invoke('workspace:loadConfig', folderPath),
   saveWorkspaceConfig: (folderPath, config) => ipcRenderer.invoke('workspace:saveConfig', folderPath, config),
