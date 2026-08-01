@@ -219,7 +219,12 @@ CREATE TABLE IF NOT EXISTS memory_buffer (
   context TEXT,
   source TEXT,
   created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-  consolidated INTEGER DEFAULT 0
+  consolidated INTEGER DEFAULT 0,
+  -- Declared here as well as in the ALTER migration below: the migration
+  -- only fires for databases that already have the table, so a FRESH
+  -- install would otherwise never get this column and every fact write
+  -- would fail (the INSERT names workspace_path).
+  workspace_path TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_buffer_unconsolidated ON memory_buffer(consolidated, created_at);
 
@@ -232,7 +237,9 @@ CREATE TABLE IF NOT EXISTS memory_archive (
   kind TEXT NOT NULL,
   content TEXT NOT NULL,
   metadata TEXT,
-  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  -- See the note on memory_buffer.workspace_path above.
+  workspace_path TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_archive_day ON memory_archive(day);
 CREATE INDEX IF NOT EXISTS idx_archive_kind ON memory_archive(kind);
@@ -338,14 +345,20 @@ function init(userDataPath, electronSafeStorage) {
   // was no way to tell a the-last-draft fact from a dontdie-reddit one.
   // These columns record WHERE a fact came from; recall still spans projects
   // so identity/preference facts stay global.
+  db.pragma('foreign_keys = ON');
+  db.exec(SCHEMA);
+  // Runs AFTER the schema so it works on both paths: a fresh database gets
+  // the column from CREATE TABLE and this is a no-op, while a database
+  // created before Aug 1 2026 gets it added here. Ordered before SCHEMA it
+  // silently skipped fresh installs -- PRAGMA table_info on a table that
+  // doesn't exist yet returns nothing, the `cols.length` guard treats that
+  // as "nothing to migrate", and the column was never created.
   for (const [table, col] of [['memory_buffer', 'workspace_path'], ['memory_archive', 'workspace_path']]) {
     try {
       const cols = db.prepare(`PRAGMA table_info(${table})`).all().map(r => r.name);
       if (cols.length && !cols.includes(col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} TEXT`);
     } catch (_) {}
   }
-  db.pragma('foreign_keys = ON');
-  db.exec(SCHEMA);
   // Always create the codebase indexer tables (Tier 2 baseline). These
   // don't depend on sqlite-vec — they're the FTS5 search path when vec
   // is unavailable (e.g. macOS where onnxruntime BFCArena crashes
