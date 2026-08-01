@@ -835,7 +835,9 @@ function buildMenu() {
         { type: 'separator' },
         {
           label: 'Farnsworth on GitHub',
-          click: () => openExternalSafe('https://github.com/TheAnomalyXYZ/farnsworth'),
+          // Was TheAnomalyXYZ/farnsworth, which 404s -- wrong org and wrong
+          // repo name. The real repo is dolong/farnsworth-app.
+          click: () => openExternalSafe('https://github.com/dolong/farnsworth-app'),
         },
       ],
     },
@@ -6272,6 +6274,17 @@ app.whenReady().then(async () => {
   // app.quit() above is not guaranteed to prevent this callback from firing,
   // so bail explicitly rather than binding ports / opening the DB twice.
   if (!gotSingleInstanceLock) return;
+  // Make "Farnsworth → About Farnsworth" show FARNSWORTH's version. Without
+  // this, role:'about' falls back to the running bundle's Info.plist -- and
+  // on the dev tree that bundle is node_modules/electron/dist/Farnsworth.app,
+  // whose CFBundleShortVersionString is Electron's own version (31.7.7). So
+  // About reported the Electron version, not the app version. app.getVersion()
+  // reads package.json and is correct on both the dev tree and packaged builds.
+  app.setAboutPanelOptions({
+    applicationName: 'Farnsworth',
+    applicationVersion: app.getVersion(),
+    version: `Electron ${process.versions.electron} · ${process.platform}-${process.arch}`,
+  });
   await ensureDirs();
   db.init(userDataPath(), safeStorage);
   await db.migrateLegacy(userDataPath());
