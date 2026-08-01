@@ -1008,6 +1008,41 @@ ipcMain.handle('setting:set', async (_event, key, value) => {
 // Returns { available: true, type, url, pid, startedAt } when the dev
 // server is up, or { available: false } (or { available: false, url, pid,
 // dead: true }) when the meta file is missing or the process is dead.
+// ---------------------------------------------------------------------------
+// Dev servers THIS Farnsworth process started (Jul 30)
+// ---------------------------------------------------------------------------
+// Quitting Farnsworth used to leave the Devvit dev server + server-runner
+// running forever: `dev:farnsworth:stop` kills them, but nothing calls it on
+// quit, so every quit leaked a Vite process and a server-runner. Long's mini
+// had one 10h51m old, still serving the-last-draft with the IDE closed.
+//
+// Tracked in memory rather than re-read from ~/.cache/farnsworth-<type>.json at
+// quit time ON PURPOSE: that meta path is shared across instances, so a second
+// Farnsworth (--instance=<name>) overwrites it. Killing whatever pid the file
+// currently holds would let one instance kill another instance's dev server.
+// This map only ever holds pids we spawned ourselves.
+const spawnedDevServers = new Map(); // type -> { pid, serverPid, metaPath }
+
+function killTrackedDevServers(reason) {
+  if (spawnedDevServers.size === 0) return;
+  const fsSyncLocal = require('fs');
+  for (const [type, rec] of spawnedDevServers) {
+    for (const pid of [rec.pid, rec.serverPid]) {
+      if (!pid) continue;
+      try {
+        process.kill(pid, 'SIGKILL');
+        console.log(`[dev:farnsworth] ${reason}: killed ${type} pid ${pid}`);
+      } catch {
+        // already gone — nothing to do
+      }
+    }
+    // Clear the meta so the next launch reports unavailable instead of
+    // pointing the canvas at a dead pid.
+    if (rec.metaPath) { try { fsSyncLocal.unlinkSync(rec.metaPath); } catch {} }
+  }
+  spawnedDevServers.clear();
+}
+
 ipcMain.handle('dev:farnsworth:get', async (_event, appType = 'devvit', repoRoot) => {
   const fs = require('fs');
   const path = require('path');
@@ -1586,6 +1621,15 @@ ipcMain.handle('dev:farnsworth:boot', async (_event, appType = 'devvit', repoRoo
       const metaPath = path.join(os.homedir(), '.cache', `farnsworth-${type}.json`);
       try {
         const meta = JSON.parse(await fs.promises.readFile(metaPath, 'utf8'));
+        // Remember what we started so before-quit can clean it up. The npm
+        // script daemonizes, so the child we spawned has already exited by
+        // now -- these pids in the meta are the only handle on the real
+        // processes.
+        spawnedDevServers.set(type, {
+          pid: meta.pid || null,
+          serverPid: meta.serverPid || null,
+          metaPath,
+        });
         resolve({ ok: true, type, url: meta.url, pid: meta.pid, startedAt: meta.startedAt });
       } catch {
         resolve({ ok: true, type, url: `http://localhost:5174` });
@@ -1625,6 +1669,9 @@ ipcMain.handle('dev:farnsworth:stop', async (_event, appType = 'devvit') => {
 
   // Clear the meta so get/re-detect reports unavailable.
   try { await fs.promises.unlink(metaPath); } catch {}
+  // Already killed above -- drop the record so before-quit doesn't re-kill
+  // pids that may have been recycled onto unrelated processes by then.
+  spawnedDevServers.delete(type);
   return { ok: true, type };
 });
 
@@ -3631,6 +3678,16 @@ app.on('before-quit', () => {
 app.on('before-quit', () => {
   try { stopCodeWatcher(); } catch (_) {}
   try { db.closeEmbedWorker(); } catch (_) {}
+});
+
+// Devvit dev server + server-runner cleanup on app quit (Jul 30). Synchronous
+// on purpose: before-quit does not await async listeners, so a promise-based
+// kill would lose the race with process exit -- which is how these leaked in
+// the first place.
+app.on('before-quit', () => {
+  try { killTrackedDevServers('before-quit'); } catch (e) {
+    console.warn('[dev:farnsworth] quit cleanup failed:', e.message);
+  }
 });
 
 // ============================================================
