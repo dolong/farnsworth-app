@@ -59,10 +59,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Pinned to 20 deliberately. DO NOT BUMP without testing Windows.
+      # On 22, node-pty has no matching prebuild, so npm ci falls back to
+      # `node-gyp rebuild` from source and fails to compile on the
+      # windows-latest image: conpty.cc cannot resolve PFNCREATEPSEUDOCONSOLE
+      # and friends against the runner's Windows SDK. Verified by run
+      # 30754145627, where the bump moved the Windows failure earlier rather
+      # than fixing it.
+      #
+      # This is unrelated to the "Node 20 is being deprecated" annotation in
+      # the logs: that refers to the runtime GitHub uses to execute JS actions
+      # like actions/checkout, not to the toolchain version selected here.
       - name: Setup Node.js (with npm cache)
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '20'
           cache: 'npm'
 
       - name: Install dependencies
