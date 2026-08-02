@@ -5,20 +5,20 @@
 #   - Manual dispatch → build without publishing (for testing)
 #
 # Build matrix:
-#   - macos-latest → .dmg (arm64 + x64). Signed + notarized if Apple
-#     secrets are present in the repo, otherwise unsigned.
+#   - macos-latest → BUILD VALIDATION ONLY, never published. Signed Mac
+#     artifacts are produced locally on the Mac mini and uploaded by hand.
+#     See the long comment on the macOS step for why publishing here would
+#     break auto-update for every Mac user.
 #   - windows-latest → .exe via NSIS (x64). Unsigned for now (no EV cert).
 #     SmartScreen will warn on first launch — users click "More info" → "Run anyway".
 #   - ubuntu-latest → .AppImage + .deb. No signing needed.
 #
-# Required secrets (Settings → Secrets and variables → Actions):
-#   APPLE_ID                — Apple Developer email (1988.dolong@gmail.com)
-#   APPLE_APP_SPECIFIC_PASSWORD  — generated at appleid.apple.com (not the iCloud pw)
-#   APPLE_TEAM_ID           — 66RHAVPZ4J
-# Optional (for fully signed mac on CI):
-#   FARNSWORTH_CERT_P12     — base64-encoded Developer ID Application .p12
-#   FARNSWORTH_CERT_PASSWORD — .p12 password
-#   KEYCHAIN_PASSWORD       — temp keychain password for the runner
+# Secrets: NONE are required, and as of Aug 2 the repo has none
+# (`GET /actions/secrets` → total_count 0). Do not reintroduce
+# `CSC_LINK: ${{ secrets.MISSING }}`-style env wiring: an absent secret
+# expands to an empty string rather than being unset, which electron-builder
+# resolves as a filesystem path and dies on. If Mac signing on CI is ever
+# wanted, add the secrets first and gate the env block on their presence.
 #
 # Notes:
 #   - GITHUB_TOKEN is auto-provided by GitHub Actions.
@@ -62,37 +62,72 @@ jobs:
       - name: Setup Node.js (with npm cache)
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
 
       - name: Install dependencies
         run: npm ci
 
+      # Resources/bin (the bundled `claude` + `nono` binaries, ~252 MB) is
+      # gitignored, so it never exists on a CI runner. electron-builder reports
+      # this as a single easily-missed line — `file source doesn't exist` — and
+      # builds a package WITHOUT those binaries anyway. Every CI-published
+      # Windows and Linux artifact is therefore missing them. Surfaced here as
+      # a job-summary warning so it stops being invisible.
+      - name: Check bundled binaries
+        shell: bash
+        run: |
+          if [ -d Resources/bin ] && [ -n "$(ls -A Resources/bin 2>/dev/null)" ]; then
+            echo "Resources/bin present: $(ls Resources/bin | tr '\n' ' ')"
+          else
+            echo "::warning title=Bundled binaries missing::Resources/bin is absent (gitignored). This artifact ships WITHOUT the claude/nono binaries."
+            echo "- :warning: **Resources/bin absent** - artifact ships without \`claude\` / \`nono\`." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       # ==================================================================
-      # macOS — code signing + notarization (skipped silently if secrets absent)
+      # macOS — BUILD VALIDATION ONLY. Never publishes. See below.
       # ==================================================================
-      - name: Build (macOS)
+      #
+      # This job must NEVER upload to the GitHub Release, and the reason is
+      # load-bearing.
+      #
+      # There are no Apple signing secrets in this repo (verified Aug 2:
+      # `GET /actions/secrets` returns total_count 0). So a mac build here is
+      # UNSIGNED. electron-builder's implicit tag publishing would upload that
+      # unsigned zip/dmg AND overwrite `latest-mac.yml` — the manifest every
+      # installed Mac polls for updates. Squirrel.Mac validates the code
+      # signature, so every Mac user's auto-update would break. That is the
+      # same class of outage as v0.1.19, where a release carrying only
+      # win/linux assets took down Mac auto-update.
+      #
+      # Signed Mac artifacts are built locally on the Mac mini with the real
+      # Developer ID and uploaded by hand. CI's job on macOS is to catch build
+      # breakage, nothing more. Hence `--publish never`.
+      #
+      # CSC_IDENTITY_AUTO_DISCOVERY=false is required because
+      # electron-builder.yml pins a mac `identity:` that does not exist in the
+      # runner's Keychain.
+      #
+      # The CSC_LINK / APPLE_* env vars that used to live here are deliberately
+      # gone. A missing secret in GitHub Actions expands to an EMPTY STRING,
+      # not an unset variable, and electron-builder resolves an empty CSC_LINK
+      # as a path relative to the project root — yielding the project dir
+      # itself and the fatal `⨯ <projectDir> not a file`. That single empty
+      # string is what made every tagged mac build red since v0.1.19.
+      - name: Build (macOS — validation, never published)
         if: matrix.os == 'macos-latest'
-        run: npm run dist:mac
+        run: npx electron-builder --mac --publish never
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Signing identity lives in the Keychain of the runner if the
-          # .p12 was imported in a previous step. electron-builder auto-
-          # discovers it via CSC_KEY_PASSWORD + CSC_LINK if those secrets
-          # are set; otherwise it falls back to "unsigned" cleanly.
-          CSC_LINK: ${{ secrets.FARNSWORTH_CERT_P12 }}
-          CSC_KEY_PASSWORD: ${{ secrets.FARNSWORTH_CERT_PASSWORD }}
-          # Notarization via notarytool
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          CSC_IDENTITY_AUTO_DISCOVERY: false
 
       # ==================================================================
       # Windows — NSIS installer, unsigned (no EV cert yet)
       # ==================================================================
+      # `--publish` is explicit: implicit tag-triggered publishing is
+      # deprecated and removed in electron-builder v27.
       - name: Build (Windows)
         if: matrix.os == 'windows-latest'
-        run: npm run dist:win
+        run: npx electron-builder --win --publish ${{ startsWith(github.ref, 'refs/tags/v') && 'always' || 'never' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -101,12 +136,18 @@ jobs:
       # ==================================================================
       - name: Build (Linux)
         if: matrix.os == 'ubuntu-latest'
-        run: npm run dist:linux
+        run: npx electron-builder --linux --publish ${{ startsWith(github.ref, 'refs/tags/v') && 'always' || 'never' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # `shell: bash` is mandatory here. The default shell on windows-latest is
+      # pwsh, where `ls` aliases to Get-ChildItem and `-lh` is not a valid
+      # parameter — a ParserError that failed the whole Windows job *after* the
+      # installer had already built and uploaded successfully, and which
+      # skipped the artifact upload below. Git Bash ships on all three runners.
       - name: List build artifacts
-        run: ls -lh dist/ || dir dist\
+        shell: bash
+        run: ls -lh dist/
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
