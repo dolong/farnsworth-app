@@ -22,6 +22,12 @@
       node.appendChild(detail);
     }
 
+    // Already answered — keep the chosen button highlighted and lock both so a
+    // second click can't fire a duplicate turn.
+    const resolvedValue = surface.resolvedValue;
+    const isResolved = resolvedValue !== undefined && resolvedValue !== null;
+    if (isResolved) node.classList.add('surface--resolved');
+
     const buttons = document.createElement('div');
     buttons.className = 'confirmation__buttons';
 
@@ -29,7 +35,13 @@
     cancel.type = 'button';
     cancel.className = 'confirmation__button confirmation__button--cancel';
     cancel.textContent = data.cancelLabel || 'Cancel';
+    if (isResolved) {
+      cancel.disabled = true;
+      if (resolvedValue === 'cancelled') cancel.classList.add('confirmation__button--chosen');
+    }
     cancel.addEventListener('click', () => {
+      if (isResolved) return;
+      surface.resolvedValue = 'cancelled';
       window.FarnsworthSurfaces.onSurfaceAction(surface, {
         kind: 'synthetic-turn', userText: '[confirmation] cancelled',
       });
@@ -42,7 +54,13 @@
       ? 'confirmation__button--destructive'
       : 'confirmation__button--confirm');
     confirm.textContent = data.confirmLabel || 'Confirm';
+    if (isResolved) {
+      confirm.disabled = true;
+      if (resolvedValue === 'confirmed') confirm.classList.add('confirmation__button--chosen');
+    }
     confirm.addEventListener('click', () => {
+      if (isResolved) return;
+      surface.resolvedValue = 'confirmed';
       window.FarnsworthSurfaces.onSurfaceAction(surface, {
         kind: 'synthetic-turn', userText: '[confirmation] confirmed',
       });

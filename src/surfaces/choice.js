@@ -32,6 +32,13 @@
     const isMulti = data.selectionMode === 'multiple';
     const selected = new Set();
 
+    // A resolved choice is one the user already answered. The value is stored
+    // on the surface object (which survives renderChat() re-renders) so the
+    // picked option stays highlighted and can't be submitted a second time.
+    const resolvedValue = surface.resolvedValue;
+    const isResolved = resolvedValue !== undefined && resolvedValue !== null;
+    if (isResolved) node.classList.add('surface--resolved');
+
     const optionsWrap = document.createElement('div');
     optionsWrap.className = 'choice__options';
 
@@ -55,7 +62,16 @@
         btn.appendChild(desc);
       }
 
+      if (isResolved) {
+        btn.disabled = true;
+        const chosen = Array.isArray(resolvedValue)
+          ? resolvedValue.indexOf(opt.id) !== -1
+          : resolvedValue === opt.id;
+        if (chosen) btn.classList.add('choice__option--selected');
+      }
+
       btn.addEventListener('click', () => {
+        if (isResolved) return;
         if (isMulti) {
           if (selected.has(opt.id)) {
             selected.delete(opt.id);
@@ -65,6 +81,7 @@
             btn.classList.add('choice__option--selected');
           }
         } else {
+          surface.resolvedValue = opt.id;
           window.FarnsworthSurfaces.onSurfaceAction(surface, {
             kind: 'synthetic-turn',
             userText: buildUserText(data, opt.id, opt.label),
@@ -81,7 +98,10 @@
       submit.type = 'button';
       submit.className = 'choice__submit';
       submit.textContent = data.submitLabel || 'Continue';
+      if (isResolved) submit.disabled = true;
       submit.addEventListener('click', () => {
+        if (isResolved) return;
+        surface.resolvedValue = Array.from(selected);
         window.FarnsworthSurfaces.onSurfaceAction(surface, {
           kind: 'synthetic-turn',
           userText: buildUserText(data, Array.from(selected), null),

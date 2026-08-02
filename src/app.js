@@ -11237,13 +11237,46 @@ function renderChatSurface(agentMsg, input) {
 //   'credential'      -> prompt for a secret via main IPC
 //   'oauth'           -> start an OAuth flow
 window.__surfaceRegistry = {};
-window.__onSurfaceAction = function (surface, action) {
+
+// Surfaces emit TWO different action shapes and only one was ever understood:
+//   A) choice.js, confirmation.js  -> { kind: 'synthetic-turn', userText }
+//   B) form.js, credential.js,
+//      oauth_connect.js            -> { id, syntheticTurn, surfaceData }   (no `kind`!)
+// Shape B fell straight through to the 'Unknown action kind: undefined' warn
+// below, so form submit / credential save / oauth start did nothing at all.
+// Normalizing here means every surface speaks one contract to the dispatcher.
+function normalizeSurfaceAction(action) {
+  if (!action) return null;
+  if (action.kind) return action;
+  if (typeof action.syntheticTurn === 'string') {
+    return {
+      kind: 'synthetic-turn',
+      userText: action.syntheticTurn,
+      id: action.id,
+      surfaceData: action.surfaceData,
+    };
+  }
+  return action;
+}
+
+window.__onSurfaceAction = function (surface, rawAction) {
+  const action = normalizeSurfaceAction(rawAction);
+  if (!action) return;
   if (action.kind === 'synthetic-turn') {
-    // Append the synthetic user message and send the next turn
-    const userMsgId = 'm' + Date.now();
-    state.chatMessages.push({ id: userMsgId, role: 'user', text: action.userText });
-    renderChat();
-    sendChatMessage();
+    // A turn is already running — swallow the click the same way the composer
+    // does, and leave the surface unresolved so it can be clicked again after.
+    if (isChatTurnActive()) return;
+    // Mark the surface spent BEFORE sending so the re-render inside
+    // sendChatMessage() paints the resolved state in the same frame.
+    if (surface) {
+      surface.resolved = true;
+      if (action.surfaceData) surface.resultData = action.surfaceData;
+    }
+    // Hand the text to sendChatMessage() rather than pushing a user message
+    // here. Pushing it here AND calling sendChatMessage() with an empty
+    // composer is exactly what made every surface a no-op: the message
+    // rendered, the send bailed at its empty-text guard, the agent never ran.
+    sendChatMessage({ text: action.userText });
   } else if (action.kind === 'direct-action') {
     handleDirectAction(action);
   } else if (action.kind === 'credential') {
@@ -11478,20 +11511,34 @@ function updateChatSendButton() {
   }
 }
 
-async function sendChatMessage() {
+// opts.text — a SYNTHETIC turn: text supplied by an interactive chat surface
+// (choice / confirmation / form / credential / oauth) instead of typed into
+// the composer.
+//
+// Before Aug 2 there was no such parameter. The surface dispatcher pushed its
+// own user message onto state.chatMessages and then called sendChatMessage()
+// with an EMPTY composer — which bailed at the `!text && !attachments` guard
+// below. The message rendered in the thread and the agent was never invoked,
+// so every interactive surface looked like it worked and silently did nothing.
+async function sendChatMessage(opts) {
   // Concurrency guard (Jul 27). A second send while a turn is in flight used
   // to spin up a parallel tool loop — two run_commands executing at once. The
   // composer button is a Stop button while working, so a click here means the
   // user wants to stop; a stray Enter is a no-op.
   if (isChatTurnActive()) return;
   const input = $('#chat-input');
-  const text = input.value.trim();
+  const synthetic = !!(opts && typeof opts.text === 'string');
+  const text = synthetic ? opts.text.trim() : (input ? input.value.trim() : '');
   // Pending clipboard-image attachments (Jul 16 ~23:30 ET). Snapshotted
   // + cleared at the top so a fail/abort never leaves stale chips in
   // the input across reloads.
-  const attachments = (state.chatAttachments || []).slice();
-  state.chatAttachments = [];
-  renderChatAttachments();
+  // A synthetic turn must NOT consume the composer draft or the pending
+  // attachments — those belong to the message the user is still writing.
+  const attachments = synthetic ? [] : (state.chatAttachments || []).slice();
+  if (!synthetic) {
+    state.chatAttachments = [];
+    renderChatAttachments();
+  }
   // Capture + clear the companion origin id on EVERY call so a stale id from
   // an aborted send can't leak into the next turn. Non-null only when this
   // send was triggered by a companion 'chat' relay message. (Jul 15 2026)
@@ -11526,7 +11573,7 @@ async function sendChatMessage() {
   const userPreviewText = text + (previewAttSummary ? (text ? '\n\n' : '') + previewAttSummary : '');
   state.chatMessages.push({ id: userMsgId, role: 'user', text: userPreviewText });
   state.chatMessages.push({ id: agentMsgId, role: 'agent', working: true, workingLabel: 'Thinking' });
-  input.value = '';
+  if (!synthetic && input) input.value = '';
   renderChat();
 
   // Memory preamble — Tier 3 (Jul 12 2026). Stages 4+5: the router picks

@@ -6410,6 +6410,26 @@ pre:hover .code-copy { opacity: 1; }
 }
 .confirmation__button:hover { opacity: 0.85; }
 
+/* Resolved surfaces (Aug 2) — a choice/confirmation the user already answered.
+   Buttons lock so a second click can't fire a duplicate turn; the option that
+   was actually picked stays at full opacity so the answer is still readable. */
+.surface--resolved .choice__option,
+.surface--resolved .choice__submit,
+.surface--resolved .confirmation__button {
+  cursor: default;
+  opacity: 0.4;
+}
+.surface--resolved .choice__option:hover {
+  background: rgba(255, 255, 255, 0.03);
+  border-color: rgba(255, 255, 255, 0.1);
+}
+.surface--resolved .confirmation__button:hover { opacity: 0.4; }
+.surface--resolved .choice__option--selected,
+.surface--resolved .confirmation__button--chosen {
+  opacity: 1;
+}
+.confirmation__button--chosen { box-shadow: 0 0 0 2px rgba(126, 107, 255, 0.55); }
+
 /* ----- copy_block surface ----- */
 .surface--copy-block {
   position: relative;
