@@ -79,21 +79,39 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # Resources/bin (the bundled `claude` + `nono` binaries, ~252 MB) is
-      # gitignored, so it never exists on a CI runner. electron-builder reports
-      # this as a single easily-missed line — `file source doesn't exist` — and
-      # builds a package WITHOUT those binaries anyway. Every CI-published
-      # Windows and Linux artifact is therefore missing them. Surfaced here as
-      # a job-summary warning so it stops being invisible.
-      - name: Check bundled binaries
+      # Resources/bin (the bundled `claude` + `nono` CLIs) is gitignored —
+      # claude alone is ~226 MB, past GitHub's 100 MB file limit — so it never
+      # exists on a runner. electron-builder reports the absence as a single
+      # forgettable `file source doesn't exist` line and packages the artifact
+      # anyway, which is how every CI-published Windows and Linux build through
+      # v0.1.26 shipped without them.
+      #
+      # The script fetches the binaries for the RUNNER's platform with sha256
+      # verification. Copying the Mac's arm64 Mach-O binaries into a Windows or
+      # Linux artifact would ship ~242 MB that can never execute.
+      #
+      # Windows gets neither: Anthropic's installer refuses Windows outright
+      # and nono publishes no Windows asset. The script says so and exits 0.
+      - name: Fetch bundled binaries (claude + nono)
+        shell: bash
+        run: ./scripts/fetch-bundled-binaries.sh
+
+      # Fail loudly if a platform that IS supposed to carry the binaries lost
+      # them. Without this the only signal is a warning nobody reads.
+      - name: Verify bundled binaries
+        if: matrix.os != 'windows-latest'
         shell: bash
         run: |
-          if [ -d Resources/bin ] && [ -n "$(ls -A Resources/bin 2>/dev/null)" ]; then
-            echo "Resources/bin present: $(ls Resources/bin | tr '\n' ' ')"
-          else
-            echo "::warning title=Bundled binaries missing::Resources/bin is absent (gitignored). This artifact ships WITHOUT the claude/nono binaries."
-            echo "- :warning: **Resources/bin absent** - artifact ships without \`claude\` / \`nono\`." >> "$GITHUB_STEP_SUMMARY"
-          fi
+          missing=0
+          for b in claude nono; do
+            if [ -x "Resources/bin/$b" ]; then
+              echo "ok: Resources/bin/$b ($(du -h "Resources/bin/$b" | cut -f1))"
+            else
+              echo "::error title=Bundled binary missing::Resources/bin/$b was not provisioned"
+              missing=1
+            fi
+          done
+          exit $missing
 
       # ==================================================================
       # macOS — BUILD VALIDATION ONLY. Never publishes. See below.
