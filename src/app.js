@@ -3441,7 +3441,14 @@ function renderLivePreview() {
       else if (state.preview === 'testview') h = w * 876 / 900;
       else h = w;
     }
-    size.textContent = Math.round(w) + ' × ' + Math.round(h);
+    // Test View's artboard is frame + test panel, so reporting the artboard
+    // dims would contradict the resolution the user picked. Show the frame.
+    if (state.preview === 'testview') {
+      const f = testviewFrameSize();
+      size.textContent = f.w + ' × ' + f.h;
+    } else {
+      size.textContent = Math.round(w) + ' × ' + Math.round(h);
+    }
   }
   wrap.appendChild(size);
 
@@ -3936,10 +3943,85 @@ function renderFullscreen() {
 // Reset Game button that reloads the WebContentsView to a fresh game
 // instance. Tests target the WebContentsView's CDP target directly via
 // python3 farnsworth-test.py.
+// ---------------------------------------------------------------------------
+// Test View geometry (Aug 2)
+//
+// Test View's artboard holds TWO things: the game frame on the left and the
+// test-runner panel on the right. So the resolution preset can't be applied to
+// the artboard directly the way it is for mobile/desktop/fullscreen — it
+// describes the GAME FRAME, and the artboard is sized to fit frame + panel.
+//
+//   artboardW = frameW + 16 (pad) + 16 (gap) + 462 (panel) + 16 (pad)
+//   artboardH = frameH + 16 + 16
+//
+// 462 is the panel width the original hardcoded 900x876 artboard produced at a
+// 390x844 phone, so the default renders byte-identically to before this change.
+const TESTVIEW_PANEL_W = 462;
+const TESTVIEW_CHROME_W = TESTVIEW_PANEL_W + 48; // 3 x 16px padding/gap
+const TESTVIEW_CHROME_H = 32;                    // 2 x 16px padding
+
+// Artboard dims needed to render a given game frame at its exact size.
+function testviewArtboardSize(frame) {
+  return {
+    w: Math.round(frame.w + TESTVIEW_CHROME_W),
+    h: Math.round(frame.h + TESTVIEW_CHROME_H),
+  };
+}
+
+// The inverse: the game frame the current artboard yields. Corner-dragging the
+// artboard flows through here, so a drag still resizes the game's real CSS
+// viewport (the Jul 13 behavior).
+function testviewFrameSize() {
+  const aw = state.previewWidths.testview || 900;
+  const ah = state.previewCustomHeight?.testview || (aw * 876 / 900);
+  return {
+    w: Math.max(160, Math.round(aw - TESTVIEW_CHROME_W)),
+    h: Math.max(160, Math.round(ah - TESTVIEW_CHROME_H)),
+  };
+}
+
+// Which device chrome Test View wraps the game in. An explicit choice from the
+// resolution dropdown wins, but only while it still matches the frame on
+// screen — after a corner-drag or a restart we fall back to orientation, which
+// classifies every shipped preset correctly (all Mobile presets are portrait,
+// every Desktop / Fullscreen / Post preset is landscape).
+function testviewDevice() {
+  const f = testviewFrameSize();
+  const pick = state.testviewFrame;
+  if (pick && pick.device && pick.w === f.w && pick.h === f.h) return pick.device;
+  return f.w >= f.h ? 'desktop' : 'mobile';
+}
+
+// Point Test View at a new game frame: record the device choice, then resize
+// the artboard so the frame lands at exactly the requested dims.
+function applyTestviewFrame(frame) {
+  state.testviewFrame = { device: frame.device, w: frame.w, h: frame.h };
+  const ab = testviewArtboardSize(frame);
+  state.previewWidths.testview = ab.w;
+  state.previewCustomHeight = state.previewCustomHeight || {};
+  state.previewCustomHeight.testview = ab.h;
+  // Picking a preset is not a manual zoom — let autoFitZoomToStage re-fit the
+  // new artboard instead of keeping the zoom the user last dialled in.
+  if (state._zoomManualFor === 'testview') state._zoomManualFor = null;
+}
+
 function renderTestView() {
   const wrap = el('div', { class: 'testview' });
 
-  // Left: phone-frame game canvas (390x844) hosting the live game.
+  // Left: device-frame game canvas hosting the live game. The frame shape
+  // follows the resolution preset picked while Test View is active — a phone
+  // for Mobile presets, a desktop window for Desktop / Fullscreen / Post.
+  //
+  // Before Aug 2 this was hardcoded to a phone locked at aspect-ratio 390/844
+  // and always loaded ?view=mobile. Picking "724 x 596 - App Desktop Default"
+  // only shrank the outer artboard, so the phone (height:100% + fixed aspect)
+  // collapsed to ~259px wide and the game was clipped on the right edge.
+  const tvFrame = testviewFrameSize();
+  const tvDevice = testviewDevice();
+  const tvScreen = state.farnsworthDev?.available
+    ? `<div class="${tvDevice === 'desktop' ? 'desktop__stage-iframe desktop__stage-browser-view' : 'phone__screen-iframe phone__screen-browser-view'}" data-canvas-view="${tvDevice}" data-canvas-url="${state.farnsworthDev.url}/?view=${tvDevice}" style="width:100%;height:100%;display:block;background:#000"></div>`
+    : `<div class="testview__no-dev">Start \`npm run farnsworth\` in the project to load a game.</div>`;
+
   const game = el('div', { class: 'testview__game' });
   const phone = el('div', { class: 'phone testview__phone' });
   phone.innerHTML = `
@@ -3960,13 +4042,30 @@ function renderTestView() {
         <svg viewBox="0 0 20 20" fill="currentColor" width="18" height="18"><circle cx="5" cy="10" r="1.4"/><circle cx="10" cy="10" r="1.4"/><circle cx="15" cy="10" r="1.4"/></svg>
       </div>
     </div>
-    <div class="phone__screen">
-      ${state.farnsworthDev?.available
-        ? `<div class="phone__screen-iframe phone__screen-browser-view" data-canvas-view="mobile" data-canvas-url="${state.farnsworthDev.url}/?view=mobile" style="width:100%;height:100%;display:block;background:#000"></div>`
-        : `<div class="testview__no-dev">Start \`npm run farnsworth\` in the project to load a game.</div>`}
-    </div>
+    <div class="phone__screen">${tvScreen}</div>
   `;
-  game.appendChild(phone);
+
+  // Desktop shell — the same window chrome renderDesktop() uses, minus the
+  // upvote/comment/award action bar (Test View strips post chrome the same way
+  // the phone frame here omits .phone__actions).
+  const desk = el('div', { class: 'desktop testview__desktop' });
+  desk.innerHTML = `
+    <div class="desktop__titlebar">
+      <div class="desktop__title">${(state.liveConfig?.projectName && state.liveConfig.projectName.trim()) || ''}</div>
+      <div class="desktop__controls">
+        <button class="desktop__control desktop__control--dots"><svg viewBox="0 0 20 20" fill="currentColor" width="14" height="14"><circle cx="5" cy="10" r="1.4"/><circle cx="10" cy="10" r="1.4"/><circle cx="15" cy="10" r="1.4"/></svg></button>
+        <button class="desktop__control desktop__control--fs"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" width="14" height="14"><path d="M3 8V4h4M17 8V4h-4M3 12v4h4M17 12v4h-4"/></svg></button>
+        <button class="desktop__control desktop__control--close"><svg viewBox="0 0 20 20" fill="currentColor" width="14" height="14"><path d="M14.7 5.3a1 1 0 010 1.4L11.4 10l3.3 3.3a1 1 0 11-1.4 1.4L10 11.4l-3.3 3.3a1 1 0 11-1.4-1.4L8.6 10 5.3 6.7a1 1 0 011.4-1.4L10 8.6l3.3-3.3a1 1 0 011.4 0z"/></svg></button>
+      </div>
+    </div>
+    <div class="desktop__stage">${tvScreen}</div>
+  `;
+
+  // The shell tracks the artboard's height and derives its width from the
+  // frame aspect, so a corner-drag still resizes the game viewport live.
+  const shell = tvDevice === 'desktop' ? desk : phone;
+  shell.style.aspectRatio = `${tvFrame.w} / ${tvFrame.h}`;
+  game.appendChild(shell);
   wrap.appendChild(game);
 
   // Right: test runner panel.
@@ -4320,7 +4419,9 @@ function setTestViewOutput(output, headerText, bodyText) {
 // viewId (main.js handler reloads the URL in place, which resets the game's
 // React state to initial). Triggered by the Reset Game button.
 function resetTestViewGame(wrap) {
-  const placeholder = wrap.querySelector('[data-canvas-view="mobile"]');
+  // Any device shape — Test View's frame is a phone OR a desktop window
+  // depending on the resolution preset, so don't hardcode the mobile viewId.
+  const placeholder = wrap.querySelector('[data-canvas-view]');
   if (!placeholder || !placeholder.dataset.canvasViewId) {
     // View not yet created (farnsworth dev not available, or createView in flight).
     return;
@@ -10441,7 +10542,10 @@ function wire() {
     syncResolutionDropdownToCategory();
     // Switching category drops any custom height override (the new
     // category's aspect ratio applies unless the user re-picks a preset).
-    if (state.previewCustomHeight) delete state.previewCustomHeight[state.preview];
+    // Test View is exempt: its height is not an aspect ratio, it's the frame
+    // the user chose plus panel chrome. Dropping it would silently reset the
+    // frame to a phone shape every time the category is re-selected.
+    if (state.previewCustomHeight && state.preview !== 'testview') delete state.previewCustomHeight[state.preview];
     updateModeToggles();
     renderCanvas();
   }));
@@ -10456,6 +10560,25 @@ function wire() {
   function syncResolutionDropdownToCategory() {
     const sel = $('#canvas-resolution-select');
     if (!sel) return;
+    const custom0 = $('#canvas-resolution-custom');
+    // Test View matches on the game frame, not the artboard — the artboard is
+    // always frame + panel, so it never equals a preset value.
+    if (state.preview === 'testview') {
+      const f = testviewFrameSize();
+      const match = Array.from(sel.options).find(o => o.value === `${f.w},${f.h}`);
+      if (match) {
+        sel.value = match.value;
+        if (custom0) custom0.hidden = true;
+        return;
+      }
+      sel.value = 'custom';
+      if (custom0) custom0.hidden = false;
+      const wIn0 = $('#canvas-resolution-w');
+      const hIn0 = $('#canvas-resolution-h');
+      if (wIn0) wIn0.value = String(f.w);
+      if (hIn0) hIn0.value = String(f.h);
+      return;
+    }
     const w = state.previewWidths[state.preview];
     // Find the option whose width matches the category default. Options
     // are keyed on "width,height" strings (e.g. "390,844") so we split
@@ -10511,6 +10634,19 @@ function wire() {
       const w = parseInt(wRaw, 10);
       const h = hRaw ? parseInt(hRaw, 10) : null;
       if (!Number.isFinite(w)) return;
+      // Test View: the preset sizes the GAME FRAME, not the artboard (the
+      // artboard also has to hold the test panel). The optgroup the option
+      // came from decides whether the frame is a phone or a desktop window.
+      if (state.preview === 'testview') {
+        const group = resSelect.selectedOptions?.[0]?.parentElement?.label || '';
+        applyTestviewFrame({
+          device: group === 'Mobile' ? 'mobile' : 'desktop',
+          w,
+          h: h || Math.round(w * 844 / 390),
+        });
+        renderCanvas();
+        return;
+      }
       // Store the new width under the current preview category; the
       // height gets re-derived from the category's aspect ratio in
       // renderCanvas() unless we have a custom h.
@@ -10533,6 +10669,13 @@ function wire() {
     const w = parseInt(resW?.value || '', 10);
     const h = parseInt(resH?.value || '', 10);
     if (!Number.isFinite(w)) return;
+    if (state.preview === 'testview') {
+      // No optgroup to read for a custom size — fall back to orientation.
+      const fh = Number.isFinite(h) ? h : Math.round(w * 844 / 390);
+      applyTestviewFrame({ device: w >= fh ? 'desktop' : 'mobile', w, h: fh });
+      renderCanvas();
+      return;
+    }
     state.previewWidths[state.preview] = w;
     state.previewCustomHeight = state.previewCustomHeight || {};
     state.previewCustomHeight[state.preview] = Number.isFinite(h) ? h : null;

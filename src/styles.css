@@ -5856,13 +5856,30 @@ pre:hover .code-copy { opacity: 1; }
   height: 100%;
 }
 
+/* Desktop game frame (Aug 2) — used when the resolution dropdown is set to a
+   Desktop / Fullscreen / Post preset while Test View is active. Same window
+   chrome as the standalone Desktop preview, sized by an inline aspect-ratio
+   that renderTestView() derives from the chosen frame dims. */
+.testview__desktop {
+  height: 100%;
+  width: auto;
+  flex: none;
+  margin: 0;
+}
+/* No letterbox padding here — the frame dims ARE the target, so the game
+   should fill the stage exactly. */
+.testview__desktop .desktop__stage { padding: 0; }
+
 .testview__phone {
   /* Scales WITH the artboard (Jul 13) so corner-drag resize reaches the
      game view, matching mobile/desktop/post behavior. Height tracks the
      artboard's inner height; width follows via aspect-ratio. At the default
      900×876 artboard this lands exactly 390×844 (the old fixed size — the
      test runner's expected default). Resizing changes the game's real CSS
-     viewport, same as dragging the mobile artboard. */
+     viewport, same as dragging the mobile artboard.
+     The aspect-ratio below is only a fallback — renderTestView() sets it
+     inline from the chosen frame dims (Aug 2), so a non-default mobile preset
+     like 428x926 gets its real shape instead of being forced back to 390/844. */
   height: 100%;
   width: auto;
   aspect-ratio: 390 / 844;
