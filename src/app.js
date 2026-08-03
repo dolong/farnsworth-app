@@ -8909,10 +8909,22 @@ async function reloadWorkspaceLiveState() {
   }
   await loadFarnsworthDev();
   renderCanvas();
+  // Health-daemon heartbeat (Aug 3 2026): the main-process ConfigWatcherGuard
+  // monitor has no direct way to know an fs.watch callback actually fired and
+  // completed, so it polls this global. Bump it on every successful reload —
+  // without this, the guard would (correctly, but uselessly) flag every
+  // legitimate config.json change as "watcher may be stale" even after the
+  // stale-state bug above was fixed, because it never has any positive
+  // signal to compare against.
+  window.__farnsworthWatcherHeartbeat = (window.__farnsworthWatcherHeartbeat || 0) + 1;
 }
 
 async function handleFolderPicked(folderPath) {
   state.folder = folderPath;
+  // Health-daemon visibility (Aug 3 2026): main-process monitors can't read
+  // renderer module-scope state directly; they poll this global via
+  // executeJavaScript. See src/health-daemon.js ConfigWatcherGuard.
+  window.__farnsworthCurrentFolder = folderPath;
   // Persist to the global setting so PTYs spawned before the WS init
   // (or any code path that reads currentFolder) see the current workspace.
   if (window.farnsworth) await window.farnsworth.setSetting('currentFolder', folderPath);

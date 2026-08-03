@@ -6370,6 +6370,28 @@ app.whenReady().then(async () => {
   startClaudeCodeServer();
   startCodexServer();
 
+  // Health daemon (Aug 3 2026) — self-healing watchdog for three recurring
+  // failure classes: blank renderer windows (arch-mismatch native modules
+  // after a release build), orphaned/unresponsive dev servers (leases from
+  // the port authority above), and stale config watchers. See
+  // farnsworth-health-daemon. isDevTree reuses updatesSupported()'s honest
+  // signal (process.defaultApp / app.isPackaged lies on this renamed dev
+  // tree, see farnsworth-dev-tree-electron-binary) — the renderer watchdog
+  // is a release-build-only concern; a dev-tree black window is the user's
+  // own npm workflow to fix.
+  try {
+    const healthDaemon = require('./src/health-daemon');
+    const hd = healthDaemon.create(mainWindow, {
+      db: db.getRawDb(),
+      instanceId: INSTANCE_NAME,
+      isDevTree: !updatesSupported(),
+    });
+    hd.start();
+    ipcMain.handle('health:status', () => hd.getStatus());
+  } catch (e) {
+    console.warn('[health] daemon failed to start:', e.message);
+  }
+
   // ====================================================================
   // Auto-updater (packaged builds only; dev mode skips it).
   //
