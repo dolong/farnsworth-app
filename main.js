@@ -2950,6 +2950,86 @@ ipcMain.handle('test:save', async (_event, { folder, name, json }) => {
   }
 });
 
+// Node-native test runner (Aug 3 2026) — replaces the Python/websocket-client
+// CDP runner for the actions it correctly implements. See
+// src/farnsworth-test-runner.mjs header + farnsworth-node-test-runner for the
+// two known gaps (switchUser is an unimplemented stub; llm-step always shells
+// to the claude CLI instead of taking the direct-API fast path the Python
+// runner uses). recursivelyHasUnsupportedAction() walks nested if/while steps
+// so a test using either action anywhere still gets routed to the proven
+// Python path — never silently degraded.
+let _nodeTestRunnerMod = null;
+async function getNodeTestRunner() {
+  if (_nodeTestRunnerMod === null) {
+    try { _nodeTestRunnerMod = await import('./src/farnsworth-test-runner.mjs'); }
+    catch (e) { console.warn('[test-runner] Node module unavailable:', e.message); _nodeTestRunnerMod = false; }
+  }
+  return _nodeTestRunnerMod || null;
+}
+
+function recursivelyHasUnsupportedAction(steps, unsupportedSet) {
+  if (!Array.isArray(steps)) return false;
+  for (const step of steps) {
+    if (!step || typeof step !== 'object') continue;
+    if (unsupportedSet.has(step.action)) return true;
+    if (Array.isArray(step.steps) && recursivelyHasUnsupportedAction(step.steps, unsupportedSet)) return true;
+  }
+  return false;
+}
+
+// Attempts the Node-native path. Returns the formatted {ok, code, failed,
+// stdout, stderr} result on success, or null if the test isn't eligible
+// (unsupported action present, no canvas preview, module unavailable, or the
+// run itself threw) — null means "fall back to the Python runner below".
+async function tryNodeTestRunner(testPath) {
+  const mod = await getNodeTestRunner();
+  if (!mod) return null;
+
+  const view = canvasWebContentsViews.values().next().value;
+  if (!view || view.webContents.isDestroyed()) return null;
+
+  let raw;
+  try {
+    raw = await require('fs').promises.readFile(testPath, 'utf8');
+  } catch {
+    return null; // let the Python path produce the real "file not found" error
+  }
+
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch { return null; }
+  const steps = Array.isArray(parsed) ? parsed : (parsed?.steps ?? []);
+  if (!Array.isArray(steps) || steps.length === 0) return null;
+  if (recursivelyHasUnsupportedAction(steps, mod.UNSUPPORTED_ACTIONS)) {
+    console.log('[test-runner] test uses switchUser/llm-step — routing to Python runner');
+    return null;
+  }
+
+  const wc = view.webContents;
+  let attachedHere = false;
+  try {
+    if (!wc.debugger.isAttached()) {
+      wc.debugger.attach('1.1');
+      attachedHere = true;
+    }
+    const result = await mod.runTest(wc, steps, { timeout: 60000 });
+    const lines = result.errors.map((e) => `[error] ${e}`);
+    return {
+      ok: result.ok,
+      code: result.ok ? 0 : 1,
+      failed: result.errors.length,
+      stdout: [`[test-runner:node] ${result.steps}/${result.total} steps completed`, ...lines].join('\n').slice(-4000),
+      stderr: '',
+    };
+  } catch (e) {
+    console.warn('[test-runner] Node path threw, falling back to Python:', e.message);
+    return null;
+  } finally {
+    if (attachedHere) {
+      try { wc.debugger.detach(); } catch {}
+    }
+  }
+}
+
 ipcMain.handle('test:run', async (_event, { path: testPath }) => {
   // test:run takes an absolute test path (not a folder) — the renderer
   // already knows the per-project dir from the test:list response, and
@@ -2957,6 +3037,25 @@ ipcMain.handle('test:run', async (_event, { path: testPath }) => {
   // live anywhere, not just the active project's dir.
   try {
     if (!testPath || typeof testPath !== 'string') return { ok: false, error: 'missing_path' };
+
+    // Try the Node-native path first (no Python/websocket-client
+    // dependency, no CDP-over-WebSocket hop). Falls through to the
+    // existing Python runner untouched if not eligible or if it errors.
+    const nodeResult = await tryNodeTestRunner(testPath);
+    if (nodeResult) {
+      try {
+        const rc = getRelayClient();
+        if (rc && rc.status === 'connected') {
+          rc.send({
+            type: 'test:state',
+            testId: testPath,
+            status: nodeResult.ok ? 'passed' : 'failed',
+            code: nodeResult.code, failed: nodeResult.failed, ts: Date.now(),
+          });
+        }
+      } catch {}
+      return nodeResult;
+    }
     // Spawn the Python test runner. Capture stdout+stderr, resolve with
     // the merged output. Exit code 0 = pass, non-zero = fail (but a test
     // can also exit 0 with "X failed" in stdout — treat that as partial).
