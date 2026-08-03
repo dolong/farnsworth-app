@@ -1023,7 +1023,20 @@ ipcMain.handle('setting:set', async (_event, key, value) => {
 // Farnsworth (--instance=<name>) overwrites it. Killing whatever pid the file
 // currently holds would let one instance kill another instance's dev server.
 // This map only ever holds pids we spawned ourselves.
-const spawnedDevServers = new Map(); // type -> { pid, serverPid, metaPath }
+const spawnedDevServers = new Map(); // type -> { pid, serverPid, metaPath, repoRoot }
+
+// Port authority (Aug 3 2026) — see farnsworth-multi-window-dev-servers.
+// Lazily required so a module-load error here can't take down boot; the
+// allocator degrades to "always return the preferred/hardcoded port" if
+// unavailable, which is exactly today's pre-port-authority behavior.
+let _portAlloc = null;
+function portAlloc() {
+  if (_portAlloc === null) {
+    try { _portAlloc = require('./src/dev-port-allocation'); }
+    catch (e) { console.warn('[port-alloc] module unavailable:', e.message); _portAlloc = false; }
+  }
+  return _portAlloc || null;
+}
 
 function killTrackedDevServers(reason) {
   if (spawnedDevServers.size === 0) return;
@@ -1041,6 +1054,13 @@ function killTrackedDevServers(reason) {
     // Clear the meta so the next launch reports unavailable instead of
     // pointing the canvas at a dead pid.
     if (rec.metaPath) { try { fsSyncLocal.unlinkSync(rec.metaPath); } catch {} }
+    // Release any leased ports for this repo (port authority, Aug 3 2026).
+    if (rec.repoRoot) {
+      const pa = portAlloc();
+      try { if (pa) pa.releaseAllForRepo(db.getRawDb(), rec.repoRoot); } catch (e) {
+        console.warn('[port-alloc] release-on-quit failed:', e.message);
+      }
+    }
   }
   spawnedDevServers.clear();
 }
@@ -1459,8 +1479,9 @@ ipcMain.handle('dev:farnsworth:boot', async (_event, appType = 'devvit', repoRoo
   }
   const scriptName = `farnsworth:${type}`;
   const pkgPath = path.join(repoRoot, 'package.json');
+  let pkg;
   try {
-    const pkg = JSON.parse(await fs.promises.readFile(pkgPath, 'utf8'));
+    pkg = JSON.parse(await fs.promises.readFile(pkgPath, 'utf8'));
     if (!pkg.scripts || !pkg.scripts[scriptName]) {
       return {
         ok: false,
@@ -1476,6 +1497,39 @@ ipcMain.handle('dev:farnsworth:boot', async (_event, appType = 'devvit', repoRoo
     };
   }
 
+  // Port authority (Aug 3 2026): a project opts in with a `farnsworth.ports`
+  // manifest block in package.json (see port-authority-implementation-plan).
+  // Projects WITHOUT the manifest keep today's behavior exactly — their own
+  // scripts hardcode 5174/3000 and nothing here changes. Only when the
+  // manifest declares a port do we lease one from the shared SQLite table
+  // and hand it back via FARNSWORTH_PORT_<ROLE> env vars, so two windows on
+  // the same or different projects stop colliding.
+  const portEnv = {};
+  const portsManifest = pkg?.farnsworth?.ports;
+  if (portsManifest && typeof portsManifest === 'object') {
+    const pa = portAlloc();
+    if (pa) {
+      const rawDb = db.getRawDb();
+      for (const [role, spec] of Object.entries(portsManifest)) {
+        if (!spec || typeof spec.default !== 'number') continue;
+        try {
+          const assigned = pa.allocatePort({
+            db: rawDb,
+            repoRoot,
+            role,
+            preferred: spec.default,
+            rangeStart: spec.rangeStart || spec.default,
+            rangeEnd: spec.rangeEnd || (spec.default + 25),
+            instanceId: INSTANCE_NAME,
+          });
+          portEnv[`FARNSWORTH_PORT_${role.toUpperCase()}`] = String(assigned);
+        } catch (e) {
+          console.warn(`[port-alloc] allocation failed for ${role}:`, e.message);
+        }
+      }
+    }
+  }
+
   // Resolve npm to an ABSOLUTE path and build a PATH that actually reflects
   // how the user installed node (Jul 28). The old code just prepended
   // /opt/homebrew/bin + /usr/local/bin, which silently assumes Homebrew or a
@@ -1487,7 +1541,7 @@ ipcMain.handle('dev:farnsworth:boot', async (_event, appType = 'devvit', repoRoo
   // Same class as the nono-profile and server-runner path bugs: a hardcoded
   // location that happened to be true on the dev machine.
   const npmBin = resolveNpmBin();
-  const env = { ...process.env };
+  const env = { ...process.env, ...portEnv };
   // composeChildPath() is the single source of truth for child PATHs: login
   // shell (both flavors) + discovered version managers + static fallbacks.
   // This site used to assemble the list by hand and so missed the discovery
@@ -1631,6 +1685,7 @@ ipcMain.handle('dev:farnsworth:boot', async (_event, appType = 'devvit', repoRoo
           pid: meta.pid || null,
           serverPid: meta.serverPid || null,
           metaPath,
+          repoRoot,
         });
         resolve({ ok: true, type, url: meta.url, pid: meta.pid, startedAt: meta.startedAt });
       } catch {
@@ -1671,6 +1726,16 @@ ipcMain.handle('dev:farnsworth:stop', async (_event, appType = 'devvit') => {
 
   // Clear the meta so get/re-detect reports unavailable.
   try { await fs.promises.unlink(metaPath); } catch {}
+  // Release any leased ports (port authority, Aug 3 2026) before dropping
+  // the record — repoRoot only lives on the tracked record, not this
+  // handler's params.
+  const rec = spawnedDevServers.get(type);
+  if (rec?.repoRoot) {
+    const pa = portAlloc();
+    try { if (pa) pa.releaseAllForRepo(db.getRawDb(), rec.repoRoot); } catch (e) {
+      console.warn('[port-alloc] release-on-stop failed:', e.message);
+    }
+  }
   // Already killed above -- drop the record so before-quit doesn't re-kill
   // pids that may have been recycled onto unrelated processes by then.
   spawnedDevServers.delete(type);

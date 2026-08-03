@@ -2080,8 +2080,15 @@ function closeEmbedWorker() {
   }
 }
 
+// Raw better-sqlite3 handle, for standalone modules (e.g.
+// src/dev-port-allocation.js) that need db.prepare()/db.exec() directly
+// rather than going through a db.js wrapper function. Added Aug 3 2026
+// for the port-authority integration.
+function getRawDb() { return db; }
+
 module.exports = {
   init,
+  getRawDb,
   close,
   migrateLegacy,
   getSetting, setSetting, getAllSettings, setAllSettings,
