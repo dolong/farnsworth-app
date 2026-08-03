@@ -2332,6 +2332,48 @@ function sendChatEventToCompanions(eventType, payload) {
 // 'chat' handler immediately before calling sendChatMessage(). (Jul 15 2026)
 let pendingCompanionChatId = null;
 
+// --- Companion model sync (Aug 2 2026) --------------------------------------
+// The companion's model picker used to write into a dead alias map that the
+// desktop never read (a 'command'/'setModel' message with no handler here).
+// Real wiring: push the SAME list the desktop's own model picker uses
+// (getAllModelOptions() -- built-ins + custom endpoints), plus the current
+// default, whenever a companion connects/re-syncs or the default changes.
+function sendModelsListToCompanions() {
+  try {
+    const models = getAllModelOptions().map(m => ({
+      id: m.display,
+      label: m.display,
+      desc: m.desc || '',
+      effort: m.effort || null,
+    }));
+    sendChatEventToCompanions('models:list', {
+      models,
+      current: state.settings?.defaultModel || null,
+    });
+  } catch (e) {
+    console.warn('[chat-sync] models:list failed:', e.message);
+  }
+}
+
+// --- Companion live tool-progress sync (Aug 2 2026) -------------------------
+// Previously the companion only heard from the agent at chat:start (once)
+// and chat:done (once) -- during the whole tool-execution loop it sat on a
+// bare "Thinking…" with no visible progress, then the full answer + all the
+// chips appeared at once. This mirrors the in-flight chip list + working
+// label every time either changes, same trimmed shape as companionMessageView
+// uses for history (label + kind only -- no input/output payloads).
+function syncChatProgressToCompanions(agentMsg) {
+  try {
+    sendChatEventToCompanions('chat:progress', {
+      messageId: agentMsg.id,
+      workingLabel: agentMsg.workingLabel || '',
+      chips: (agentMsg.chips || []).filter(c => !c._superseded).slice(-30).map(c => ({ label: c.label, kind: c.kind })),
+    });
+  } catch (e) {
+    console.warn('[chat-sync] chat:progress failed:', e.message);
+  }
+}
+
 // --- Companion history sync (Jul 15 2026) -----------------------------------
 // The companion mirrors whatever conversation the desktop is viewing (one
 // active conversation, Vellum Mobile model). These helpers push snapshots:
@@ -2383,6 +2425,7 @@ function sendChatHistorySnapshot() {
       messages,
     });
     sendConversationListToCompanions();
+    sendModelsListToCompanions();
   } catch (e) {
     console.warn('[chat-sync] snapshot failed:', e.message);
   }
@@ -2432,6 +2475,20 @@ function wireRelay() {
     } else if (t === 'chat:conversation:new') {
       // Companion started a new chat — startNewConversation broadcasts.
       startNewConversation();
+    } else if (t === 'chat:model:select') {
+      // Companion picked a model from its (now real) picker (Aug 2 2026).
+      // One shared default across desktop + companion, same as conversation
+      // switching above — write it through the same path the desktop's own
+      // model-picker popover uses, then echo the confirmed state back so
+      // every connected companion (and the desktop's own chip) stays in
+      // sync.
+      const display = payload.model;
+      if (display && state.settings) {
+        state.settings.defaultModel = display;
+        persistSettings();
+        updateChatInputModelButton?.();
+      }
+      sendModelsListToCompanions();
     } else if (t === 'command') {
       // Companion ran a Farnsworth command
       const name = payload.name;
@@ -12090,6 +12147,10 @@ async function sendChatMessage(opts) {
           workingLabel: `Running ${tu.name}…`,
           chips: nextChips,
         });
+        // Live progress to companion (Aug 2 2026) -- without this the
+        // companion sat on a bare "Thinking…" for the whole tool loop and
+        // only saw chips once the turn fully finished.
+        syncChatProgressToCompanions(agentMsg);
         const toolRes = await window.farnsworth.executeTool(tu.name, tu.input);
         let resultContent;
         if (tu.name === 'test_run') {
@@ -12146,6 +12207,7 @@ async function sendChatMessage(opts) {
           // renderer doesn't resurrect it as an unreferenced leftover chip.
           newChip._superseded = true;
           updateAgentMsg({ chips: withTerm });
+          syncChatProgressToCompanions(agentMsg);
         } else if (tu.name === 'take_canvas_screenshot') {
           if (toolRes.base64) {
             resultContent = [
@@ -12198,6 +12260,7 @@ async function sendChatMessage(opts) {
       // Send tool results back as a user message
       history.push({ role: 'user', content: toolResultBlocks });
       updateAgentMsg({ working: true, workingLabel: 'Thinking' });
+      syncChatProgressToCompanions(agentMsg);
     }
     if (turn.cancelled) {
       // Leave whatever the agent already produced visible and append a quiet
