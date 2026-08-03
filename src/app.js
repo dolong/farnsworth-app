@@ -7020,9 +7020,27 @@ function wireStatusBar() {
     const chip = e.target.closest('.statusbar__chip');
     if (chip && map[chip.id]) openSettings(map[chip.id]);
   });
-  // Cheap polls for the two sources that change outside renderer events.
-  setInterval(() => { refreshGitBranch(); refreshMemStats(); }, 60000);
+  // Cheap polls for the sources that change outside renderer events.
+  setInterval(() => { refreshGitBranch(); refreshMemStats(); refreshFarnsworthDevIfChanged(); }, 60000);
   window.addEventListener('focus', refreshGitBranch);
+}
+
+// Post View stale-state fix, metadata half (Aug 3 2026): the preview
+// metadata file (~/.cache/farnsworth-<appType>.json) lives outside the
+// open project folder, so the fs:watchFolder IPC watcher above never sees
+// it change. Rather than plumb a brand-new main-process watcher for one
+// file, piggyback on the existing 60s status-bar poll: re-fetch
+// farnsworthDev and only re-render when its url/pid/available actually
+// changed, so an already-open Post View picks up a dev-server restart
+// without a manual reset.
+async function refreshFarnsworthDevIfChanged() {
+  if (!state.folder || !window.farnsworth?.devFarnsworthGet) return;
+  const before = state.farnsworthDev || {};
+  await loadFarnsworthDev();
+  const after = state.farnsworthDev || {};
+  if (before.url !== after.url || before.pid !== after.pid || before.available !== after.available) {
+    renderCanvas();
+  }
 }
 
 function openFile(f) {
@@ -8855,6 +8873,44 @@ async function startFromScratch() {
   await handleFolderPicked(res.path);
 }
 
+// Applies a workspace config object's `live` subkey into state.liveConfig.
+// Extracted (Aug 3 2026) from handleFolderPicked so the folder-watcher
+// stale-state fix below can re-run the exact same logic when
+// .farnsworth/config.json changes on disk instead of only at folder-open
+// time. See farnsworth-post-view-stale-state: the watcher used to refresh
+// the Files tree but never reload liveConfig/farnsworthDev, so Post View
+// stayed stale until the user reset Farnsworth or reopened the folder.
+function applyWorkspaceLiveConfig(config) {
+  const liveCfg = config?.live || {};
+  state.liveConfig = {
+    projectName: typeof liveCfg.projectName === 'string' ? liveCfg.projectName : '',
+    subredditName: typeof liveCfg.subredditName === 'string' ? liveCfg.subredditName : '',
+    url: typeof liveCfg.url === 'string' ? liveCfg.url : '',
+    postName: typeof liveCfg.postName === 'string' ? liveCfg.postName : '',
+  };
+}
+
+// Re-reads .farnsworth/config.json + the dev-server preview metadata for
+// the CURRENTLY open folder and re-applies them into state, then
+// re-renders the canvas so an already-visible Post View picks up the
+// change immediately. Called from the folder-open path (once) AND from
+// the UI folder watcher below (whenever config.json or the preview cache
+// file changes while the folder stays open) — same reload, two triggers.
+async function reloadWorkspaceLiveState() {
+  if (!state.folder || !window.farnsworth?.loadWorkspaceConfig) return;
+  try {
+    const res = await window.farnsworth.loadWorkspaceConfig(state.folder);
+    if (res?.ok) {
+      applyWorkspaceLiveConfig(res.config);
+      if (res.config?.appType) state.appType = res.config.appType;
+    }
+  } catch (e) {
+    console.warn('[stale-state] config reload failed:', e?.message || e);
+  }
+  await loadFarnsworthDev();
+  renderCanvas();
+}
+
 async function handleFolderPicked(folderPath) {
   state.folder = folderPath;
   // Persist to the global setting so PTYs spawned before the WS init
@@ -8906,13 +8962,7 @@ async function handleFolderPicked(folderPath) {
   // URL, post name) from .farnsworth/config.json's `live` subkey. Each
   // project has its own — this is what `state.liveConfig` reads from
   // everywhere in the renderer.
-  const liveCfg = config?.live || {};
-  state.liveConfig = {
-    projectName: typeof liveCfg.projectName === 'string' ? liveCfg.projectName : '',
-    subredditName: typeof liveCfg.subredditName === 'string' ? liveCfg.subredditName : '',
-    url: typeof liveCfg.url === 'string' ? liveCfg.url : '',
-    postName: typeof liveCfg.postName === 'string' ? liveCfg.postName : '',
-  };
+  applyWorkspaceLiveConfig(config);
   if (config && config.appType) {
     state.appType = config.appType;
     hideWelcome();
@@ -8977,6 +9027,13 @@ async function startUiFolderWatcher(folderPath) {
           relPath = relPath.slice(state.folder.length + 1);
         } else if (relPath === state.folder) {
           return;  // folder itself changed, not a file
+        }
+        // Post View stale-state fix (Aug 3 2026): the file-tree refresh
+        // below is not enough for .farnsworth/config.json (the `live`
+        // block feeds state.liveConfig) — reload it explicitly so an
+        // already-open Post View updates without a Farnsworth reset.
+        if (relPath === '.farnsworth/config.json') {
+          reloadWorkspaceLiveState();
         }
         const openIdx = openFiles.findIndex(o => o.path === state.folder + '/' + relPath);
         if (openIdx >= 0) {

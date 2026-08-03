@@ -1802,6 +1802,24 @@ async function backfillConceptEmbeddings() {
 // Returns the list of chunk ids written. When vecAvailable is false, the
 // embed step is skipped (FTS5 index is populated instead) — this is the
 // FTS5-only Tier 2 mode that works without sqlite-vec.
+// memory_code_fts is CONTENTLESS FTS5 (content='' above) — it rejects an
+// ordinary `DELETE FROM memory_code_fts WHERE rowid IN (...)` at the SQL
+// level with "cannot DELETE from contentless fts5 table: memory_code_fts".
+// New files indexed fine (nothing to delete yet); every RE-index of a
+// previously-indexed file failed silently in the boot log and left stale
+// search results. Contentless FTS5's only supported delete is the special
+// 'delete' command row, and it must be issued per-rowid (no batch form).
+// Fixed Aug 3 2026 — see farnsworth-tier2-fts5-delete-bug.
+function deleteCodeFtsRows(workspacePath, filePath) {
+  const rows = db.prepare(
+    'SELECT id FROM memory_code_chunks WHERE workspace_path = ? AND file_path = ?'
+  ).all(workspacePath, filePath);
+  if (rows.length === 0) return 0;
+  const del = db.prepare("INSERT INTO memory_code_fts(memory_code_fts, rowid, chunk_text) VALUES('delete', ?, ?)");
+  for (const { id } of rows) del.run(id, '');
+  return rows.length;
+}
+
 async function memoryCodeUpsertFile(workspacePath, filePath, content) {
   if (!db) return { ok: false, error: 'no_db' };
   const hash = hashContent(content);
@@ -1823,7 +1841,7 @@ async function memoryCodeUpsertFile(workspacePath, filePath, content) {
   let vectors = null;
   const tx = db.transaction(() => {
     // Delete old chunks + embeddings + FTS5 entries for this file
-    db.prepare('DELETE FROM memory_code_fts WHERE rowid IN (SELECT id FROM memory_code_chunks WHERE workspace_path = ? AND file_path = ?)').run(workspacePath, filePath);
+    deleteCodeFtsRows(workspacePath, filePath);
     db.prepare('DELETE FROM memory_code_chunks WHERE workspace_path = ? AND file_path = ?').run(workspacePath, filePath);
     if (vecAvailable) {
       db.prepare(`
@@ -1872,7 +1890,7 @@ function memoryCodeRemoveFile(workspacePath, filePath) {
         )
       `).run(workspacePath, filePath);
     }
-    db.prepare('DELETE FROM memory_code_fts WHERE rowid IN (SELECT id FROM memory_code_chunks WHERE workspace_path = ? AND file_path = ?)').run(workspacePath, filePath);
+    deleteCodeFtsRows(workspacePath, filePath);
     db.prepare('DELETE FROM memory_code_chunks WHERE workspace_path = ? AND file_path = ?').run(workspacePath, filePath);
     db.prepare('DELETE FROM memory_indexed_files WHERE workspace_path = ? AND file_path = ?').run(workspacePath, filePath);
   });
