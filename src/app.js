@@ -3485,7 +3485,14 @@ function renderLivePreview() {
   // ratio, or the custom-height override if set).
   const size = el('div', { class: 'artboard__size' });
   if (state.preview === 'post') {
-    size.textContent = 'Reddit · r/SwordAndSupperGame';
+    // Aug 4: was hardcoded 'Reddit · r/SwordAndSupperGame', which labelled
+    // every project's Post View with someone else's subreddit. Derive it the
+    // same way renderPostView() does: Live config first, then folder name.
+    const lcSub = (state.liveConfig?.subredditName || '').trim();
+    const lcProj = (state.liveConfig?.projectName || '').trim();
+    const folderName = state.folder ? state.folder.split('/').pop() : '';
+    const subForLabel = lcSub || lcProj || folderName;
+    size.textContent = subForLabel ? `Reddit · r/${subForLabel}` : 'Reddit';
   } else {
     const w = initialW;
     let h = customH;
