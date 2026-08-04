@@ -3876,20 +3876,10 @@ function renderPostView() {
   `;
   feed.appendChild(comments);
 
-  // Second post teaser (ShrekisSexy)
-  const teaser = el('div', { class: 'post-view__post-teaser' });
-  teaser.innerHTML = `
-    <div class="post-view__post-teaser-avatar"></div>
-    <div class="post-view__post-teaser-body">
-      <div class="post-view__post-teaser-meta">
-        <span class="post-view__author" style="color:#d7dadc;font-weight:500">u/ShrekisSexy</span>
-        <span>· 5 hr. ago</span>
-      </div>
-      <div class="post-view__post-teaser-title">Here are 5 end-game builds without legacy items</div>
-      <div class="post-view__post-teaser-snippet">I just beat two level 1000+ boss rushes as a level 169. These are my 5</div>
-    </div>
-  `;
-  feed.appendChild(teaser);
+  // Aug 4: the "u/ShrekisSexy" next-post teaser was removed at Long's request.
+  // It was hardcoded Sword & Supper filler ("5 end-game builds without legacy
+  // items") that made every project's Post View look like someone else's game.
+  // The comments block is the last element in the feed now.
 
   root.appendChild(feed);
 

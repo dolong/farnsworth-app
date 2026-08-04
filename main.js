@@ -1940,8 +1940,14 @@ ipcMain.handle('project:scaffold', async (event, targetPath) => {
       // config" empty state — even though the template harness serves
       // ?view=post (the splash) perfectly well from the first Go Live.
       const prettyName = String(name).replace(/[-_]+/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
-      cfg.live = { projectName: name, subredditName: '', url: '', postName: prettyName, ...(cfg.live || {}) };
+      // Default the preview subreddit to the project name (Long, Aug 4: new
+      // projects should read r/<project title>), so Post View's Reddit chrome
+      // is about THIS game from the first Go Live instead of showing a
+      // placeholder. Both fields also satisfy the renderPostView() gate on
+      // builds that predate the harness-aware gate.
+      cfg.live = { projectName: name, subredditName: name, url: '', postName: prettyName, ...(cfg.live || {}) };
       cfg.live.projectName = name;
+      if (!cfg.live.subredditName || !String(cfg.live.subredditName).trim()) cfg.live.subredditName = name;
       if (!cfg.live.postName || !String(cfg.live.postName).trim()) cfg.live.postName = prettyName;
       fsSync.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + '\n');
     } catch (e) {
