@@ -1934,8 +1934,15 @@ ipcMain.handle('project:scaffold', async (event, targetPath) => {
       cfg.appType = 'devvit';
       cfg.createdAt = new Date().toISOString();
       cfg.liveGameId = cfg.liveGameId ?? null;
-      cfg.live = { projectName: name, subredditName: '', url: '', postName: '', ...(cfg.live || {}) };
+      // Aug 4: seed a human-readable postName. Post View's render gate needs a
+      // subredditName or postName to be non-empty, so shipping empty strings
+      // made every freshly scaffolded project fall through to the "No Live
+      // config" empty state — even though the template harness serves
+      // ?view=post (the splash) perfectly well from the first Go Live.
+      const prettyName = String(name).replace(/[-_]+/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+      cfg.live = { projectName: name, subredditName: '', url: '', postName: prettyName, ...(cfg.live || {}) };
       cfg.live.projectName = name;
+      if (!cfg.live.postName || !String(cfg.live.postName).trim()) cfg.live.postName = prettyName;
       fsSync.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + '\n');
     } catch (e) {
       console.warn('[scaffold] config write failed:', e.message);

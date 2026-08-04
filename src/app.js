@@ -3700,7 +3700,17 @@ function renderPostView() {
   // — which is misleading when the open folder is unrelated. Show an
   // empty placeholder + Live cogwheel prompt instead. Jul 8 ~10:50 ET.
   const lc = state.liveConfig || {};
-  const hasLiveConfig = (lc.subredditName && lc.subredditName.trim()) || (lc.postName && lc.postName.trim());
+  const hasLiveMeta = (lc.subredditName && lc.subredditName.trim()) || (lc.postName && lc.postName.trim());
+  // Aug 4: a running Devvit harness is enough to render the post preview even
+  // when the Reddit metadata hasn't been filled in yet. Freshly scaffolded
+  // projects serve ?view=post (the template splash) from their first Go Live,
+  // and gating that behind subredditName/postName made Post View look broken:
+  // it showed "No Live config" while mobile/desktop rendered fine, because the
+  // scaffold writes a `live` block with EMPTY strings. The Jul 8 intent (don't
+  // show a misleading mock for non-Devvit folders like Farnsworth itself) is
+  // preserved — no harness AND no metadata still falls through to the empty state.
+  const hasLivePreview = !!(state.farnsworthDev && state.farnsworthDev.available);
+  const hasLiveConfig = hasLiveMeta || hasLivePreview;
   if (!hasLiveConfig) {
     const wrap = el('div', { class: 'post-view post-view--empty' });
     wrap.innerHTML = `
@@ -3714,7 +3724,7 @@ function renderPostView() {
           <svg viewBox="0 0 24 24" fill="currentColor" width="48" height="48"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>
         </div>
         <div class="post-view__empty-title">No Live config for this folder</div>
-        <div class="post-view__empty-text">This workspace doesn't have a Reddit post configured. Open the Live panel's settings to add your subreddit + post name.</div>
+        <div class="post-view__empty-text">No dev server is running and this workspace has no Reddit post configured. Hit Go Live to preview the post, or open the Live panel's settings to add your subreddit + post name.</div>
         <button class="post-view__empty-btn" id="post-view-empty-config-btn">Open Live settings</button>
       </div>
     `;
@@ -3725,6 +3735,24 @@ function renderPostView() {
     return wrap;
   }
   const root = el('div', { class: 'post-view' });
+
+  // Aug 4: derive the Reddit chrome from the open project instead of falling
+  // through to hardcoded Sword & Supper strings. Every project that wasn't
+  // S&S rendered the wrong subreddit, author, and title (flagged Jul 21 for
+  // dontdie-reddit). Metadata from the Live config always wins when present.
+  const projectLabel = (lc.projectName && lc.projectName.trim())
+    || (state.folder ? state.folder.split('/').pop() : '')
+    || '';
+  const subLabel = (lc.subredditName && lc.subredditName.trim())
+    ? 'r/' + lc.subredditName.trim()
+    : (projectLabel ? 'r/' + projectLabel : 'r/your_subreddit');
+  const pillName = (document.getElementById('devvit-user-pill-name')?.textContent || '').trim();
+  const authorLabel = (pillName && pillName !== '…' && pillName !== '(no user)')
+    ? 'u/' + pillName.replace(/^u\//, '')
+    : 'u/developer';
+  const titleLabel = (lc.postName && lc.postName.trim())
+    || projectLabel
+    || 'Untitled post';
 
   // Top nav bar — Reddit header (hamburger + reddit wordmark + search)
   // Hamburger has a small red notification dot in its top-right corner
@@ -3760,13 +3788,13 @@ function renderPostView() {
     <div class="post-view__credit-back"><svg viewBox="0 0 20 20" fill="currentColor"><path d="M12.7 4.3a1 1 0 00-1.4 0l-6 6a1 1 0 000 1.4l6 6a1 1 0 001.4-1.4L7.4 11H17a1 1 0 100-2H7.4l5.3-5.3a1 1 0 000-1.4z"/></svg></div>
     <div style="display:flex;flex-direction:column;gap:2px;min-width:0;">
       <div class="post-view__credit-sub">
-        <span class="post-view__credit-avatar"><img src="assets/reddit/community-icon.png" alt="r/SwordAndSupperGame"/></span>
-        <span class="post-view__credit-sub-name">${(state.liveConfig?.subredditName && ('r/' + state.liveConfig.subredditName)) || 'r/SwordAndSupperGame'}</span>
+        <span class="post-view__credit-avatar"><img src="assets/reddit/community-icon.png" alt="${subLabel}"/></span>
+        <span class="post-view__credit-sub-name">${subLabel}</span>
         <span class="post-view__credit-sub-dot">·</span>
         <span class="post-view__credit-sub-time">19m ago</span>
       </div>
       <div style="font-size:11px;color:#818384;display:flex;align-items:center;gap:4px;">
-        <span style="color:#d7dadc;font-weight:500;">u/MaccaoTooth</span>
+        <span style="color:#d7dadc;font-weight:500;">${authorLabel}</span>
       </div>
     </div>
     <div class="post-view__credit-more"><svg viewBox="0 0 20 20" fill="currentColor"><circle cx="5" cy="10" r="1.4"/><circle cx="10" cy="10" r="1.4"/><circle cx="15" cy="10" r="1.4"/></svg></div>
@@ -3777,8 +3805,7 @@ function renderPostView() {
   // to the hardcoded mock post. (Long Jul 3 ~13:19 ET — "the post name
   // from the config should replace the hardcoded title here.")
   const title = el('h1', { class: 'post-view__title' });
-  title.textContent = (state.liveConfig?.postName && state.liveConfig.postName.trim())
-    || 'Strange Mild Japanese Katsu Curry';
+  title.textContent = titleLabel;
   content.appendChild(title);
 
 
