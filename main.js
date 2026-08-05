@@ -1478,6 +1478,110 @@ function resolveNpmBin() {
   return null;
 }
 
+// ============================================================
+// Go Live dependency preflight (Aug 5 2026)
+// ------------------------------------------------------------
+// Go Live used to validate the workspace, package.json, the farnsworth:<type>
+// script and the npm binary -- then spawn the script and hope. On a machine
+// where `npm install` had never run (or had failed halfway, or where a git
+// pull moved the lockfile), the script died with `sh: vite: command not
+// found` inside a terminal the user has to think to go look at. Farnsworth's
+// first external user hit exactly that on day one.
+//
+// node_modules is not a user decision: there is one correct fix and no reason
+// to make a person type it. So detect the state cheaply and install only when
+// needed -- NOT on every press, which would put seconds of npm work behind a
+// button that should feel instant.
+//
+// Deliberately conservative: if deps still look incomplete after installing,
+// boot anyway and let the script speak. A project whose script calls a
+// globally-installed binary is unusual but legitimate, and a preflight must
+// never be the thing that blocks a setup that would have worked.
+
+// Local binaries a package script will actually exec, following one level of
+// `npm run <other>` indirection. Tokens we can't classify are skipped rather
+// than guessed at, because a false "missing" means a pointless reinstall.
+function binariesUsedByScript(pkg, scriptName, depth = 0, seen = new Set()) {
+  const out = new Set();
+  const cmd = pkg?.scripts?.[scriptName];
+  if (!cmd || depth > 2 || seen.has(scriptName)) return out;
+  seen.add(scriptName);
+  const PASSTHROUGH = new Set([
+    'npm', 'npx', 'pnpm', 'yarn', 'node', 'sh', 'bash', 'zsh', 'env', 'cd',
+    'echo', 'printf', 'wait', 'kill', 'pkill', 'rm', 'mkdir', 'cp', 'mv',
+    'true', 'false', 'set', 'export', 'trap', 'open', 'sleep', 'test', 'if',
+    'then', 'else', 'elif', 'fi', 'for', 'while', 'do', 'done', 'exit', 'exec',
+  ]);
+  for (const seg of String(cmd).split(/&&|\|\||[;|&]/)) {
+    const tokens = seg.trim().split(/\s+/).filter(Boolean);
+    let i = 0;
+    // Skip leading VAR=value env prefixes.
+    while (i < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[i])) i++;
+    const head = tokens[i];
+    if (!head) continue;
+    if ((head === 'npm' || head === 'pnpm' || head === 'yarn') && tokens[i + 1] === 'run' && tokens[i + 2]) {
+      for (const b of binariesUsedByScript(pkg, tokens[i + 2], depth + 1, seen)) out.add(b);
+      continue;
+    }
+    if (PASSTHROUGH.has(head)) continue;
+    // Paths, flags, quotes and shell expansions aren't bare bin names.
+    if (/^[-"'$(]/.test(head) || head.includes('/') || head.includes('$')) continue;
+    if (!/^[A-Za-z0-9@._-]+$/.test(head)) continue;
+    out.add(head);
+  }
+  return out;
+}
+
+function inspectProjectDeps(repoRoot, pkg, scriptName) {
+  const fs = require('fs');
+  const path = require('path');
+  const nm = path.join(repoRoot, 'node_modules');
+  // .package-lock.json is written by npm only when an install COMPLETES, so
+  // it's a better "did this finish" signal than the directory existing.
+  const stamp = path.join(nm, '.package-lock.json');
+
+  if (!fs.existsSync(nm)) return { needsInstall: true, reason: 'this project has no node_modules yet' };
+  if (!fs.existsSync(path.join(nm, '.bin'))) return { needsInstall: true, reason: 'node_modules has no .bin directory' };
+  if (!fs.existsSync(stamp)) return { needsInstall: true, reason: 'a previous npm install never finished' };
+
+  // Declared dependencies that aren't on disk. This is the check that
+  // actually catches the real cases, because the template's Go Live script is
+  // `bash scripts/farnsworth-devvit.sh` -- the binaries it calls are inside
+  // the shell file, invisible to script parsing.
+  //
+  // Presence, not timestamps: an earlier version of this compared the
+  // lockfile mtime to the install stamp, and it reported "stale" on a
+  // perfectly working project (the-last-draft) because the lockfile had been
+  // rewritten after install. A newly-pulled dependency is missing from disk
+  // anyway, so presence catches that failure without the false positives.
+  // Version drift where the package IS installed is deliberately ignored:
+  // that's a much milder problem and not something to fix behind the user's
+  // back on a button press.
+  for (const field of ['dependencies', 'devDependencies']) {
+    const declared = pkg?.[field];
+    if (!declared || typeof declared !== 'object') continue;
+    for (const name of Object.keys(declared)) {
+      // Skip non-registry specs: file:/link:/git deps and workspace protocol
+      // resolve to places this check can't reason about.
+      const spec = String(declared[name] || '');
+      if (/^(file:|link:|workspace:|git|github:|https?:)/i.test(spec)) continue;
+      if (!fs.existsSync(path.join(nm, ...name.split('/')))) {
+        return { needsInstall: true, reason: `${name} is not installed` };
+      }
+    }
+  }
+
+  // The binaries this script is about to call. An interrupted install leaves
+  // node_modules present with bins missing -- the exact shape that produces
+  // "vite: command not found".
+  for (const bin of binariesUsedByScript(pkg, scriptName)) {
+    if (!fs.existsSync(path.join(nm, '.bin', bin))) {
+      return { needsInstall: true, reason: `${bin} is missing from node_modules/.bin` };
+    }
+  }
+  return { needsInstall: false, reason: null };
+}
+
 ipcMain.handle('dev:farnsworth:boot', async (_event, appType = 'devvit', repoRoot) => {
   const fs = require('fs');
   const path = require('path');
@@ -1569,6 +1673,59 @@ ipcMain.handle('dev:farnsworth:boot', async (_event, appType = 'devvit', repoRoo
         'locations. If node is installed, set FARNSWORTH_NPM to the full ' +
         'path of your npm binary and relaunch.',
     };
+  }
+
+  // Dependency preflight -- see inspectProjectDeps() above. Runs before the
+  // emulator wiring so a fresh clone or a half-finished install becomes a
+  // progress message on the Go Live button instead of a dead dev server.
+  {
+    const deps = inspectProjectDeps(repoRoot, pkg, scriptName);
+    if (deps.needsInstall) {
+      console.log(`[dev:farnsworth:boot] installing dependencies (${deps.reason})`);
+      const notify = (payload) => {
+        try { _event.sender.send('dev:farnsworth:progress', { repoRoot, ...payload }); } catch {}
+      };
+      notify({ phase: 'installing', reason: deps.reason });
+      const startedAt = Date.now();
+      try {
+        await execFileAsync(npmBin, ['install', '--no-audit', '--no-fund'], {
+          cwd: repoRoot,
+          timeout: 900000,
+          maxBuffer: 16 * 1024 * 1024,
+          env: {
+            ...env,
+            // Same reason as the scaffold path: redis-memory-server's
+            // postinstall compiles from source and needs GNU Make >= 4, but
+            // macOS ships 3.81, so it fails the whole install. The emulator
+            // replaces Redis locally anyway.
+            REDISMS_DISABLE_POSTINSTALL: '1',
+          },
+        });
+        console.log(`[dev:farnsworth:boot] npm install ok in ${Math.round((Date.now() - startedAt) / 1000)}s`);
+      } catch (e) {
+        const detail =
+          String(e.stderr || e.message || '')
+            .trim()
+            .split('\n')
+            .filter(Boolean)
+            .slice(-1)[0] || 'npm install failed';
+        console.warn('[dev:farnsworth:boot] npm install failed:', detail);
+        notify({ phase: 'install-failed', reason: deps.reason });
+        return {
+          ok: false,
+          error: 'install_failed',
+          message: `Dependencies could not be installed (${deps.reason}). npm said: ${detail}`,
+        };
+      }
+      notify({ phase: 'starting' });
+      const after = inspectProjectDeps(repoRoot, pkg, scriptName);
+      if (after.needsInstall) {
+        // Not fatal on purpose: a script calling a globally-installed binary
+        // is unusual but valid, and the preflight must not block a setup that
+        // would otherwise have worked.
+        console.warn(`[dev:farnsworth:boot] deps still look incomplete (${after.reason}) — booting anyway`);
+      }
+    }
   }
 
   // Tell the project's farnsworth:<type> script where OUR server-runner lives

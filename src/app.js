@@ -60,6 +60,10 @@ const state = {
   // file is missing or the PID is dead.
   farnsworthDev: { available: false },
   farnsworthBooting: false,
+  // 'installing' while Go Live's dependency preflight runs npm install,
+  // 'starting' once the dev server script is actually spawning.
+  farnsworthBootPhase: null,
+  farnsworthBootDetail: '',
   zoom: 100,
 
   // Persisted artboard widths per preview mode (height derives from aspect ratio)
@@ -2971,8 +2975,17 @@ function renderLiveStatus() {
   const type = state.appType || 'devvit';
 
   if (state.farnsworthBooting) {
-    const b = el('button', { class: 'live-status-btn live-status-btn--booting', disabled: true });
-    b.innerHTML = '<span class="live-status-spinner"></span>Starting…';
+    const installing = state.farnsworthBootPhase === 'installing';
+    const b = el('button', {
+      class: 'live-status-btn live-status-btn--booting',
+      disabled: true,
+      // The reason lives in the tooltip so the label stays short: "vite is
+      // missing from node_modules/.bin", "package-lock.json changed", etc.
+      title: installing
+        ? `Installing dependencies${state.farnsworthBootDetail ? ` — ${state.farnsworthBootDetail}` : ''}. First run can take a minute.`
+        : 'Starting the dev server…',
+    });
+    b.innerHTML = `<span class="live-status-spinner"></span>${installing ? 'Installing…' : 'Starting…'}`;
     host.appendChild(b);
     return;
   }
@@ -3383,7 +3396,26 @@ async function bootFarnsworthDev() {
   }
   const type = state.appType || 'devvit';
   state.farnsworthBooting = true;
+  state.farnsworthBootPhase = 'starting';
+  state.farnsworthBootDetail = '';
   renderLiveStatus();
+  // Dependency preflight progress (Aug 5 2026). Without this the button reads
+  // "Starting…" through a multi-minute npm install and looks hung.
+  let offBootProgress = null;
+  try {
+    offBootProgress = window.farnsworth.onDevFarnsworthProgress?.((p) => {
+      if (!p || (p.repoRoot && p.repoRoot !== state.folder)) return;
+      if (p.phase === 'installing') {
+        state.farnsworthBootPhase = 'installing';
+        state.farnsworthBootDetail = p.reason || '';
+        showToast?.(`Installing dependencies — ${p.reason || 'first run'}. This can take a minute.`);
+      } else if (p.phase === 'starting') {
+        state.farnsworthBootPhase = 'starting';
+        state.farnsworthBootDetail = '';
+      }
+      renderLiveStatus();
+    }) || null;
+  } catch {}
   try {
     const res = await window.farnsworth.devFarnsworthBoot(type, state.folder);
     if (res?.ok) {
@@ -3399,7 +3431,10 @@ async function bootFarnsworthDev() {
     showToast?.('Failed to start dev server.');
     console.warn('[Farnsworth] boot error:', e);
   } finally {
+    try { offBootProgress?.(); } catch {}
     state.farnsworthBooting = false;
+    state.farnsworthBootPhase = null;
+    state.farnsworthBootDetail = '';
     renderCanvas();
   }
 }
@@ -8890,7 +8925,10 @@ async function startFromScratch() {
 
   if (status) status.hidden = true;
   if (res.installError) {
-    showToast(`Project created, but dependencies failed to install — run npm install in ${res.name}.`);
+    // Go Live's dependency preflight (Aug 5 2026) retries this automatically,
+    // so a failed scaffold install is no longer a dead end the user has to
+    // discover from a "vite: command not found" in a terminal.
+    showToast(`Project created, but dependencies failed to install — Go Live will retry the install.`);
   } else {
     showToast(`Created ${res.name} — ready to Go Live.`);
   }

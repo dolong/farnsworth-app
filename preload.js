@@ -24,6 +24,16 @@ contextBridge.exposeInMainWorld('farnsworth', {
   devFarnsworthBoot: (appType, repoRoot) => ipcRenderer.invoke('dev:farnsworth:boot', appType, repoRoot),
   // Stop the farnsworth dev server for an app type (kills vite, clears meta).
   devFarnsworthStop: (appType) => ipcRenderer.invoke('dev:farnsworth:stop', appType),
+  // Go Live progress (Aug 5 2026): the boot handler now runs a dependency
+  // preflight, so the button needs to say "Installing…" instead of sitting on
+  // "Starting…" for a minute on a fresh clone.
+  onDevFarnsworthProgress: (callback) => {
+    const handler = (_e, payload) => {
+      try { callback(payload); } catch (e) { console.error('[preload] dev boot progress handler:', e); }
+    };
+    ipcRenderer.on('dev:farnsworth:progress', handler);
+    return () => ipcRenderer.removeListener('dev:farnsworth:progress', handler);
+  },
 
   // Recent folders
   getRecent: () => ipcRenderer.invoke('recent:get'),
