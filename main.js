@@ -66,9 +66,16 @@ if (!IS_DEFAULT_INSTANCE) {
 // The workspace folder is per-instance — that is the whole point of running
 // two. Everything else in settings stays global. Reads and writes both go
 // through this so the renderer can keep saying 'currentFolder'.
+// Settings that describe "what this window is looking at" rather than a user
+// preference. They must not be shared across instances: SHARED_USER_DATA gives
+// every instance the same SQLite file, so an unscoped key means a named dev
+// instance silently reassigns the default app's open folder / active chat.
+// (Aug 5: a test instance clobbered chat.activeId for exactly this reason.)
+const PER_INSTANCE_SETTING_KEYS = new Set(['currentFolder', 'chat.activeId']);
+
 function scopedSettingKey(key) {
-  if (key === 'currentFolder' && !IS_DEFAULT_INSTANCE) {
-    return `currentFolder:${INSTANCE_NAME}`;
+  if (PER_INSTANCE_SETTING_KEYS.has(key) && !IS_DEFAULT_INSTANCE) {
+    return `${key}:${INSTANCE_NAME}`;
   }
   return key;
 }
@@ -988,7 +995,11 @@ ipcMain.handle('settings:set', async (_event, settings) => {
 // unparseable shapes. Single-key reads return the raw stored string.
 ipcMain.handle('setting:get', async (_event, key) => {
   if (!key || typeof key !== 'string') return null;
-  return db.getSetting(key);
+  // Must scope identically to setting:set below, or a named instance writes
+  // 'chat.activeId:<name>' and then reads the DEFAULT instance's value back.
+  // Verified safe: nothing reads 'currentFolder' through this path (main uses
+  // currentFolderSetting(), which already scopes).
+  return db.getSetting(scopedSettingKey(key));
 });
 ipcMain.handle('setting:set', async (_event, key, value) => {
   if (!key || typeof key !== 'string') return { ok: false, error: 'bad_key' };
@@ -7888,6 +7899,68 @@ ipcMain.handle('relay:status', async () => {
 // runs via child_process.exec so the output is captured reliably.
 // ------------------------------------------------------------
 const terminalPtys = new Map(); // ws -> { pty, lastActivity }
+
+// ---- Folder switch: retarget live terminals (Aug 5) -----------------------
+// A PTY's cwd is fixed at spawn, so every terminal tab opened before an Open
+// Folder kept sitting in the previous project. New tabs were fine (the
+// renderer sends the current folder in its WS init), which is exactly why
+// this stayed invisible for so long.
+//
+// An idle shell gets a real `cd` typed into it: non-destructive, keeps the
+// shell, its env and its history, and the user can see what happened. A shell
+// with a running foreground child (dev server, test watcher, npm install) is
+// left strictly alone -- writing to it would inject keystrokes into that
+// program -- and reported back so the renderer can say so out loud.
+function shQuoteSingle(s) {
+  return "'" + String(s).replace(/'/g, "'\\''") + "'";
+}
+
+// True when the shell has at least one child process, i.e. something is
+// running in the foreground. `pgrep -P` is cheap and present on macOS/Linux.
+function ptyHasRunningChild(pid) {
+  if (!pid) return false;
+  try {
+    const out = require('child_process').execFileSync('pgrep', ['-P', String(pid)], {
+      encoding: 'utf8', timeout: 2000, stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    return out.trim().length > 0;
+  } catch (e) {
+    // pgrep exits 1 with no output when there are no children -- that is the
+    // common, healthy "idle shell" case, not an error.
+    if (e && e.status === 1) return false;
+    // Anything else (pgrep missing, timeout): treat as busy. Skipping a
+    // retarget is recoverable; typing into a running program is not.
+    return true;
+  }
+}
+
+ipcMain.handle('terminal:retarget', async (_event, requestedCwd) => {
+  const cwd = requestedCwd || currentFolderSetting();
+  if (!cwd) return { ok: false, error: 'no_folder' };
+  const moved = [];
+  const busy = [];
+  for (const [ws, entry] of terminalPtys.entries()) {
+    if (!ws || ws.readyState !== 1 /* OPEN */ || !entry || !entry.pty) continue;
+    if (ptyHasRunningChild(entry.pty.pid)) { busy.push(entry.tabId); continue; }
+    try {
+      // \x15 (Ctrl-U) clears any half-typed command first so the cd cannot
+      // get appended to it.
+      entry.pty.write('\x15cd ' + shQuoteSingle(cwd) + '\n');
+      moved.push(entry.tabId);
+    } catch (e) {
+      busy.push(entry.tabId);
+    }
+  }
+  // Claude Code sessions cannot be moved at all: `claude` is the PTY's own
+  // process and its cwd is fixed for its lifetime. Worse, a stale one is an
+  // agent pointed at the wrong repo. Report them so the user is told rather
+  // than silently letting an agent edit the previous project.
+  const staleAgents = [];
+  for (const entry of claudeCodePtys.values()) {
+    if (entry && entry.cwd && entry.cwd !== cwd) staleAgents.push(entry.tabId);
+  }
+  return { ok: true, cwd, moved, busy, staleAgents };
+});
 
 function getActiveTerminalPty() {
   let best = null;

@@ -8943,7 +8943,78 @@ async function reloadWorkspaceLiveState() {
   window.__farnsworthWatcherHeartbeat = (window.__farnsworthWatcherHeartbeat || 0) + 1;
 }
 
+// Moves every idle live terminal into the freshly opened project and says so
+// out loud when something could not be moved. Fire-and-forget: a terminal
+// that cannot be retargeted must not block the folder switch.
+async function retargetTerminalsToFolder(folderPath, previousFolder) {
+  if (!window.farnsworth?.terminalRetarget) return;
+  let res = null;
+  try {
+    res = await window.farnsworth.terminalRetarget(folderPath);
+  } catch (e) {
+    console.warn('[folder switch] terminal retarget failed:', e?.message || e);
+    return;
+  }
+  if (!res?.ok) return;
+  const oldName = (previousFolder || '').split('/').filter(Boolean).pop() || 'the previous project';
+  const plural = (n, word) => n + ' ' + word + (n === 1 ? '' : 's');
+  const notes = [];
+  if (res.busy?.length) {
+    notes.push(plural(res.busy.length, 'terminal') + ' still running a command in ' + oldName);
+  }
+  if (res.staleAgents?.length) {
+    notes.push(plural(res.staleAgents.length, 'Claude Code session') +
+      ' still attached to ' + oldName + ' \u2014 close and reopen the tab to move it');
+  }
+  if (notes.length) showToast(notes.join(' \u00b7 '));
+  if (res.moved?.length) {
+    console.log('[folder switch] retargeted ' + res.moved.length + ' terminal(s) to ' + folderPath);
+  }
+}
+
+// Keeps the chat thread on the project you are actually looking at. Compares
+// the active conversation's own workspace_path against the folder being
+// opened rather than just "did the folder change", so it fixes the boot path
+// too (chat.activeId is restored before the folder is) and does NOT wipe your
+// thread when you reopen the same project.
+async function ensureChatMatchesWorkspace(folderPath) {
+  if (!state.chatActiveId || !window.farnsworth?.chatConvLoad) return;
+  let convWs = null;
+  let convMissing = false;
+  try {
+    const conv = await window.farnsworth.chatConvLoad(state.chatActiveId);
+    if (!conv) convMissing = true;
+    else convWs = typeof conv.workspace_path === 'string' ? conv.workspace_path : null;
+  } catch (e) {
+    console.warn('[folder switch] chat scope check failed:', e?.message || e);
+    return;
+  }
+  // Same project: keep the thread exactly as it was.
+  if (!convMissing && convWs === folderPath) return;
+
+  // The outgoing thread has no user turn yet, so it is just a placeholder --
+  // delete it instead of littering history with empty "New chat" rows on
+  // every folder switch.
+  const hasUserTurn = (state.chatMessages || []).some((m) => m && m.role === 'user');
+  if (!hasUserTurn) {
+    const orphan = state.chatActiveId;
+    state.chatActiveId = null;
+    state.chatMessages = [];
+    if (!convMissing) {
+      try { await window.farnsworth.chatConvDelete(orphan); } catch {}
+    }
+  }
+  // startNewConversation() saves the outgoing thread (when it still has one),
+  // creates the row against the now-current workspace, resets the transcript,
+  // re-renders and pushes the fresh thread to any companions.
+  await startNewConversation();
+}
+
 async function handleFolderPicked(folderPath) {
+  // The folder we are leaving. Needed to tell a real switch apart from a
+  // reopen/boot-restore of the same project (Aug 5) -- terminals only need
+  // retargeting on an actual change.
+  const previousFolder = state.folder;
   state.folder = folderPath;
   // Health-daemon visibility (Aug 3 2026): main-process monitors can't read
   // renderer module-scope state directly; they poll this global via
@@ -8952,6 +9023,15 @@ async function handleFolderPicked(folderPath) {
   // Persist to the global setting so PTYs spawned before the WS init
   // (or any code path that reads currentFolder) see the current workspace.
   if (window.farnsworth) await window.farnsworth.setSetting('currentFolder', folderPath);
+  // Aug 5: live PTYs spawned in the old project stayed there. Do this after
+  // the currentFolder setting is written so main's fallback agrees with us.
+  if (previousFolder && previousFolder !== folderPath) {
+    retargetTerminalsToFolder(folderPath, previousFolder);
+  }
+  // Aug 5: the chat used to carry the previous project's conversation across
+  // a folder switch. chat_conversations rows are workspace-scoped already;
+  // only the active-id pointer was global.
+  await ensureChatMatchesWorkspace(folderPath);
   // Workspace changed — force Tasks panel + Files tree to re-load from
   // disk on next mount. Files used to walk the whole tree eagerly on
   // every folder pick (incl. boot), which blocked main process for

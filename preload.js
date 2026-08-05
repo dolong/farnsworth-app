@@ -282,6 +282,10 @@ contextBridge.exposeInMainWorld('farnsworth', {
   // chat panel remains a custom API client; this panel is Anthropic's
   // Claude Code binary running as a child process.
   getClaudeCodeWsUrl: () => ipcRenderer.invoke('claudeCode:getWsUrl'),
+  // Folder switch: `cd` every idle live PTY into the newly opened project.
+  // Returns { ok, cwd, moved[], busy[], staleAgents[] }.
+  terminalRetarget: (cwd) => ipcRenderer.invoke('terminal:retarget', cwd),
+
   claudeCodeClose: (tabId) => ipcRenderer.invoke('claudeCode:close', tabId),
   // Tab persistence — restore the panel's open tabs across restarts.
   claudeCodeListTabs: () => ipcRenderer.invoke('claudeCode:listTabs'),
