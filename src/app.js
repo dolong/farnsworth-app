@@ -10412,7 +10412,7 @@ function oauthDisconnectedHTML() {
         Sign in with Claude Code CLI
       </button>
       <div class="oauth-help">Uses the login Claude Code CLI already stored in your Keychain.</div>
-      <div class="oauth-help" style="margin-top:10px;">Don't have Claude Code CLI? Install with <code>npm i -g @anthropic-ai/claude-code</code> and run <code>claude login</code> first, then click above.</div>
+      <div class="oauth-help" style="margin-top:10px;">Don't have Claude Code CLI? Install with <code>npm i -g @anthropic-ai/claude-code</code> and run <code>claude auth login</code> first, then click above.</div>
       <details style="margin-top:14px;">
         <summary style="cursor:pointer; font-size:12px; color:var(--text-dim); user-select:none;">Sign in with claude.ai directly (likely broken)</summary>
         <div style="margin-top:8px;">
@@ -10517,6 +10517,77 @@ async function disconnectOAuth() {
   renderSettings();
 }
 
+// ---- Claude Code CLI sign-in: code prompt (Aug 5) -------------------------
+// `claude auth login` opens the browser and then blocks on "Paste code here
+// if prompted >". Main forwards the URL + that prompt over
+// onClaudeLoginEvent; this overlay collects the code no matter where sign-in
+// was started (Settings or the Claude Code panel) and hands it back.
+let claudeLoginCodeOverlay = null;
+
+function closeClaudeLoginCodePrompt() {
+  if (claudeLoginCodeOverlay) { try { claudeLoginCodeOverlay.remove(); } catch {} }
+  claudeLoginCodeOverlay = null;
+}
+
+function showClaudeLoginCodePrompt(url, errorText) {
+  closeClaudeLoginCodePrompt();
+  const ov = document.createElement('div');
+  claudeLoginCodeOverlay = ov;
+  ov.style.cssText = 'position:fixed;inset:0;z-index:10000;background:rgba(0,0,0,.62);display:flex;align-items:center;justify-content:center;';
+  ov.innerHTML = `
+    <div style="width:430px;max-width:92vw;background:#1f2024;border:1px solid #2a2c32;border-radius:14px;padding:20px;box-shadow:0 18px 60px rgba(0,0,0,.6);font-size:13px;color:var(--text,#e6e6e6);">
+      <div style="font-size:15px;font-weight:600;margin-bottom:6px;">Finish signing in to Claude Code</div>
+      <div style="color:var(--text-dim,#9aa0a6);line-height:1.55;margin-bottom:12px;">
+        A browser tab opened for the consent screen. Approve it, copy the code it gives you, and paste it below.
+      </div>
+      ${url ? '<button data-act="reopen" class="btn btn--ghost btn--sm" style="margin-bottom:12px;">Reopen the consent page</button>' : ''}
+      <input data-role="code" type="text" placeholder="Paste code here" autocomplete="off" spellcheck="false"
+        style="width:100%;box-sizing:border-box;background:#141519;border:1px solid #2a2c32;border-radius:9px;padding:9px 11px;color:inherit;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;" />
+      <div data-role="err" style="color:#e06c6c;margin-top:8px;min-height:16px;line-height:1.4;"></div>
+      <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:6px;">
+        <button data-act="cancel" class="btn btn--ghost btn--sm">Cancel</button>
+        <button data-act="submit" class="btn btn--primary btn--sm">Submit code</button>
+      </div>
+    </div>`;
+  document.body.appendChild(ov);
+
+  const input = ov.querySelector('[data-role="code"]');
+  const errEl = ov.querySelector('[data-role="err"]');
+  if (errorText) errEl.textContent = errorText;
+  const submit = async () => {
+    const code = (input.value || '').trim();
+    if (!code) { errEl.textContent = 'Paste the code from the browser first.'; return; }
+    errEl.textContent = '';
+    try {
+      const res = await window.farnsworth.claudeCodeSubmitLoginCode(code);
+      if (res && res.ok) { closeClaudeLoginCodePrompt(); }
+      else { errEl.textContent = (res && res.message) || 'Could not submit the code.'; }
+    } catch (e) {
+      errEl.textContent = 'Could not submit the code: ' + e.message;
+    }
+  };
+  ov.querySelector('[data-act="submit"]').addEventListener('click', submit);
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
+  ov.querySelector('[data-act="cancel"]').addEventListener('click', async () => {
+    closeClaudeLoginCodePrompt();
+    try { await window.farnsworth.claudeCodeCancelLogin(); } catch {}
+  });
+  const reopenBtn = ov.querySelector('[data-act="reopen"]');
+  if (reopenBtn && url) {
+    reopenBtn.addEventListener('click', () => {
+      try { window.farnsworth.openExternal(url); } catch {}
+    });
+  }
+  setTimeout(() => { try { input.focus(); } catch {} }, 50);
+}
+
+if (window.farnsworth && window.farnsworth.onClaudeLoginEvent) {
+  window.farnsworth.onClaudeLoginEvent((kind, payload) => {
+    if (kind === 'needCode') showClaudeLoginCodePrompt(payload && payload.url, payload && payload.error);
+    else if (kind === 'done') closeClaudeLoginCodePrompt();
+  });
+}
+
 async function importFromKeychain() {
   if (!window.farnsworth) return;
   const importBtn = $('#oauth-import-keychain-btn');
@@ -10527,7 +10598,7 @@ async function importFromKeychain() {
   // the browser, captures the local-loopback callback, writes the token to
   // the OS credential store, and exits. Main then auto-imports the entry.
   if (!res.ok && res.error === 'no_credentials' && window.farnsworth.runClaudeLogin) {
-    if (importBtn) { importBtn.disabled = true; importBtn.textContent = 'Running claude login… (browser opened, please authorize)'; }
+    if (importBtn) { importBtn.disabled = true; importBtn.textContent = 'Signing in… (browser opened, please authorize)'; }
     res = await window.farnsworth.runClaudeLogin();
   }
 
@@ -10541,7 +10612,7 @@ async function importFromKeychain() {
     renderSettings();
   } else {
     if (importBtn) { importBtn.disabled = false; importBtn.textContent = 'Sign in with Claude Code CLI'; }
-    alert('Could not sign in: ' + (res.message || res.error) + '\n\nRun `claude login` in a Terminal first if you don\'t have Claude Code CLI installed.');
+    alert('Could not sign in: ' + (res.message || res.error) + '\n\nRun `claude auth login` in a Terminal first if you don\'t have Claude Code CLI installed.');
   }
 }
 
@@ -12749,9 +12820,15 @@ async function initClaudeCode(tabId) {
             claudeCodeSessions.delete(tabId);
             initClaudeCode(tabId);
           }, 600);
+        } else if (res && res.error === 'cancelled') {
+          statusEl.className = 'claudecode__signin-status';
+          statusEl.textContent = 'Sign-in cancelled.';
+          btn.disabled = false;
+          btn.classList.remove('is-loading');
+          refreshBtn.disabled = false;
         } else {
           statusEl.className = 'claudecode__signin-status is-error';
-          statusEl.textContent = (res && res.message) || 'Sign-in failed. Try again or run `claude login` in Terminal.';
+          statusEl.textContent = (res && res.message) || 'Sign-in failed. Try again, or run `claude auth login` in Terminal and hit Re-check.';
           btn.disabled = false;
           btn.classList.remove('is-loading');
           refreshBtn.disabled = false;

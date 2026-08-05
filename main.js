@@ -4779,20 +4779,155 @@ ipcMain.handle('auth:importFromKeychain', async () => {
   };
 });
 
-// Spawn `claude login` as a child process. The CLI opens the browser to
-// claude.ai/oauth/authorize, captures the local-loopback callback itself,
-// exchanges the code for tokens, and writes them to the OS credential store.
-// After the child exits (success or failure), we read the freshly-written
-// credential store entry via the same keychain-import path as the manual
-// Import button.
+// ---- Claude Code CLI login (shared: Settings + the Claude Code panel) -----
+// Aug 5: a friend's fresh install could not sign in — the card showed
+// "`claude login` exited with code 1". Two bugs, both here:
 //
-// Cross-platform: uses `which`/`where` first, then common install paths.
-ipcMain.handle('auth:runClaudeLogin', async () => {
-  const fs = require('fs');
-  const path = require('path');
-  const { spawn } = require('child_process');
+//   1. Claude Code 2.x has no top-level `login` subcommand. `claude login`
+//      is parsed as a *prompt*, so the CLI answers "Not logged in · Please
+//      run /login" and exits 1. The real command is `claude auth login`.
+//   2. `claude auth login` does NOT capture a loopback callback (verified on
+//      2.1.204 both with and without a TTY): it opens the browser with
+//      redirect_uri=platform.claude.com/oauth/code/callback, prints the URL,
+//      then blocks on "Paste code here if prompted >". With stdio:'ignore'
+//      that flow can never complete, and the CLI's real error text was
+//      thrown away, leaving a bare exit code on screen.
+//
+// So: pipe stdio, forward the URL + the code prompt to the renderer, and
+// accept the pasted code back over claudeCode:submitLoginCode.
+let activeClaudeLoginChild = null;
+let claudeLoginCancelled = false;
 
-  // 1) Find the `claude` binary (bundled Resources/bin/claude first, Jul 7 ~21:02 ET).
+function stripTerminalEscapes(s) {
+  return String(s)
+    // OSC-8 hyperlink wrappers (claude wraps the auth URL in one)
+    .replace(/\x1b\]8;;[^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
+    .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
+}
+
+function extractClaudeAuthUrl(text) {
+  const m = stripTerminalEscapes(text).match(/https:\/\/claude\.(?:com|ai)\/\S*oauth\S*/);
+  return m ? m[0] : null;
+}
+
+// Spawns `claude auth login`, streams the URL + code prompt to `sender`,
+// resolves with { ok, exitCode, output }. Never throws.
+function runClaudeCliLogin(claudePath, sender) {
+  const { spawn } = require('child_process');
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(claudePath, ['auth', 'login'], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        detached: false,
+        env: { ...process.env, NO_COLOR: '1', FORCE_COLOR: '0' },
+      });
+    } catch (e) {
+      return resolve({ ok: false, error: 'spawn_failed', message: 'Failed to spawn `claude auth login`: ' + e.message });
+    }
+    activeClaudeLoginChild = child;
+    claudeLoginCancelled = false;
+
+    const emit = (channel, payload) => {
+      try { if (sender && !sender.isDestroyed()) sender.send(channel, payload); } catch {}
+    };
+
+    let out = '';
+    let sentUrl = null;
+    let askedForCode = false;
+    let rejections = 0;
+
+    const onChunk = (buf) => {
+      out += buf.toString();
+      const clean = stripTerminalEscapes(out);
+      const url = extractClaudeAuthUrl(out);
+      if (url && url !== sentUrl) {
+        sentUrl = url;
+        emit('claudeCode:login:url', { url });
+      }
+      if (!askedForCode && /Paste code/i.test(clean)) {
+        askedForCode = true;
+        emit('claudeCode:login:needCode', { url: sentUrl });
+      }
+      // A wrong code does not exit — the CLI prints "Invalid code" and
+      // prompts again. Re-open the prompt with the reason instead of leaving
+      // the user waiting on a child that is silently still running.
+      const seen = (clean.match(/Invalid code/gi) || []).length;
+      if (seen > rejections) {
+        rejections = seen;
+        emit('claudeCode:login:needCode', { url: sentUrl, error: 'That code was rejected. Copy the full code from the browser and try again.' });
+      }
+    };
+    child.stdout.on('data', onChunk);
+    child.stderr.on('data', onChunk);
+
+    let settled = false;
+    const finish = (res) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (activeClaudeLoginChild === child) activeClaudeLoginChild = null;
+      emit('claudeCode:login:done', { ok: !!res.ok });
+      resolve({ ...res, output: stripTerminalEscapes(out) });
+    };
+
+    // 5-minute cap — covers the browser-authorize round trip plus margin.
+    const timer = setTimeout(() => {
+      try { child.kill('SIGTERM'); } catch {}
+      finish({ ok: false, error: 'timeout', message: '`claude auth login` timed out after 5 minutes. You can also run `claude auth login` in Terminal, then hit Re-check.' });
+    }, 5 * 60 * 1000);
+
+    child.on('exit', (code) => {
+      if (claudeLoginCancelled) {
+        return finish({ ok: false, error: 'cancelled', message: 'Sign-in cancelled.' });
+      }
+      finish({ ok: code === 0, exitCode: code });
+    });
+    child.on('error', (err) => finish({ ok: false, error: 'spawn_failed', message: '`claude auth login` child error: ' + err.message }));
+  });
+}
+
+// Surface the CLI's own last words instead of a bare exit code.
+function claudeLoginFailureMessage(res) {
+  if (res.error === 'cancelled') return res.message || 'Sign-in cancelled.';
+  const tail = String(res.output || '')
+    .split('\n')
+    .map((l) => l.trim())
+    // Drop the noise lines: the 400-char auth URL and the paste prompt.
+    .filter((l) => l && !/https:\/\/claude\.(?:com|ai)/.test(l) && !/^Paste code/i.test(l) && !/^Opening browser/i.test(l))
+    .slice(-3)
+    .join(' · ');
+  const base = res.message || ('`claude auth login` exited with code ' + res.exitCode);
+  return tail ? base + ' — ' + tail : base;
+}
+
+// The renderer hands back the code the browser showed, into the child's stdin.
+ipcMain.handle('claudeCode:submitLoginCode', async (_event, code) => {
+  const child = activeClaudeLoginChild;
+  if (!child || child.killed) {
+    return { ok: false, error: 'no_active_login', message: 'No sign-in is running. Click Sign in again.' };
+  }
+  const value = String(code || '').trim();
+  if (!value) return { ok: false, error: 'empty_code', message: 'Paste the code from the browser first.' };
+  try {
+    child.stdin.write(value + '\n');
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: 'write_failed', message: 'Could not hand the code to the CLI: ' + e.message };
+  }
+});
+
+ipcMain.handle('claudeCode:cancelLogin', async () => {
+  const child = activeClaudeLoginChild;
+  claudeLoginCancelled = true;
+  try { if (child && !child.killed) child.kill('SIGTERM'); } catch {}
+  return { ok: true };
+});
+
+// Settings -> "Sign in with Claude Code CLI". Runs the CLI login, then reads
+// the freshly-written credential-store entry via the same keychain-import
+// path as the manual Import button.
+ipcMain.handle('auth:runClaudeLogin', async (event) => {
   const claudePath = findClaudePath();
   if (!claudePath) {
     return {
@@ -4802,41 +4937,16 @@ ipcMain.handle('auth:runClaudeLogin', async () => {
     };
   }
 
-  // 2) Spawn `claude login`. stdio: 'ignore' keeps the main-process terminal
-  // quiet; the user sees the browser open as the visible signal. The CLI
-  // captures its own local-loopback callback, so we just wait for exit.
-  return await new Promise((resolve) => {
-    let child;
-    try {
-      child = spawn(claudePath, ['login'], { stdio: 'ignore', detached: false });
-    } catch (e) {
-      return resolve({ ok: false, error: 'spawn_failed', message: 'Failed to spawn `claude login`: ' + e.message });
-    }
-
-    // 5-minute cap — covers the typical browser-authorize flow plus margin.
-    const timeout = setTimeout(() => {
-      try { child.kill('SIGTERM'); } catch {}
-      resolve({ ok: false, error: 'timeout', message: '`claude login` timed out after 5 minutes. Try again or run `claude login` in a terminal yourself.' });
-    }, 5 * 60 * 1000);
-
-    child.on('exit', async (code) => {
-      clearTimeout(timeout);
-      if (code !== 0) {
-        return resolve({ ok: false, error: 'claude_login_failed', message: '`claude login` exited with code ' + code + '. Try again or run `claude login` in a terminal.' });
-      }
-      // claude login wrote a fresh entry to the OS credential store.
-      // Re-read it via the same path as auth:importFromKeychain so the
-      // renderer doesn't need to call two IPCs in sequence.
-      const result = await importFromKeychainCore();
-      if (result.ok) result.claudeLoginRan = true;
-      resolve(result);
-    });
-
-    child.on('error', (err) => {
-      clearTimeout(timeout);
-      resolve({ ok: false, error: 'spawn_failed', message: '`claude login` child error: ' + err.message });
-    });
-  });
+  const res = await runClaudeCliLogin(claudePath, event && event.sender);
+  if (!res.ok) {
+    return { ok: false, error: res.error || 'claude_login_failed', message: claudeLoginFailureMessage(res) };
+  }
+  // The CLI wrote a fresh entry to the OS credential store. Re-read it via
+  // the same path as auth:importFromKeychain so the renderer doesn't need to
+  // call two IPCs in sequence.
+  const result = await importFromKeychainCore();
+  if (result.ok) result.claudeLoginRan = true;
+  return result;
 });
 
 // Reusable: read Claude Code CLI's OAuth blob from the OS credential store
@@ -4874,7 +4984,7 @@ async function importFromKeychainCore() {
     return {
       ok: false,
       error: 'no_credentials',
-      message: 'No Claude Code credentials found in the OS credential store. Sign in once via Claude Code CLI first (run `claude login` in Terminal), then click Import again.',
+      message: 'No Claude Code credentials found in the OS credential store. Sign in once via Claude Code CLI first (run `claude auth login` in Terminal), then click Import again.',
     };
   }
 
@@ -7362,58 +7472,31 @@ ipcMain.handle('claudeCode:checkAuth', async () => {
   }
 });
 
-ipcMain.handle('claudeCode:runLogin', async () => {
-  // Delegate to the existing auth:runClaudeLogin handler. It spawns
-  // `claude login`, waits for the Keychain to update, and returns the
-  // import result. We re-export it under the claudeCode: namespace so
-  // the panel's own IPC surface is self-contained.
-  const { ipcMain: ipc } = require('electron');
-  // Re-run the same logic by calling the handler directly via a synthetic
-  // event — simpler is to just inline-import the function. But the
-  // existing handler is registered as an anonymous async arrow, so the
-  // easiest path is to invoke the IPC by name through the handler map.
-  // Electron doesn't expose handlers by name publicly, so we re-implement
-  // the call by spawning `claude login` here and watching Keychain.
-  const { execSync, spawn } = require('child_process');
+ipcMain.handle('claudeCode:runLogin', async (event) => {
+  // Same shared runner as Settings' auth:runClaudeLogin, then verify through
+  // the exact check the sign-in gate uses — so "signed in" here can never
+  // disagree with claudeCode:checkAuth.
   const claudePath = findClaudePath();
   if (!claudePath) {
     return { ok: false, error: 'claude_not_found', message: 'Claude Code CLI not found. Install with: npm i -g @anthropic-ai/claude-code' };
   }
 
-  return await new Promise((resolve) => {
-    let child;
-    try {
-      child = spawn(claudePath, ['login'], { stdio: 'ignore', detached: false });
-    } catch (e) {
-      return resolve({ ok: false, error: 'spawn_failed', message: 'Failed to spawn `claude login`: ' + e.message });
+  const res = await runClaudeCliLogin(claudePath, event && event.sender);
+  if (!res.ok) {
+    return { ok: false, error: res.error || 'claude_login_failed', message: claudeLoginFailureMessage(res) };
+  }
+
+  try {
+    const check = await verifyClaudeCodeKeychainAuth();
+    if (check && check.hasAuth) {
+      return { ok: true, hasAuth: true, claudeLoginRan: true, source: check.source };
     }
-    const timeout = setTimeout(() => {
-      try { child.kill('SIGTERM'); } catch {}
-      resolve({ ok: false, error: 'timeout', message: '`claude login` timed out after 5 minutes.' });
-    }, 5 * 60 * 1000);
-    child.on('exit', async (code) => {
-      clearTimeout(timeout);
-      if (code !== 0) {
-        return resolve({ ok: false, error: 'claude_login_failed', message: '`claude login` exited with code ' + code });
-      }
-      // claude login wrote a fresh Keychain entry. Verify + return status.
-      try {
-        const out = execSync('security find-generic-password -s "Claude Code-credentials" -w', { encoding: 'utf8', timeout: 5000 }).trim();
-        if (out && out.startsWith('{')) {
-          const blob = JSON.parse(out);
-          const oauth = blob.claudeAiOauth || blob;
-          if (oauth.accessToken) {
-            return resolve({ ok: true, hasAuth: true, claudeLoginRan: true });
-          }
-        }
-      } catch {}
-      resolve({ ok: false, error: 'no_keychain_after_login', message: '`claude login` exited but no Keychain entry was written.' });
-    });
-    child.on('error', (err) => {
-      clearTimeout(timeout);
-      resolve({ ok: false, error: 'spawn_failed', message: '`claude login` child error: ' + err.message });
-    });
-  });
+  } catch {}
+  return {
+    ok: false,
+    error: 'no_keychain_after_login',
+    message: '`claude auth login` finished but no credentials landed in the OS credential store. Try Re-check, or run `claude auth login` in Terminal.',
+  };
 });
 
 // ============================================================

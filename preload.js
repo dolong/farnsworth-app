@@ -293,6 +293,23 @@ contextBridge.exposeInMainWorld('farnsworth', {
   // Keychain to update, returns the result).
   claudeCodeCheckAuth: () => ipcRenderer.invoke('claudeCode:checkAuth'),
   claudeCodeRunLogin: () => ipcRenderer.invoke('claudeCode:runLogin'),
+  // `claude auth login` prints an auth URL, then blocks waiting for the code
+  // the callback page shows (Claude Code 2.x has no loopback callback). Main
+  // forwards both events; the renderer collects the code and sends it back.
+  claudeCodeSubmitLoginCode: (code) => ipcRenderer.invoke('claudeCode:submitLoginCode', code),
+  claudeCodeCancelLogin: () => ipcRenderer.invoke('claudeCode:cancelLogin'),
+  onClaudeLoginEvent: (callback) => {
+    const channels = ['claudeCode:login:url', 'claudeCode:login:needCode', 'claudeCode:login:done'];
+    const bound = channels.map((ch) => {
+      const handler = (_e, payload) => {
+        try { callback(ch.split(':').pop(), payload || {}); }
+        catch (err) { console.error('[claude-login] handler error:', err); }
+      };
+      ipcRenderer.on(ch, handler);
+      return [ch, handler];
+    });
+    return () => bound.forEach(([ch, handler]) => ipcRenderer.removeListener(ch, handler));
+  },
 
   // Codex panel (mirrors the Claude Code panel IPC surface, Jul 14).
   // codexStatus (Settings → AI detection) already exists above; these are
