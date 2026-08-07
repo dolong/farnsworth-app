@@ -2390,8 +2390,28 @@ function syncChatProgressToCompanions(agentMsg) {
 // Strips working placeholders, context cards, and chip input/output payloads
 // (expandable-chip data can carry entire file contents — too heavy for the
 // wire, and the companion doesn't render chip expansion).
-function companionMessageView(m) {
-  if (!m || m.working) return null;
+function companionMessageView(m, opts) {
+  const includeWorking = !!(opts && opts.includeWorking);
+  if (!m) return null;
+  // In-flight turns used to be dropped here unconditionally, which is what
+  // made a companion opened mid-task look frozen: the snapshot arrived with
+  // the running turn deleted, so the companion had no working bubble, and its
+  // chat:progress handler (which only updates an existing working bubble)
+  // discarded every later update too. Silence until chat:done. (Aug 7 2026)
+  if (m.working) {
+    if (!includeWorking || m.role !== 'agent') return null;
+    return {
+      role: 'assistant',
+      working: true,
+      workingLabel: m.workingLabel || 'Working',
+      text: [m.preambleText, m.responseText].filter(Boolean).join('\n\n') || m.text || '',
+      model: m.model || null,
+      chips: (m.chips || [])
+        .filter(c => !c._superseded)
+        .slice(-30)
+        .map(c => ({ label: c.label, kind: c.kind })),
+    };
+  }
   if (m.role === 'user') return m.text ? { role: 'user', text: m.text } : null;
   if (m.role === 'agent') {
     const text = [m.preambleText, m.responseText].filter(Boolean).join('\n\n') || m.text || '';
@@ -2420,13 +2440,21 @@ function sendConversationListToCompanions() {
 
 function sendChatHistorySnapshot() {
   try {
+    // NB: must be an arrow, not a bare `.map(companionMessageView)` — map
+    // passes the index as the second argument, which would land in `opts`.
     const messages = (state.chatMessages || [])
-      .map(companionMessageView)
+      .map(m => companionMessageView(m, { includeWorking: true }))
       .filter(Boolean)
       .slice(-100);
+    // Tell the companion whether a turn is still running, so it can keep its
+    // spinner up on a mid-task join instead of hard-clearing it. (Aug 7 2026)
+    const inFlight = (state.chatMessages || []).find(m => m.working && m.role === 'agent');
     sendChatEventToCompanions('chat:history', {
+      conversationId: state.chatActiveId || null,
       title: currentConvTitle() || 'New conversation',
       messages,
+      streaming: !!inFlight,
+      workingMessageId: inFlight ? inFlight.id : null,
     });
     sendConversationListToCompanions();
     sendModelsListToCompanions();
