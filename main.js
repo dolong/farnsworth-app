@@ -5990,12 +5990,17 @@ function resolveEndpointKey(ep) {
   return getOpenAIKey();
 }
 
+// Aug 7 2026: returns null (not {}) when the accumulated argument JSON doesn't
+// parse, so the caller can report a truncated tool call instead of dispatching
+// one with no arguments. An absent/empty string is still a legitimate no-arg
+// call and stays {}. See the matching note at content_block_stop.
 function oaSafeJson(s) {
   if (!s) return {};
   try {
     return JSON.parse(s);
   } catch (e) {
-    return {};
+    console.warn(`[inference] OpenAI tool arguments failed to parse after ${s.length} chars: ${e.message}`);
+    return null;
   }
 }
 
@@ -6204,8 +6209,13 @@ async function openAIStream(opts, send, abortSignal) {
     const toolUses = [];
     for (const tb of toolArr) {
       const input = oaSafeJson(tb.argsJson);
-      blockArr.push({ type: 'tool_use', id: tb.id, name: tb.name, input });
-      toolUses.push({ id: tb.id, name: tb.name, input });
+      const inputInvalid = input === null ? {
+        reason: 'arguments did not parse as JSON',
+        rawLength: (tb.argsJson || '').length,
+        rawTail: (tb.argsJson || '').slice(-160),
+      } : null;
+      blockArr.push({ type: 'tool_use', id: tb.id, name: tb.name, input, inputInvalid });
+      toolUses.push({ id: tb.id, name: tb.name, input, inputInvalid });
     }
     send({ type: 'done', result: { ok: true, text: fullText, content: blockArr, toolUses, stopReason, usage } });
     return { ok: true };
@@ -6229,7 +6239,12 @@ ipcMain.handle('inference:send', async (_event, opts = {}) => {
   // Jul 19: route OpenAI-compatible models (GPT-5.6 Sol/Terra/Luna, etc.)
   // to the OpenAI adapter; the Anthropic path below stays unchanged.
   if (isOpenAIModel(model) || opts.endpoint) return await openAISend({ ...opts, model });
-  const maxTokens = Number.isFinite(opts.maxTokens) ? opts.maxTokens : 4096;
+  // Aug 7 2026: was 4096 while both OpenAI paths defaulted to 16384. The chat
+  // agent writes whole source files through write_file, and a single tool call
+  // carrying a real file blows past 4096 output tokens -- the model then stops
+  // mid-JSON at max_tokens and the arguments never parse. Match the OpenAI
+  // ceiling so the budget isn't the thing breaking tool calls.
+  const maxTokens = Number.isFinite(opts.maxTokens) ? opts.maxTokens : 16384;
   const system = typeof opts.system === 'string' ? opts.system : null;
 
   const auth = await getValidAccessToken();
@@ -6442,7 +6457,10 @@ ipcMain.on('inference:stream', async (event, opts = {}) => {
     finally { clearStream(); }
     return;
   }
-  const maxTokens = Number.isFinite(opts.maxTokens) ? opts.maxTokens : 4096;
+  // Aug 7 2026: see the matching note on inference:send -- 4096 was too small
+  // for a write_file carrying a real source file, and truncation surfaced as a
+  // bogus "path required" instead of a token-limit error.
+  const maxTokens = Number.isFinite(opts.maxTokens) ? opts.maxTokens : 16384;
   const system = typeof opts.system === 'string' ? opts.system : null;
 
   const auth = await getValidAccessToken();
@@ -6556,7 +6574,26 @@ ipcMain.on('inference:stream', async (event, opts = {}) => {
         } else if (eventType === 'content_block_stop') {
           const idx = parsed.index;
           if (blocks[idx]?.type === 'tool_use' && blocks[idx].inputJson) {
-            try { blocks[idx].input = JSON.parse(blocks[idx].inputJson); } catch { blocks[idx].input = {}; }
+            try {
+              blocks[idx].input = JSON.parse(blocks[idx].inputJson);
+            } catch (err) {
+              // Aug 7 2026: this used to fall back to `{}`, which was the whole
+              // bug. A tool_use whose arguments don't parse is nearly always the
+              // model hitting max_tokens mid-JSON -- the stream just stops in the
+              // middle of a half-written argument object. Substituting {} meant
+              // the tool got DISPATCHED with no arguments at all, so write_file
+              // answered "path required" and run_command answered "command
+              // required". The agent had no way to see it had been truncated, so
+              // it blamed payload size and retried the same call forever.
+              // Flag it instead and let the renderer report the real cause.
+              blocks[idx].input = null;
+              blocks[idx].inputInvalid = {
+                reason: err.message,
+                rawLength: blocks[idx].inputJson.length,
+                rawTail: blocks[idx].inputJson.slice(-160),
+              };
+              console.warn(`[inference] tool_use "${blocks[idx].name}" arguments failed to parse after ${blocks[idx].inputJson.length} chars: ${err.message}`);
+            }
           }
           send({ type: 'block_stop', index: idx });
         } else if (eventType === 'message_delta') {
@@ -6571,8 +6608,25 @@ ipcMain.on('inference:stream', async (event, opts = {}) => {
 
     const blockArr = Object.keys(blocks).sort((a, b) => +a - +b).map(k => blocks[k]);
     const text = blockArr.filter(b => b.type === 'text').map(b => b.text || '').join('');
+    // Aug 7 2026: a hard truncation can end the stream without ever delivering
+    // content_block_stop for the open tool_use, so the parse above never runs.
+    // Treat "accumulated JSON but no parsed input" as invalid for the same
+    // reason -- never hand a half-specified tool call to the executor.
+    for (const b of blockArr) {
+      if (b.type === 'tool_use' && !b.inputInvalid && b.input == null && b.inputJson) {
+        b.inputInvalid = {
+          reason: 'stream ended before the arguments were complete',
+          rawLength: b.inputJson.length,
+          rawTail: b.inputJson.slice(-160),
+        };
+        console.warn(`[inference] tool_use "${b.name}" never completed its arguments (${b.inputJson.length} chars, stop=${stopReason})`);
+      }
+    }
     const toolUses = blockArr.filter(b => b.type === 'tool_use').map(b => ({
-      id: b.id, name: b.name, input: b.input || {},
+      id: b.id,
+      name: b.name,
+      input: b.inputInvalid ? null : (b.input || {}),
+      inputInvalid: b.inputInvalid || null,
     }));
     const result = { ok: true, text, content: blockArr, toolUses, stopReason, usage };
     send({ type: 'done', result });

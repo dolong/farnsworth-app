@@ -12432,6 +12432,36 @@ async function sendChatMessage(opts) {
           });
           continue;
         }
+        // Aug 7 2026: a tool call whose arguments never finished streaming must
+        // NOT be dispatched. main.js flags it (inputInvalid) instead of quietly
+        // substituting {} -- that fallback was why a truncated write_file came
+        // back as "path required", which told the agent nothing true and sent it
+        // into a retry loop guessing at payload size. Report the real cause so
+        // the model can actually correct: split the write, don't shrink blindly.
+        if (tu.inputInvalid) {
+          const inv = tu.inputInvalid;
+          const hitLimit = res.stopReason === 'max_tokens';
+          const detail =
+            `Your ${tu.name} call was cut off before its arguments finished` +
+            (hitLimit ? ' because the response hit the max_tokens output limit' : '') +
+            `. ${inv.rawLength} characters of argument JSON arrived and could not be parsed (${inv.reason}). ` +
+            `The tool did NOT run and nothing was written. ` +
+            `Retry by splitting the work into smaller calls -- for a large file, write it in sections rather than one call.`;
+          const invChips = [
+            ...(agentMsg.chips || []),
+            { label: `${tu.name} — arguments truncated`, kind: 'error', name: tu.name },
+          ];
+          updateAgentMsg({ working: true, chips: invChips });
+          tlChip(invChips.length - 1);
+          toolResultBlocks.push({
+            type: 'tool_result',
+            tool_use_id: tu.id,
+            content: 'Error: ' + detail,
+            is_error: true,
+          });
+          console.warn('[chat] skipped truncated tool call', tu.name, inv);
+          continue;
+        }
         const preview = JSON.stringify(tu.input).slice(0, 60);
         const newChip = { label: `${tu.name}(${preview})`, kind: 'edit', name: tu.name, input: tu.input };
         const nextChips = [...(agentMsg.chips || []), newChip];
