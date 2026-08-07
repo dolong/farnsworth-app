@@ -9061,6 +9061,9 @@ async function handleFolderPicked(folderPath) {
   // Persist to the global setting so PTYs spawned before the WS init
   // (or any code path that reads currentFolder) see the current workspace.
   if (window.farnsworth) await window.farnsworth.setSetting('currentFolder', folderPath);
+  // Bind this window to the folder so main resolves agent/terminal/chat calls
+  // from the window that asked, not from the one global setting.
+  if (window.farnsworth?.setActiveWorkspace) await window.farnsworth.setActiveWorkspace(folderPath);
   // Aug 5: live PTYs spawned in the old project stayed there. Do this after
   // the currentFolder setting is written so main's fallback agrees with us.
   if (previousFolder && previousFolder !== folderPath) {
@@ -9668,6 +9671,15 @@ async function closeFolder() {
     // 1 = Don't Save, 0 = Saved all, fall through to close.
   }
   stopUiFolderWatcher();
+  // Clear BOTH the per-window binding and the global setting. Without this the
+  // agent kept running commands inside a folder the user had just closed.
+  if (window.farnsworth?.setActiveWorkspace) {
+    try { await window.farnsworth.setActiveWorkspace(null); } catch {}
+  }
+  if (window.farnsworth?.setSetting) {
+    try { await window.farnsworth.setSetting('currentFolder', null); } catch {}
+  }
+  window.__farnsworthCurrentFolder = null;
   state.folder = null;
   state.files.entries = [];
   state.appType = null;

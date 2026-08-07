@@ -73,15 +73,65 @@ if (!IS_DEFAULT_INSTANCE) {
 // (Aug 5: a test instance clobbered chat.activeId for exactly this reason.)
 const PER_INSTANCE_SETTING_KEYS = new Set(['currentFolder', 'chat.activeId']);
 
+// Runtime view state that lives in the settings table but is NOT a user
+// preference. These must never ride the bulk settings:get/settings:set path.
+//
+// The renderer seeds state.settings from getAllSettings() at boot and later
+// writes the WHOLE object back via persistSettings(). That means every one of
+// these keys gets frozen at boot and re-stamped on any unrelated settings
+// change -- so opening a folder, then toggling a setting, silently restored
+// the PREVIOUS folder and pointed the chat agent at the wrong repo while the
+// UI still showed the right one. (Aug 7: Long, one window, the-last-draft on
+// screen, agent running in my-devvit-game.)
+//
+// Written and read through the single-key setting:get / setting:set IPCs only.
+const RUNTIME_STATE_KEY_PREFIXES = ['currentFolder', 'chat.activeId', 'claudeCode.tabs', 'codex.tabs'];
+function isRuntimeStateKey(key) {
+  if (typeof key !== 'string') return false;
+  // Covers both the bare key and its per-instance form ('currentFolder:dev').
+  return RUNTIME_STATE_KEY_PREFIXES.some((p) => key === p || key.startsWith(p + ':'));
+}
+
 function scopedSettingKey(key) {
   if (PER_INSTANCE_SETTING_KEYS.has(key) && !IS_DEFAULT_INSTANCE) {
     return `${key}:${INSTANCE_NAME}`;
   }
   return key;
 }
+// Per-window workspace registry. The settings table holds ONE currentFolder,
+// but Farnsworth is multi-window: with two windows open, that single value
+// describes only whichever opened a folder last, so every agent action in the
+// other window ran in the wrong repo. The renderer announces its folder on
+// every open/close via workspace:setActive; main keys it by webContents id.
+const windowWorkspaces = new Map(); // webContents.id -> folder path
+
+// The folder for the window that made THIS request. Falls back to the global
+// setting for callers with no event (timers, relay, companion bridges).
+function folderForEvent(event) {
+  const id = event && event.sender && !event.sender.isDestroyed() ? event.sender.id : null;
+  if (id != null && windowWorkspaces.has(id)) return windowWorkspaces.get(id) || null;
+  return currentFolderSetting();
+}
+
+ipcMain.handle('workspace:setActive', async (event, folder) => {
+  const id = event && event.sender ? event.sender.id : null;
+  if (id == null) return { ok: false, error: 'no_sender' };
+  if (folder) windowWorkspaces.set(id, folder);
+  else windowWorkspaces.delete(id);
+  return { ok: true };
+});
+
+app.on('web-contents-created', (_e, contents) => {
+  contents.on('destroyed', () => windowWorkspaces.delete(contents.id));
+});
+
 function currentFolderSetting() {
   if (!db.getSetting) return null;
-  return db.getSetting(scopedSettingKey('currentFolder')) || null;
+  const v = db.getSetting(scopedSettingKey('currentFolder'));
+  // Heal DBs that already contain the stringified-null poison described on
+  // db.deleteSetting -- 'null' is truthy and would be used as a real path.
+  if (!v || v === 'null' || v === 'undefined' || v === '""') return null;
+  return v;
 }
 
 // Fixed WebSocket ports are the reason only one Farnsworth could run per
@@ -979,9 +1029,26 @@ function createWindow({ fresh = false } = {}) {
 // ============================================================
 // IPC: Settings (SQLite-backed)
 // ============================================================
-ipcMain.handle('settings:get', async () => db.getAllSettings());
+ipcMain.handle('settings:get', async () => {
+  // Strip runtime view state so the renderer never holds it in state.settings
+  // and therefore cannot write a stale copy back. See isRuntimeStateKey().
+  const all = db.getAllSettings() || {};
+  const out = {};
+  for (const [k, v] of Object.entries(all)) {
+    if (!isRuntimeStateKey(k)) out[k] = v;
+  }
+  return out;
+});
 
 ipcMain.handle('settings:set', async (_event, settings) => {
+  // Defence in depth: even if a stale renderer still carries these keys, the
+  // bulk path must not be able to write them. The single-key setting:set IPC
+  // below is the only supported writer.
+  if (settings && typeof settings === 'object') {
+    for (const k of Object.keys(settings)) {
+      if (isRuntimeStateKey(k)) delete settings[k];
+    }
+  }
   // Pass the OBJECT — setAllSettings runs Object.entries itself. Passing
   // entries here double-converted and wrote numeric keys ('0','1',...) with
   // ["key",value] pair values, silently breaking bulk settings persistence
@@ -1003,6 +1070,11 @@ ipcMain.handle('setting:get', async (_event, key) => {
 });
 ipcMain.handle('setting:set', async (_event, key, value) => {
   if (!key || typeof key !== 'string') return { ok: false, error: 'bad_key' };
+  // Clearing means removing the row, not writing the string 'null'.
+  if (value === null || value === undefined) {
+    if (db.deleteSetting) db.deleteSetting(scopedSettingKey(key));
+    return { ok: true, cleared: true };
+  }
   // scopedSettingKey maps 'currentFolder' to a per-instance key when this
   // process was launched with --instance=<name>. The renderer is unaware.
   db.setSetting(scopedSettingKey(key), value);
@@ -5571,7 +5643,7 @@ function globToRegex(glob) {
   return new RegExp('^' + re + '$');
 }
 
-async function executeAgentTool(name, input) {
+async function executeAgentTool(name, input, folderOverride) {
   // memory_recall works without a workspace folder — it searches the
   // assistant's own store, not the project.
   if (name === 'memory_recall') {
@@ -5602,7 +5674,7 @@ async function executeAgentTool(name, input) {
     const sz = img.getSize();
     return { ok: true, path: outPath, base64: pngBuf.toString('base64'), width: sz.width, height: sz.height };
   }
-  const folder = currentFolderSetting();
+  const folder = folderOverride || currentFolderSetting();
   if (!folder) {
     return { ok: false, error: 'no_folder', message: 'No workspace folder open. Open a folder first.' };
   }
@@ -5640,6 +5712,7 @@ async function executeAgentTool(name, input) {
     // or write outside the workspace folder. Falls back to plain exec
     // (with a console warning) if nono isn't installed.
     return await runShellCommand(input.command, {
+      folder,
       pipeToActiveTerminal: false,
       sandboxProfile: 'farnsworth-chat-run',
       timeoutMs: input.timeout_ms,
@@ -6224,9 +6297,9 @@ ipcMain.handle('inference:send', async (_event, opts = {}) => {
   }
 });
 
-ipcMain.handle('inference:toolExecute', async (_event, name, input) => {
+ipcMain.handle('inference:toolExecute', async (event, name, input) => {
   try {
-    return await executeAgentTool(name, input || {});
+    return await executeAgentTool(name, input || {}, folderForEvent(event));
   } catch (err) {
     return { ok: false, error: err.message || 'tool_failed' };
   }
@@ -8091,8 +8164,8 @@ function ptyHasRunningChild(pid) {
   }
 }
 
-ipcMain.handle('terminal:retarget', async (_event, requestedCwd) => {
-  const cwd = requestedCwd || currentFolderSetting();
+ipcMain.handle('terminal:retarget', async (event, requestedCwd) => {
+  const cwd = requestedCwd || folderForEvent(event);
   if (!cwd) return { ok: false, error: 'no_folder' };
   const moved = [];
   const busy = [];
@@ -8147,7 +8220,7 @@ function resolveCommandTimeout(requested) {
 }
 
 async function runShellCommand(command, opts = {}) {
-  const folder = currentFolderSetting();
+  const folder = opts.folder || currentFolderSetting();
   if (!folder) return { ok: false, error: 'no_folder', message: 'No workspace folder open' };
   if (!command || typeof command !== 'string') return { ok: false, error: 'bad_input', message: 'command required' };
   const pipeToActiveTerminal = opts.pipeToActiveTerminal !== false;
@@ -8276,8 +8349,8 @@ async function runSandboxedCommand(nonoBin, profileName, command, folder, timeou
   });
 }
 
-ipcMain.handle('terminal:runCommand', async (_event, command) => {
-  return await runShellCommand(command);
+ipcMain.handle('terminal:runCommand', async (event, command) => {
+  return await runShellCommand(command, { folder: folderForEvent(event) });
 });
 
 // Close a specific terminal tab by id. Renderer sends the tabId (which is the
@@ -8300,12 +8373,12 @@ ipcMain.handle('terminal:close', async (_event, tabId) => {
 // (debounced), lists them in a dropdown next to the Chat pill,
 // and can switch between them or start a new one.
 // ------------------------------------------------------------
-function getActiveWorkspacePath() {
-  return currentFolderSetting();
+function getActiveWorkspacePath(event) {
+  return folderForEvent(event);
 }
 
-ipcMain.handle('chatConv:list', async () => {
-  return db.listConversations(getActiveWorkspacePath());
+ipcMain.handle('chatConv:list', async (event) => {
+  return db.listConversations(getActiveWorkspacePath(event));
 });
 
 ipcMain.handle('chatConv:load', async (_event, id) => {
@@ -8315,9 +8388,9 @@ ipcMain.handle('chatConv:load', async (_event, id) => {
   catch { return null; }
 });
 
-ipcMain.handle('chatConv:create', async (_event, { id, title, messages } = {}) => {
+ipcMain.handle('chatConv:create', async (event, { id, title, messages } = {}) => {
   const convId = id || 'conv-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
-  db.createConversation(convId, getActiveWorkspacePath(), title || 'New chat', messages || []);
+  db.createConversation(convId, getActiveWorkspacePath(event), title || 'New chat', messages || []);
   return { id: convId };
 });
 

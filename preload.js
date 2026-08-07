@@ -8,6 +8,10 @@ contextBridge.exposeInMainWorld('farnsworth', {
   getSettings: () => ipcRenderer.invoke('settings:get'),
   setSettings: (s) => ipcRenderer.invoke('settings:set', s),
   getSetting: (key) => ipcRenderer.invoke('setting:get', key),
+  // Tell main which folder THIS window is in. Main keys it by webContents id
+  // so agent tools resolve the asking window's workspace instead of a single
+  // global that only describes whichever window opened a folder last.
+  setActiveWorkspace: (folder) => ipcRenderer.invoke('workspace:setActive', folder),
   setSetting: (key, value) => ipcRenderer.invoke('setting:set', key, value),
 
   // Dev tools (farnsworth backend boot detection, per app type)

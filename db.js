@@ -432,6 +432,13 @@ function setSetting(key, value) {
   `).run(key, typeof value === 'string' ? value : JSON.stringify(value));
 }
 
+// Clearing a setting must REMOVE the row. setSetting(key, null) used to run
+// JSON.stringify(null) and store the literal string 'null', which every
+// reader then saw as a truthy value -- e.g. a workspace path named 'null'.
+function deleteSetting(key) {
+  db.prepare('DELETE FROM settings WHERE key = ?').run(key);
+}
+
 function getAllSettings() {
   const rows = db.prepare('SELECT key, value FROM settings').all();
   const out = {};
@@ -2091,7 +2098,7 @@ module.exports = {
   getRawDb,
   close,
   migrateLegacy,
-  getSetting, setSetting, getAllSettings, setAllSettings,
+  getSetting, setSetting, deleteSetting, getAllSettings, setAllSettings,
   getRecentFolders, addRecentFolder, clearRecentFolders,
   setAuthToken, getAuthToken, deleteAuthToken,
   getChatHistory, addChatMessage, clearChatHistory,
