@@ -11797,6 +11797,92 @@ function renderChatAttachments() {
 // uncapped result eventually blows the per-message character ceiling
 // (10,485,760) and the turn fails with an opaque HTTP 400. Keep the head and
 // tail so the model still sees the start and end of the output.
+// --- Tool chip labels (Aug 8 2026) -----------------------------------------
+// Chip labels were `JSON.stringify(input).slice(0, 60)` with no ellipsis. Two
+// problems, one visible and one worse:
+//
+//   1. No truncation marker, so a display cut was indistinguishable from a
+//      truncated argument value -- `test_run({"path":".../the-last-draft/.far)`
+//      reads as a broken path, not as a clipped label. Long flagged exactly
+//      this the day after a real truncated-tool-call bug (`d69fd6c`).
+//   2. Every path-bearing call shares the same long absolute workspace prefix,
+//      which ate the whole 60-char budget. The identifying tail (WHICH test?
+//      which file?) was always the part thrown away, so every chip in a run
+//      rendered as the same useless string.
+//
+// So: strip the workspace prefix, elide paths from the LEFT (a path's meaning
+// is its tail), summarize bulk payloads by size instead of dumping a prefix of
+// them, and always mark an elision with '…'.
+const CHIP_PREVIEW_MAX = 60;
+const CHIP_PREVIEW_BULK_KEYS = new Set(['content', 'text', 'json', 'body', 'source']);
+const CHIP_PREVIEW_KEY_ORDER = ['path', 'file', 'name', 'command', 'cmd', 'query', 'url'];
+
+function chipIsPathKey(k) {
+  return k === 'path' || k === 'file' || /(^|_)path$/.test(k);
+}
+
+function chipShortenPath(v) {
+  const folder = state.folder || '';
+  if (typeof v !== 'string' || !folder) return v;
+  if (v === folder) return '.';
+  return v.startsWith(folder + '/') ? v.slice(folder.length + 1) : v;
+}
+
+function chipClip(value, isPath) {
+  const s = String(value).replace(/\s+/g, ' ').trim();
+  if (s.length <= CHIP_PREVIEW_MAX) return s;
+  // Paths identify themselves by their tail, so keep the end; prose and
+  // commands read left-to-right, so keep the start.
+  return isPath && s.includes('/')
+    ? '…' + s.slice(-(CHIP_PREVIEW_MAX - 1))
+    : s.slice(0, CHIP_PREVIEW_MAX - 1) + '…';
+}
+
+function chipFormatArg(key, raw) {
+  if (typeof raw === 'string' && CHIP_PREVIEW_BULK_KEYS.has(key)) {
+    return `${key}: ${raw.length} chars`;
+  }
+  if (typeof raw === 'string') {
+    const isPath = chipIsPathKey(key);
+    return `${key}: ${chipClip(isPath ? chipShortenPath(raw) : raw, isPath)}`;
+  }
+  let json;
+  try { json = JSON.stringify(raw); } catch { json = String(raw); }
+  return `${key}: ${chipClip(json === undefined ? String(raw) : json, false)}`;
+}
+
+function toolChipPreview(input) {
+  if (input === null || input === undefined) return '';
+  if (typeof input !== 'object') return chipClip(input, false);
+  const keys = Object.keys(input);
+  if (!keys.length) return '';
+  // Single-argument calls -- the common case ({path}, {command}, {query}) --
+  // read better as a bare value than as a key/value pair.
+  if (keys.length === 1) {
+    const k = keys[0];
+    const raw = input[k];
+    if (typeof raw === 'string' && !CHIP_PREVIEW_BULK_KEYS.has(k)) {
+      const isPath = chipIsPathKey(k);
+      return chipClip(isPath ? chipShortenPath(raw) : raw, isPath);
+    }
+    return chipFormatArg(k, raw);
+  }
+  const ordered = [
+    ...CHIP_PREVIEW_KEY_ORDER.filter(k => keys.includes(k)),
+    ...keys.filter(k => !CHIP_PREVIEW_KEY_ORDER.includes(k)),
+  ];
+  const parts = [];
+  let budget = CHIP_PREVIEW_MAX;
+  for (const k of ordered) {
+    const piece = chipFormatArg(k, input[k]);
+    if (parts.length && piece.length + 2 > budget) { parts.push('…'); break; }
+    parts.push(piece);
+    budget -= piece.length + 2;
+    if (budget <= 0) break;
+  }
+  return parts.join(', ');
+}
+
 const TOOL_RESULT_CHAR_CAP = 200000;
 function capToolResultContent(content, toolName) {
   if (typeof content === 'string') {
@@ -12490,7 +12576,7 @@ async function sendChatMessage(opts) {
           console.warn('[chat] skipped truncated tool call', tu.name, inv);
           continue;
         }
-        const preview = JSON.stringify(tu.input).slice(0, 60);
+        const preview = toolChipPreview(tu.input);
         const newChip = { label: `${tu.name}(${preview})`, kind: 'edit', name: tu.name, input: tu.input };
         const nextChips = [...(agentMsg.chips || []), newChip];
         const tlEntry = tlChip(nextChips.length - 1);
