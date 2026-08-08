@@ -2366,11 +2366,103 @@ function sendModelsListToCompanions() {
 // chips appeared at once. This mirrors the in-flight chip list + working
 // label every time either changes, same trimmed shape as companionMessageView
 // uses for history (label + kind only -- no input/output payloads).
+// --- Timeline projection for the companion (Aug 8 2026) --------------------
+// The desktop renders a turn from `m.timeline`, the ordered record of what the
+// model emitted: narration, tool chips, surfaces, narration, more chips. That
+// interleave IS the explanation -- it's what makes a 30-tool turn readable as
+// "here's what I think, here's what I ran, here's what that told me".
+//
+// The companion never received it. `companionMessageView` joined preambleText
+// and responseText into one blob and flattened every chip into a single flat
+// array, so a turn the desktop showed as 31 narration blocks between 30 step
+// groups arrived on the phone as one "30 steps" pill with all reasoning welded
+// into a single lump after it -- and, because the companion renders text only
+// when a message is NOT working, with no reasoning visible at all until the
+// turn ended. Long saw a bare wall of shell commands.
+//
+// So project the real timeline. Chips resolve through chipIndex (chips get
+// patched after creation, which is why the timeline stores indices), and
+// superseded chips drop out here exactly as they do on the desktop.
+const COMPANION_CHIP_BUDGET = 120;
+
+function companionTimelineView(m) {
+  const tl = Array.isArray(m.timeline) ? m.timeline : null;
+  if (!tl || !tl.length) return null;
+  const chips = m.chips || [];
+  const referenced = new Set();
+  const segments = [];
+  const pushChip = (c) => {
+    const chip = { label: c.label, kind: c.kind };
+    const last = segments[segments.length - 1];
+    if (last && last.type === 'chips') last.chips.push(chip);
+    else segments.push({ type: 'chips', chips: [chip] });
+  };
+  for (const e of tl) {
+    if (e.type === 'text') {
+      if (!e.text || !e.text.trim()) continue;
+      const last = segments[segments.length - 1];
+      if (last && last.type === 'text') last.text += e.text;
+      else segments.push({ type: 'text', text: e.text });
+    } else if (e.type === 'chip') {
+      referenced.add(e.chipIndex);
+      const c = chips[e.chipIndex];
+      // A run_command chip is replaced by the richer terminal chip; the
+      // desktop shows one, so the companion must not show both.
+      if (!c || c._superseded) continue;
+      pushChip(c);
+    }
+    // `surface` entries are intentionally skipped: the companion renders
+    // surfaces from m.surfaces, and it has no slot for them mid-timeline yet.
+  }
+  // Mark the closing text of a finished turn as the verdict so the companion
+  // styles it as an answer rather than as more in-flight narration. This has
+  // to happen BEFORE trailing chips are appended: the desktop's own test is
+  // "last text segment AND last timeline entry", and the leftover chips below
+  // are rendered outside the timeline walk, so they must not push the answer
+  // out of final position.
+  if (!m.working) {
+    for (let i = segments.length - 1; i >= 0; i--) {
+      if (segments[i].type === 'text') { segments[i].final = i === segments.length - 1; break; }
+    }
+  }
+  // Chips the timeline never referenced (action chips, end-of-turn usage and
+  // HTTP-error chips) trail the turn on the desktop. Match that.
+  for (let i = 0; i < chips.length; i++) {
+    if (referenced.has(i) || chips[i]._superseded) continue;
+    pushChip(chips[i]);
+  }
+  if (!segments.length) return null;
+  // Budget guard. The old flat projection silently dropped everything past 30
+  // chips (a real turn today lost 58 of 88). Keep the most recent and say so,
+  // because an unmarked omission is indistinguishable from a bug -- the same
+  // lesson the chip labels taught.
+  let total = segments.reduce((n, s) => n + (s.type === 'chips' ? s.chips.length : 0), 0);
+  if (total > COMPANION_CHIP_BUDGET) {
+    let drop = total - COMPANION_CHIP_BUDGET;
+    for (const s of segments) {
+      if (!drop) break;
+      if (s.type !== 'chips') continue;
+      const take = Math.min(drop, s.chips.length);
+      s.chips.splice(0, take);
+      drop -= take;
+    }
+    const kept = segments.filter(s => s.type !== 'chips' || s.chips.length);
+    kept.unshift({ type: 'note', text: `${total - COMPANION_CHIP_BUDGET} earlier steps not shown` });
+    return kept;
+  }
+  return segments;
+}
+
 function syncChatProgressToCompanions(agentMsg) {
   try {
     sendChatEventToCompanions('chat:progress', {
       messageId: agentMsg.id,
       workingLabel: agentMsg.workingLabel || '',
+      // Narration streams via chat:delta, but a companion that joined mid-task
+      // has no earlier deltas to have missed -- send the timeline so its view
+      // is complete on the very first progress event, not just from here on.
+      timeline: companionTimelineView(agentMsg),
+      text: [agentMsg.preambleText, agentMsg.responseText].filter(Boolean).join('\n\n') || agentMsg.text || '',
       chips: (agentMsg.chips || []).filter(c => !c._superseded).slice(-30).map(c => ({ label: c.label, kind: c.kind })),
     });
   } catch (e) {
@@ -2406,6 +2498,10 @@ function companionMessageView(m, opts) {
       workingLabel: m.workingLabel || 'Working',
       text: [m.preambleText, m.responseText].filter(Boolean).join('\n\n') || m.text || '',
       model: m.model || null,
+      // Ordered narration/steps interleave. `chips` stays for older companion
+      // builds that predate timeline rendering (the SPA updates independently
+      // of the desktop, so a stale cached client must still work).
+      timeline: companionTimelineView(m),
       chips: (m.chips || [])
         .filter(c => !c._superseded)
         .slice(-30)
@@ -2422,7 +2518,14 @@ function companionMessageView(m, opts) {
       model: m.model || null,
       verified: !!m.verified,
       error: !!m.error,
-      chips: (m.chips || []).slice(-30).map(c => ({ label: c.label, kind: c.kind })),
+      timeline: companionTimelineView(m),
+      // `_superseded` was filtered on the working branch but NOT here, so a
+      // finished turn shipped both the raw run_command chip and the terminal
+      // chip that replaced it -- 22 duplicates on a real turn. (Aug 8 2026)
+      chips: (m.chips || [])
+        .filter(c => !c._superseded)
+        .slice(-30)
+        .map(c => ({ label: c.label, kind: c.kind })),
     };
   }
   return null;
@@ -12746,6 +12849,10 @@ async function sendChatMessage(opts) {
   sendChatEventToCompanions('chat:done', {
     messageId: agentMsgId,
     finalText: agentMsg.text || '',
+    // Without this the companion's live interleave collapsed back to a flat
+    // blob the moment the turn finished. (Aug 8 2026)
+    timeline: companionTimelineView(agentMsg),
+    chips: (agentMsg.chips || []).filter(c => !c._superseded).slice(-30).map(c => ({ label: c.label, kind: c.kind })),
   });
 }
 
