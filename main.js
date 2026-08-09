@@ -3632,6 +3632,210 @@ async function drainConsolidation(reason) {
   return { ok: true, processed, batches, applied: totals, remaining, reason };
 }
 
+function normalizeExplicitMemorySlug(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 120);
+}
+
+// Explicit memory writes are durable before they are applied: the directive is
+// appended to the buffer and the human-readable request is written to the
+// immutable archive first. Applying it synchronously makes "remember this"
+// visible in the same turn; leaving the buffer row unconsolidated until after
+// the concept write gives the normal consolidation loop crash recovery.
+function queueExplicitMemoryDirective(op, input, folderOverride = null) {
+  const slug = normalizeExplicitMemorySlug(input?.slug);
+  const scope = input?.scope;
+  if (!['global', 'project'].includes(scope)) {
+    return { ok: false, error: 'bad_input', message: 'scope must be global or project' };
+  }
+  const workspacePath = scope === 'project' ? (folderOverride || currentFolderSetting()) : null;
+  if (!slug) return { ok: false, error: 'bad_input', message: 'slug required' };
+  if (scope === 'project' && !workspacePath) {
+    return { ok: false, error: 'no_folder', message: 'Project-scoped memory requires an open workspace folder.' };
+  }
+  const directive = {
+    version: 1,
+    op,
+    slug,
+    title: String(input?.title || '').trim() || slug.replace(/-/g, ' '),
+    section: String(input?.section || '').trim() || (op === 'upsert' ? 'procedure' : 'notes'),
+    content: String(input?.content || '').trim(),
+    match: String(input?.match || '').trim(),
+    replacement: String(input?.replacement || '').trim(),
+    reason: String(input?.reason || '').trim(),
+    scope,
+    requestedAt: new Date().toISOString(),
+  };
+  if ((op === 'upsert' || op === 'append') && !directive.content) {
+    return { ok: false, error: 'bad_input', message: 'content required' };
+  }
+  if (op === 'forget' && !directive.match) {
+    return { ok: false, error: 'bad_input', message: 'match required' };
+  }
+
+  const context = `explicit-memory:${op}:${slug}`;
+  const buffered = db.memoryBufferAppend(JSON.stringify(directive), context, 'agent.memory.explicit', workspacePath);
+  if (!buffered?.ok) return buffered;
+  const summary = op === 'forget'
+    ? `Forget from ${slug}: ${directive.match}${directive.replacement ? ` → ${directive.replacement}` : ''}`
+    : `${op === 'upsert' ? 'Save' : 'Append'} to ${slug}: ${directive.content}`;
+  const archived = db.memoryArchiveAppend(
+    op === 'forget' ? 'correction' : 'fact',
+    summary,
+    { source: 'agent.memory.explicit', tool: `memory_${op}`, directive },
+    null,
+    workspacePath
+  );
+  if (!archived?.ok) {
+    console.warn('[memory explicit] archive write failed after buffer append:', archived?.error || 'unknown');
+  }
+  return { ok: true, directive, bufferId: buffered.id, archiveId: archived?.id || null, workspacePath };
+}
+
+function replaceMemorySection(body, heading, content) {
+  const h = String(heading || 'procedure').trim();
+  const text = String(content || '').trim();
+  const source = String(body || '');
+  const escaped = h.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`^##\\s+${escaped}\\s*$`, 'm');
+  const match = re.exec(source);
+  if (!match) return (source ? source.replace(/\s*$/, '\n\n') : '') + `## ${h}\n\n${text}\n`;
+  const afterHeading = match.index + match[0].length;
+  const tail = source.slice(afterHeading);
+  const nextSection = tail.search(/^##\s+/m);
+  const end = nextSection === -1 ? source.length : afterHeading + nextSection;
+  return source.slice(0, afterHeading) + `\n\n${text}\n\n` + source.slice(end).replace(/^\s+/, '');
+}
+
+function archiveExplicitMemoryRevision(directive, existing, workspacePath) {
+  if (!existing) return null;
+  const snapshot = {
+    version: 1,
+    slug: existing.slug,
+    title: existing.title || null,
+    lead: existing.lead || null,
+    body: existing.body || '',
+    sections: existing.sections || null,
+    tags: existing.tags || null,
+    source: existing.source || null,
+    confidence: existing.confidence ?? null,
+    replacedBy: directive,
+  };
+  return db.memoryArchiveAppend(
+    'correction',
+    `Revision snapshot before memory_${directive.op} on ${directive.slug}`,
+    { source: 'agent.memory.revision', tool: `memory_${directive.op}`, snapshot },
+    null,
+    workspacePath || null
+  );
+}
+
+function applyExplicitMemoryDirectives(rows) {
+  const applied = { append: 0, create: 0, essential: 0, drop: 0, lane: 0 };
+  const doneIds = [];
+  const terminalIds = [];
+  const results = [];
+  for (const row of rows || []) {
+    if (!['agent.memory.explicit', 'mcp-explicit'].includes(row?.source)) continue;
+    let d = null;
+    try { d = JSON.parse(row.content); } catch {
+      terminalIds.push(row.id);
+      results.push({ id: row.id, ok: false, terminal: true, error: 'invalid_directive_json' });
+      continue;
+    }
+    const slug = normalizeExplicitMemorySlug(d.slug);
+    if (!slug || !['upsert', 'append', 'forget'].includes(d.op)) {
+      terminalIds.push(row.id);
+      results.push({ id: row.id, ok: false, terminal: true, error: 'invalid_directive' });
+      continue;
+    }
+    try {
+      const existing = db.memoryGetConcept(slug);
+      if (d.op === 'forget') {
+        if (!existing) {
+          terminalIds.push(row.id);
+          results.push({ id: row.id, ok: false, terminal: true, error: 'concept_not_found', slug });
+          continue;
+        }
+        const body = String(existing.body || '');
+        if (!body.includes(d.match)) {
+          terminalIds.push(row.id);
+          results.push({ id: row.id, ok: false, terminal: true, error: 'match_not_found', slug });
+          continue;
+        }
+        const revision = archiveExplicitMemoryRevision(d, existing, row.workspace_path);
+        if (revision && !revision.ok) console.warn('[memory explicit] revision archive failed:', revision.error || 'unknown');
+        const nextBody = body.replace(d.match, d.replacement || '').replace(/\n{3,}/g, '\n\n').trim();
+        const r = db.memoryUpsertConcept({
+          slug,
+          title: existing.title || d.title || slug.replace(/-/g, ' '),
+          lead: existing.lead || null,
+          body: nextBody,
+          sections: null,
+          tags: existing.tags || null,
+          source: 'explicit-correction',
+          confidence: 1.0,
+        });
+        if (!r?.ok) throw new Error(r?.error || 'concept update failed');
+        applied.drop++;
+        results.push({ id: row.id, ok: true, op: d.op, slug, replaced: !!d.replacement });
+      } else if (existing) {
+        const body = String(existing.body || '');
+        if (d.op === 'upsert') {
+          const revision = archiveExplicitMemoryRevision(d, existing, row.workspace_path);
+          if (revision && !revision.ok) console.warn('[memory explicit] revision archive failed:', revision.error || 'unknown');
+          const nextBody = replaceMemorySection(body, d.section || 'procedure', d.content);
+          const r = db.memoryUpsertConcept({
+            slug,
+            title: d.title || existing.title || slug.replace(/-/g, ' '),
+            lead: d.content.slice(0, 240),
+            body: nextBody,
+            sections: null,
+            tags: existing.tags || null,
+            source: 'explicit',
+            confidence: 1.0,
+          });
+          if (!r?.ok) throw new Error(r?.error || 'concept upsert failed');
+          applied.append++;
+          results.push({ id: row.id, ok: true, op: d.op, slug, updated: true });
+        } else {
+          if (!body.includes(d.content)) {
+            const revision = archiveExplicitMemoryRevision(d, existing, row.workspace_path);
+            if (revision && !revision.ok) console.warn('[memory explicit] revision archive failed:', revision.error || 'unknown');
+            const r = db.memoryAppendToSection(slug, d.section || 'notes', d.content);
+            if (!r?.ok) throw new Error(r?.error || 'concept append failed');
+          }
+          applied.append++;
+          results.push({ id: row.id, ok: true, op: d.op, slug, deduplicated: body.includes(d.content) });
+        }
+      } else {
+        const section = d.section || (d.op === 'upsert' ? 'procedure' : 'notes');
+        const r = db.memoryUpsertConcept({
+          slug,
+          title: d.title || slug.replace(/-/g, ' '),
+          lead: d.content.slice(0, 240),
+          body: `## ${section}\n\n${d.content}\n`,
+          source: 'explicit',
+          confidence: 1.0,
+        });
+        if (!r?.ok) throw new Error(r?.error || 'concept create failed');
+        applied.create++;
+        results.push({ id: row.id, ok: true, op: d.op, slug, created: true });
+      }
+      doneIds.push(row.id);
+    } catch (e) {
+      results.push({ id: row.id, ok: false, error: e.message, slug });
+    }
+  }
+  const finalizedIds = [...new Set([...doneIds, ...terminalIds])];
+  if (finalizedIds.length) db.memoryConsolidate(finalizedIds);
+  return { processed: finalizedIds.length, succeeded: doneIds.length, failed: terminalIds.length, applied, results };
+}
+
 async function runConsolidationBatch(reason = 'manual') {
   {
     const conf = memoryStageConf('consolidation');
@@ -3640,9 +3844,38 @@ async function runConsolidationBatch(reason = 'manual') {
     // 50 rows never fit in the old hardcoded 2048 tokens.
     const batchSize = Math.max(1, Math.min(50, Number(conf.batchSize) || 12));
     const maxTokens = Math.max(2048, Math.min(16384, Number(conf.maxTokens) || 8192));
-    const buffer = db.memoryBufferList(true, batchSize);
+    let buffer = db.memoryBufferList(true, batchSize);
     if (!buffer.length) return { ok: true, processed: 0, reason };
-    if (!conf.enabled) return { ...db.memoryConsolidate(null), processed: 0 }; // Tier-1: flip flags
+
+    // Explicit memory directives are deterministic and must never be handed to
+    // the consolidation model as opaque JSON. Apply them through db.js so the
+    // canonical concept body and derived memory_sections index stay in sync.
+    const explicitSources = new Set(['agent.memory.explicit', 'mcp-explicit']);
+    const explicit = applyExplicitMemoryDirectives(buffer.filter(row => explicitSources.has(row.source)));
+    buffer = buffer.filter(row => !explicitSources.has(row.source));
+    if (!buffer.length) {
+      return {
+        ok: true,
+        processed: explicit.processed,
+        total: explicit.results.length,
+        applied: explicit.applied,
+        explicit: explicit.results,
+        explicitFailures: explicit.results.filter(r => !r.ok).length,
+        reason,
+      };
+    }
+    if (!conf.enabled) {
+      const ordinary = db.memoryConsolidate(buffer.map(row => row.id));
+      return {
+        ...ordinary,
+        processed: explicit.processed + (ordinary.count || 0),
+        total: explicit.results.length + buffer.length,
+        applied: explicit.applied,
+        explicit: explicit.results,
+        explicitFailures: explicit.results.filter(r => !r.ok).length,
+        reason,
+      };
+    } // Tier-1: flip ordinary rows only
     const concepts = db.memoryListConcepts(100);
     const articleIndex = concepts.map(c => `- ${c.slug} — ${c.title}${c.lead ? ': ' + String(c.lead).slice(0, 120) : ''}`).join('\n') || '(no articles yet)';
     // Facts carry the project they came from so the model can attribute them
@@ -3714,10 +3947,16 @@ Every buffer id must appear in exactly one non-lane op. Return ONLY JSON:
       }
     }
     if (doneIds.size) db.memoryConsolidate([...doneIds]);
+    const mergedApplied = {};
+    for (const key of new Set([...Object.keys(applied), ...Object.keys(explicit.applied)])) {
+      mergedApplied[key] = (applied[key] || 0) + (explicit.applied[key] || 0);
+    }
+    const processed = doneIds.size + explicit.processed;
+    const total = buffer.length + explicit.results.length;
     db.memoryStageStatsSetGlobal('lastConsolidationAt', new Date().toISOString());
-    db.memoryStageStatsSetGlobal('lastConsolidationError', doneIds.size ? null : `applied_nothing (ops=${ops.length}, stop=${meta.stopReason || '?'})`);
-    console.log(`[memory tier3] consolidation batch (${reason}): ${doneIds.size}/${buffer.length} buffer rows → ${JSON.stringify(applied)}${meta.truncated ? ' [salvaged from truncated output]' : ''}`);
-    return { ok: true, processed: doneIds.size, total: buffer.length, applied, reason, meta };
+    db.memoryStageStatsSetGlobal('lastConsolidationError', processed ? null : `applied_nothing (ops=${ops.length}, stop=${meta.stopReason || '?'})`);
+    console.log(`[memory tier3] consolidation batch (${reason}): ${processed}/${total} buffer rows → ${JSON.stringify(mergedApplied)}${meta.truncated ? ' [salvaged from truncated output]' : ''}`);
+    return { ok: true, processed, total, applied: mergedApplied, explicit: explicit.results, explicitFailures: explicit.results.filter(r => !r.ok).length, reason, meta };
   }
 }
 
@@ -5581,6 +5820,50 @@ const AGENT_TOOLS = [
     }
   },
   {
+    name: 'memory_upsert',
+    description: 'Explicitly remember a durable procedure, decision, preference, or fact. Creates the target concept if absent or immediately replaces the named section through Farnsworth\'s indexed memory path. Use when the user says remember or save this. Do not ask for confirmation.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        slug: { type: 'string', description: 'Stable kebab-case concept slug, for example "updating-devvit-apps".' },
+        title: { type: 'string', description: 'Human-readable concept title.' },
+        content: { type: 'string', description: 'The durable memory content to store. Include the complete procedure or fact.' },
+        section: { type: 'string', description: 'Optional target section heading.' },
+        scope: { type: 'string', enum: ['global', 'project'], description: 'global for reusable procedures/user knowledge; project for the open workspace.' }
+      },
+      required: ['slug', 'title', 'content', 'scope']
+    }
+  },
+  {
+    name: 'memory_append',
+    description: 'Append a durable observation or additional instruction to memory without replacing the existing concept. Use for new details, exceptions, and history that belong under an existing topic.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        slug: { type: 'string', description: 'Target concept slug.' },
+        content: { type: 'string', description: 'New durable content to append.' },
+        section: { type: 'string', description: 'Optional target section heading. Defaults to notes.' },
+        scope: { type: 'string', enum: ['global', 'project'], description: 'global or the open project.' }
+      },
+      required: ['slug', 'content', 'scope']
+    }
+  },
+  {
+    name: 'memory_forget',
+    description: 'Correct or remove an obsolete memory. First use memory_recall to identify the concept and exact claim. This records an immutable correction and asks consolidation to remove the matching text, optionally replacing it with corrected text.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        slug: { type: 'string', description: 'Concept slug containing the obsolete claim.' },
+        match: { type: 'string', description: 'Exact obsolete text or claim to remove.' },
+        replacement: { type: 'string', description: 'Optional corrected text that replaces the obsolete claim.' },
+        reason: { type: 'string', description: 'Short reason for the correction.' },
+        scope: { type: 'string', enum: ['global', 'project'], description: 'global or the open project.' }
+      },
+      required: ['slug', 'match', 'scope']
+    }
+  },
+  {
     name: 'take_canvas_screenshot',
     description: 'Take a screenshot of the active canvas preview and return the image so you can see what the app currently looks like. Returns the image directly — use this to verify UI state, discover selectors for test automation, inspect layout, or confirm the result of a code change. Must have an active preview (set_preview or set_canvas_view first if needed).',
     input_schema: {
@@ -5658,6 +5941,39 @@ async function executeAgentTool(name, input, folderOverride) {
     if (res.buffer?.length) fmt.push('recent unfiled facts:\n' + res.buffer.map(b => `- ${String(b.content).slice(0, 160)}`).join('\n'));
     if (res.code?.length) fmt.push('code index:\n' + res.code.map(c => `- ${c.path || c.file || '?'}: ${String(c.content || '').slice(0, 120)}`).join('\n'));
     return { ok: true, result: fmt.join('\n\n') || 'No memory matches for that query.' };
+  }
+
+  if (name === 'memory_upsert' || name === 'memory_append' || name === 'memory_forget') {
+    const op = name.replace('memory_', '');
+    const queued = queueExplicitMemoryDirective(op, input, folderOverride);
+    if (!queued?.ok) return queued;
+    const applied = applyExplicitMemoryDirectives([{
+      id: queued.bufferId,
+      source: 'agent.memory.explicit',
+      content: JSON.stringify(queued.directive),
+      workspace_path: queued.workspacePath,
+    }]);
+    const result = applied.results[0];
+    if (!result?.ok) {
+      return {
+        ok: false,
+        error: result?.error || 'memory_write_failed',
+        message: `Memory ${op} was archived but could not be applied: ${result?.error || 'unknown error'}`,
+        slug: queued.directive.slug,
+        bufferId: queued.bufferId,
+        archiveId: queued.archiveId,
+      };
+    }
+    db.memoryConceptEmbed(queued.directive.slug).catch((e) => console.warn('[memory explicit] embed failed:', e.message));
+    return {
+      ok: true,
+      message: `Memory ${op} applied to ${queued.directive.slug}.`,
+      slug: queued.directive.slug,
+      scope: queued.directive.scope,
+      bufferId: queued.bufferId,
+      archiveId: queued.archiveId,
+      result,
+    };
   }
 
   if (name === 'take_canvas_screenshot') {

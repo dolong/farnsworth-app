@@ -6,7 +6,7 @@ Living spec for the Farnsworth chat agent tool design space.
 
 ---
 
-## Current tools (14)
+## Current tools (18)
 
 ### File system
 
@@ -27,6 +27,7 @@ Living spec for the Farnsworth chat agent tool design space.
 | Tool | Description |
 |---|---|
 | `open_testview` | Switch canvas to Test View. Legacy entry point — prefer `set_preview("testview")`. |
+| `take_canvas_screenshot(filename?)` | Capture the active canvas preview and return the PNG to the agent for visual verification. |
 | `set_canvas_view(view)` | Switch top-level view: `"live"` / `"storybook"` / `"code"`. |
 | `set_preview(preview)` | Within Live, switch surface: `"post"` / `"mobile"` / `"desktop"` / `"fullscreen"` / `"testview"`. Auto-switches to live. |
 | `switch_devvit_user(username)` | Switch active emulator user (restarts dev server). Returns available list on miss. |
@@ -45,6 +46,9 @@ Living spec for the Farnsworth chat agent tool design space.
 | Tool | Description |
 |---|---|
 | `memory_recall(query)` | Search Farnsworth's long-term memory (concept articles, past conversations, code index, essentials, buffer). No workspace required. |
+| `memory_upsert(slug, title, content, section?, scope)` | Create a concept or replace one named section. Explicit writes are buffered + archived first, then applied immediately through `db.js` so section FTS stays current. Scope is required: `global` or `project`. |
+| `memory_append(slug, content, section?, scope)` | Add durable content under a section without replacing existing content. Exact duplicates are suppressed. |
+| `memory_forget(slug, match, replacement?, reason?, scope)` | Correct or remove an exact obsolete claim. Archive remains immutable; the active concept is revised and reindexed. |
 
 ### UI output
 
@@ -69,7 +73,6 @@ Living spec for the Farnsworth chat agent tool design space.
 - `kill_process(tabId)` — stop a specific PTY
 
 ### Canvas + emulator (gaps)
-- `take_canvas_screenshot(filename?)` — capture the live preview → file
 - `reload_canvas` — force WCV reload (equivalent to Page.reload on canvas CDP target)
 - `get_canvas_url` — return the URL the canvas is currently showing
 - `zoom_canvas(factor)` — set zoom (0.05–5.0)
@@ -80,7 +83,6 @@ Living spec for the Farnsworth chat agent tool design space.
 - `get_last_test_results` — return cached stdout from the last test_run
 
 ### Memory (gaps)
-- `memory_save(key, value)` — agent writes a fact back to the memory store
 - `search_pkb` — full-text search the project knowledge base (FTS5 codebase index)
 
 ### Project / tasks (nothing yet)
