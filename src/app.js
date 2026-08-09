@@ -2624,6 +2624,10 @@ function wireRelay() {
         updateChatInputModelButton?.();
       }
       sendModelsListToCompanions();
+    } else if (t && t.startsWith('terminal:')) {
+      // Companion remote Terminal view. Renderer-level bridge: this writes
+      // into the existing desktop terminal WebSocket, never a second PTY.
+      handleCompanionTerminalMessage(t, payload);
     } else if (t === 'command') {
       // Companion ran a Farnsworth command
       const name = payload.name;
@@ -12874,132 +12878,242 @@ async function sendChatMessage(opts) {
 // has a short label (`tty`, `tty 2`, ...) shown in the tab pill. The label
 // can be renamed later (e.g. "npm run dev") once we wire rename UX.
 
-const terminalSessions = new Map(); // tabId -> { term, fit, ws, paneEl, label, createdAt }
+const terminalSessions = new Map(); // tabId -> { term, fit, ws, paneEl, label, createdAt, outputBuffer, readyPromise, cwd, resizeObserver }
 let activeTerminalTabId = null;
 let terminalTabCounter = 0;
 
-// Parallel state for the Claude Code panel — mirrors terminalSessions structure
-// but spawns the `claude` binary via the claude-code WebSocket server (port 9224).
-// This is the "official Claude Code embedded in Farnsworth" path: same
-// xterm.js rendering, but the underlying PTY runs `claude` instead of bash.
-const claudeCodeSessions = new Map(); // tabId -> { term, fit, ws, paneEl, label, createdAt, ptyTabId }
-let activeClaudeCodeTabId = null;
-let claudeCodeTabCounter = 0;
+// Companion Terminal bridge (Aug 9 2026). The desktop renderer owns the real
+// terminal WebSocket and remains the sole PTY/winsize owner. The companion is
+// only another raw-byte viewport into that existing session.
+const companionTerminalAttachments = new Map(); // companionId -> renderer terminal tabId
+const companionTerminalAttachGenerations = new Map(); // companionId -> latest attach request
+const TERMINAL_REPLAY_MAX_CHARS = 512 * 1024;
+let terminalCreationPromise = null;
 
-// Tabs to persist across Farnsworth restarts (Jun 28 ~15:51 ET).
-// Mirrors the open tabs in `claudeCodeSessions` so the UI can recreate the
-// tab pills on startup before any PTYs are spawned. PTYs themselves are
-// not persisted — each tab re-spawns a fresh `claude` child process when
-// the user activates it (lazy init pattern, same as terminal tabs).
-let claudeCodePersistedTabs = []; // [{ id, label, createdAt, sessionId }]
-let claudeCodePersistedActiveId = null;
-
-// Session ID per tab (Jun 28 ~16:30 ET) — keyed by Farnsworth tabId so
-// the renderer can look up the Claude Code session UUID before the PTY
-// spawns. Populated by restoreClaudeCodeTabs() from the persisted list,
-// and updated when the server's `ready` message echoes back the
-// sessionId it actually used (which may be the one we sent, or a fresh
-// UUID main generated for new tabs).
-const claudeCodePersistedSessionsByTab = new Map(); // tabId -> uuid
-
-// Snapshot the current open tabs and active selection, then write to SQLite.
-// Called after any tab add/close/switch. Debounced via saveClaudeCodeTabsTimeout
-// so a burst of changes coalesces into one DB write.
-const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-function isValidUuid(s) {
-  return typeof s === 'string' && uuidRe.test(s);
-}
-let saveClaudeCodeTabsTimeout = null;
-function persistClaudeCodeTabs() {
-  if (!window.farnsworth?.claudeCodeSaveTabs) return;
-  clearTimeout(saveClaudeCodeTabsTimeout);
-  saveClaudeCodeTabsTimeout = setTimeout(() => {
-    const tabs = Array.from(claudeCodeSessions.entries())
-      .sort((a, b) => a[1].createdAt - b[1].createdAt)
-      .map(([id, sess]) => ({
-        id,
-        label: sess.label,
-        createdAt: sess.createdAt,
-        // Persist the Claude Code sessionId so a fresh launch can
-        // `claude --resume <sessionId>` and pick up the prior
-        // conversation instead of starting blank. Only persist valid
-        // UUIDs — the claude CLI rejects anything else with "Invalid
-        // session ID" (Jun 28 ~16:33 ET bug). Stale junk from the
-        // first attempt (ffffffff-prefix fakes) gets dropped here so
-        // the next restore starts a fresh session instead of erroring.
-        sessionId: (() => {
-          const cand = sess.sessionId || claudeCodePersistedSessionsByTab.get(id);
-          return isValidUuid(cand) ? cand : null;
-        })(),
-      }));
-    window.farnsworth.claudeCodeSaveTabs({
-      tabs,
-      activeId: activeClaudeCodeTabId,
-    }).catch(() => {});
-  }, 200);
+function companionTerminalId(payload) {
+  return payload?.companionId || payload?.from || 'companion';
 }
 
-// Read saved tabs on startup. Returns the list and the active id; the
-// caller decides when to actually spawn each PTY (we restore tab pills
-// immediately so the user sees them, but only init PTYs for the active
-// tab + on tab switch).
-async function loadPersistedClaudeCodeTabs() {
-  if (!window.farnsworth?.claudeCodeListTabs) return { tabs: [], activeId: null };
+function sendTerminalEventToCompanion(type, companionId, payload = {}) {
+  if (!window.farnsworth?.relaySend) return;
   try {
-    const r = await window.farnsworth.claudeCodeListTabs();
-    if (!r || !r.ok) return { tabs: [], activeId: null };
-    return { tabs: r.tabs || [], activeId: r.activeId || null };
-  } catch {
-    return { tabs: [], activeId: null };
+    window.farnsworth.relaySend({ type, companionId, ts: Date.now(), ...payload });
+  } catch (e) {
+    console.warn('[terminal-bridge] relaySend failed:', e.message);
   }
 }
 
-function nextClaudeCodeTabId() {
-  claudeCodeTabCounter++;
-  return 'cc-' + claudeCodeTabCounter;
-}
-
-function nextClaudeCodeLabel() {
-  const n = claudeCodeTabCounter;
-  return n === 1 ? 'claude' : 'claude ' + n;
-}
-
-// Derive a tab title from the user's first message in a Claude Code
-// session (Jul 14 ~13:00 ET). Trims to ~40 chars so the cctab pill
-// stays readable; collapses whitespace; strips leading Re:/Fwd:/>;
-// strips leading slashes so "/login" becomes "login". Returns
-// 'New chat' for empty input.
-function generateTitleFromMessage(msg) {
-  if (!msg || typeof msg !== 'string') return 'New chat';
-  const firstLine = msg.trim().split('\n').find(l => l.trim()) || '';
-  let collapsed = firstLine.replace(/\s+/g, ' ').trim();
-  // Strip prompt-prefix chars (Claude Code's "❯ ", "›", "> ") + leading
-  // slashes + Re:/Fwd: prefixes. xterm's line buffer includes whatever
-  // was rendered on the prompt line, including the prompt char.
-  collapsed = collapsed
-    .replace(/^[❯›>]\s*/, '')
-    .replace(/^(re|fwd|>>)\s*:\s*/i, '')
-    .replace(/^\/+/, '')
-    .trim();
-  // Strip conversational openers so the title reads like a topic instead
-  // of a raw question. Falls back to the original text if stripping makes
-  // it too short (e.g., "please" alone -> "please" kept). Verified Jul 14
-  // ~15:35 ET: Long expected topic-style titles, not raw first-message text.
-  const openerStripped = collapsed.replace(
-    /^(how (do|can|should|would|could) (i|you|we)|how to|what (is|are|were)|can you|could you|i (need|want) to|please|let's|let us)\s+/i,
-    ''
-  ).trim();
-  if (openerStripped.length >= 3) {
-    collapsed = openerStripped;
+function appendTerminalReplay(sess, data) {
+  if (!sess || typeof data !== 'string' || !data) return;
+  sess.outputBuffer = (sess.outputBuffer || '') + data;
+  if (sess.outputBuffer.length > TERMINAL_REPLAY_MAX_CHARS) {
+    sess.outputBuffer = sess.outputBuffer.slice(-TERMINAL_REPLAY_MAX_CHARS);
   }
-  // Strip trailing question mark / period so titles don't read as questions.
-  collapsed = collapsed.replace(/[?.!]+\s*$/, '');
-  // Sentence-case (capitalize first letter only) -- title-case looks weird
-  // for code topics ("Use Async/await" -> "Use Async/Await").
-  collapsed = collapsed.charAt(0).toUpperCase() + collapsed.slice(1);
-  if (!collapsed) return 'New chat';
-  if (collapsed.length <= 40) return collapsed;
-  return collapsed.slice(0, 37) + '...';
+}
+
+function forwardTerminalOutput(tabId, data) {
+  if (typeof data !== 'string' || !data) return;
+  for (const [companionId, attachedTabId] of companionTerminalAttachments.entries()) {
+    if (attachedTabId === tabId) {
+      sendTerminalEventToCompanion('terminal:output', companionId, { tabId, data });
+    }
+  }
+}
+
+function forwardTerminalSize(tabId, cols, rows) {
+  for (const [companionId, attachedTabId] of companionTerminalAttachments.entries()) {
+    if (attachedTabId === tabId) {
+      sendTerminalEventToCompanion('terminal:resize', companionId, { tabId, cols, rows });
+    }
+  }
+}
+
+function endCompanionTerminalAttachments(tabId, reason = 'desktop-session-ended') {
+  for (const [companionId, attachedTabId] of [...companionTerminalAttachments.entries()]) {
+    if (attachedTabId !== tabId) continue;
+    companionTerminalAttachments.delete(companionId);
+    companionTerminalAttachGenerations.set(
+      companionId,
+      (companionTerminalAttachGenerations.get(companionId) || 0) + 1,
+    );
+    sendTerminalEventToCompanion('terminal:exit', companionId, { tabId, reason });
+  }
+}
+
+function liveTerminalSession(tabId) {
+  const sess = tabId ? terminalSessions.get(tabId) : null;
+  return sess && !sess.cleaned && !sess.ended ? sess : null;
+}
+
+function latestTerminalTabId() {
+  let latestId = null;
+  let latestCreatedAt = -Infinity;
+  for (const [tabId, sess] of terminalSessions.entries()) {
+    if (!sess || sess.cleaned || sess.ended) continue;
+    if (sess.createdAt >= latestCreatedAt) {
+      latestCreatedAt = sess.createdAt;
+      latestId = tabId;
+    }
+  }
+  return latestId;
+}
+
+function chooseTerminalTab(requestedTabId) {
+  if (liveTerminalSession(requestedTabId)) return requestedTabId;
+  if (liveTerminalSession(activeTerminalTabId)) return activeTerminalTabId;
+  return latestTerminalTabId();
+}
+
+function settleTerminalReady(sess, error) {
+  if (!sess || sess.readySettled) return;
+  sess.readySettled = true;
+  if (error) sess.rejectReady?.(error);
+  else sess.resolveReady?.(sess);
+}
+
+function sendTerminalResize(sess, cols, rows) {
+  if (!sess || sess.cleaned) return;
+  const next = `${cols}x${rows}`;
+  // xterm can report the same size from both onResize and ResizeObserver.
+  // Keep the PTY and companion stream free of redundant winsize messages.
+  if (sess.lastResize === next) return;
+  sess.lastResize = next;
+  if (sess.ws?.readyState === WebSocket.OPEN) {
+    sess.ws.send(JSON.stringify({ type: 'resize', cols, rows }));
+  }
+  // This direction is desktop -> companion only. Companion resize messages
+  // are intentionally ignored in handleCompanionTerminalMessage().
+  forwardTerminalSize(sess.tabId, cols, rows);
+}
+
+function cleanupTerminalSession(tabId, reason = 'terminal-ended', { notifyCompanions = true, writeStatus = false } = {}) {
+  const sess = terminalSessions.get(tabId);
+  if (!sess || sess.cleaned) return false;
+  sess.cleaned = true;
+  sess.cleanupReason = reason;
+  try { sess.resizeObserver?.disconnect(); } catch {}
+  if (!sess.readySettled) settleTerminalReady(sess, new Error(reason));
+  if (notifyCompanions) endCompanionTerminalAttachments(tabId, reason);
+  if (writeStatus && !sess.statusWritten) {
+    sess.statusWritten = true;
+    try { sess.term?.write('\r\n\x1b[2m[process exited]\x1b[0m\r\n'); } catch {}
+  }
+  try { sess.ws?.close(); } catch {}
+  try { sess.term?.dispose(); } catch {}
+  try { sess.paneEl?.remove(); } catch {}
+  terminalSessions.delete(tabId);
+
+  if (activeTerminalTabId === tabId) {
+    activeTerminalTabId = [...terminalSessions.entries()]
+      .sort((a, b) => a[1].createdAt - b[1].createdAt)
+      .map(([id]) => id)[0] || null;
+    for (const [id, remaining] of terminalSessions.entries()) {
+      if (remaining.paneEl) remaining.paneEl.hidden = (id !== activeTerminalTabId);
+    }
+  }
+  renderTerminalTabs();
+  return true;
+}
+
+async function attachCompanionTerminal(payload = {}) {
+  const companionId = companionTerminalId(payload);
+  const generation = (companionTerminalAttachGenerations.get(companionId) || 0) + 1;
+  companionTerminalAttachGenerations.set(companionId, generation);
+
+  let tabId = chooseTerminalTab(payload.tabId || null);
+  // No desktop terminal exists yet. Create the ordinary Terminal session in
+  // its normal hidden pane; do not call switchLeftPanel() from this path.
+  if (!tabId) {
+    if (!terminalCreationPromise) {
+      terminalCreationPromise = (async () => {
+        const newTabId = nextTerminalTabId();
+        await initTerminal(newTabId);
+        return newTabId;
+      })().finally(() => { terminalCreationPromise = null; });
+    }
+    tabId = await terminalCreationPromise;
+    tabId = chooseTerminalTab(tabId) || tabId;
+  }
+
+  const sess = terminalSessions.get(tabId);
+  if (!sess || sess.cleaned) {
+    if (companionTerminalAttachGenerations.get(companionId) === generation) {
+      sendTerminalEventToCompanion('terminal:attached', companionId, { ok: false, reason: 'terminal-unavailable' });
+    }
+    return;
+  }
+
+  try {
+    await Promise.race([
+      sess.readyPromise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('terminal-ready-timeout')), 5000)),
+    ]);
+  } catch (e) {
+    if (companionTerminalAttachGenerations.get(companionId) === generation) {
+      sendTerminalEventToCompanion('terminal:attached', companionId, { ok: false, reason: e.message || 'terminal-ready-timeout' });
+    }
+    return;
+  }
+
+  // A newer subscribe/switch/detach may have superseded this await. Never let
+  // a slow old readiness result steal the companion back to a stale tab.
+  if (companionTerminalAttachGenerations.get(companionId) !== generation) return;
+  if (terminalSessions.get(tabId) !== sess || sess.cleaned) return;
+
+  const cols = Number(sess.term?.cols) || 80;
+  const rows = Number(sess.term?.rows) || 24;
+  const replay = sess.outputBuffer || '';
+  companionTerminalAttachments.set(companionId, tabId);
+  sendTerminalEventToCompanion('terminal:attached', companionId, {
+    ok: true,
+    tabId,
+    reset: true,
+    cols,
+    rows,
+    cwd: sess.cwd || state.folder || null,
+    label: sess.label || 'Terminal',
+  });
+  // No await after attached: the snapshot is sent before any later live data.
+  if (replay) sendTerminalEventToCompanion('terminal:output', companionId, { tabId, data: replay, replay: true });
+}
+
+function handleCompanionTerminalMessage(type, payload = {}) {
+  const companionId = companionTerminalId(payload);
+  if (type === 'terminal:subscribe') {
+    const expectedGeneration = (companionTerminalAttachGenerations.get(companionId) || 0) + 1;
+    attachCompanionTerminal(payload).catch((e) => {
+      if (companionTerminalAttachGenerations.get(companionId) === expectedGeneration) {
+        sendTerminalEventToCompanion('terminal:attached', companionId, { ok: false, reason: e.message || 'attach-failed' });
+      }
+    });
+    return;
+  }
+
+  if (type === 'terminal:detach') {
+    companionTerminalAttachGenerations.set(
+      companionId,
+      (companionTerminalAttachGenerations.get(companionId) || 0) + 1,
+    );
+    companionTerminalAttachments.delete(companionId);
+    return;
+  }
+
+  const tabId = companionTerminalAttachments.get(companionId);
+  const sess = tabId ? terminalSessions.get(tabId) : null;
+  if (!sess || sess.cleaned || sess.ws?.readyState !== WebSocket.OPEN) return;
+
+  if (type === 'terminal:input') {
+    const data = typeof payload.data === 'string' ? payload.data : '';
+    if (data) {
+      sess.ws.send(JSON.stringify({ type: 'data', data }));
+      sess.lastActivity = Date.now();
+    }
+  } else if (type === 'terminal:interrupt' || type === 'terminal:ctrl-c') {
+    sess.ws.send(JSON.stringify({ type: 'data', data: '\x03' }));
+    sess.lastActivity = Date.now();
+  }
+  // terminal:resize is deliberately ignored. The desktop xterm owns the
+  // shared PTY winsize; the companion only scales its local viewport.
 }
 
 function nextTerminalTabId() {
@@ -13018,15 +13132,14 @@ async function initTerminal(tabId) {
   if (!host || typeof Terminal === 'undefined') return;
   if (terminalSessions.has(tabId)) {
     // Re-mount: xterm's element may have been moved; ensure it's inside its pane.
-    const sess = terminalSessions.get(tabId);
-    if (sess.term.element && sess.paneEl && sess.term.element.parentNode !== sess.paneEl) {
-      sess.paneEl.appendChild(sess.term.element);
+    const existing = terminalSessions.get(tabId);
+    if (existing.term?.element && existing.paneEl && existing.term.element.parentNode !== existing.paneEl) {
+      existing.paneEl.appendChild(existing.term.element);
     }
-    setTimeout(() => { try { sess.fit.fit(); } catch {} }, 50);
-    return;
+    setTimeout(() => { try { existing.fit?.fit(); } catch {} }, 50);
+    return existing;
   }
 
-  // Create a per-tab pane div and add it to the host.
   const paneEl = document.createElement('div');
   paneEl.className = 'termtab__pane';
   paneEl.id = 'termtab-pane-' + tabId;
@@ -13034,6 +13147,7 @@ async function initTerminal(tabId) {
   host.appendChild(paneEl);
 
   const label = nextTerminalLabel(tabId);
+  const cwd = state.folder || null;
   const term = new Terminal({
     cursorBlink: true,
     fontFamily: 'ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, monospace',
@@ -13057,58 +13171,133 @@ async function initTerminal(tabId) {
   term.open(paneEl);
   fit.fit();
 
-  const wsUrl = await window.farnsworth.getTerminalWsUrl();
-  const ws = new WebSocket(wsUrl);
-  ws.binaryType = 'arraybuffer';
-  // We'll get a { type: 'ready', tabId } from main when the PTY is bound —
-  // remember the WS-assigned tabId so close() can target it later.
-  let ptyTabId = tabId;
-
-  term.onData((data) => {
-    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'data', data }));
+  let resolveReady;
+  let rejectReady;
+  const readyPromise = new Promise((resolve, reject) => {
+    resolveReady = resolve;
+    rejectReady = reject;
   });
-  term.onResize(({ cols, rows }) => {
-    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'resize', cols, rows }));
-  });
-  ws.onopen = () => {
-    fit.fit();
-    // Tell main the workspace cwd so the PTY spawns in the right directory.
-    // Falls back to currentFolder setting / homedir in main if absent.
-    ws.send(JSON.stringify({ type: 'init', cwd: state.folder || null }));
-    ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
-  };
-  ws.onmessage = (e) => {
-    try {
-      const msg = JSON.parse(e.data);
-      if (msg.type === 'ready' && msg.tabId) {
-        // Main has bound this PTY to msg.tabId. Update our map key for close() routing.
-        ptyTabId = msg.tabId;
-        const sess = terminalSessions.get(tabId);
-        if (sess) sess.ptyTabId = ptyTabId;
-      } else if (msg.type === 'data') {
-        term.write(msg.data);
-      } else if (msg.type === 'exit') {
-        term.write('\r\n\x1b[2m[process exited]\x1b[0m\r\n');
-      }
-    } catch {}
-  };
-  ws.onclose = () => {
-    term.write('\r\n\x1b[2m[disconnected]\x1b[0m\r\n');
+  // Local desktop tabs may never have a remote subscriber awaiting readiness.
+  readyPromise.catch(() => {});
+  const sess = {
+    tabId,
+    term,
+    fit,
+    ws: null,
+    paneEl,
+    label,
+    createdAt: Date.now(),
+    ptyTabId: tabId,
+    outputBuffer: '',
+    readyPromise,
+    resolveReady,
+    rejectReady,
+    readySettled: false,
+    cwd,
+    resizeObserver: null,
+    lastActivity: Date.now(),
+    lastResize: null,
+    cleaned: false,
+    ended: false,
+    closing: false,
+    statusWritten: false,
   };
 
-  // Keep xterm sized to its pane whenever the host container changes.
-  const resizeObserver = new ResizeObserver(() => {
-    try { fit.fit(); ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows })); } catch {}
-  });
-  resizeObserver.observe(paneEl);
-
-  terminalSessions.set(tabId, { term, fit, ws, paneEl, label, createdAt: Date.now(), ptyTabId });
+  // Register exactly once, before getTerminalWsUrl/WebSocket can deliver any
+  // event. This also closes the concurrent init race for the same tabId.
+  terminalSessions.set(tabId, sess);
   activeTerminalTabId = tabId;
   renderTerminalTabs();
-  // Hide every other pane; show this one.
-  for (const [id, sess] of terminalSessions.entries()) {
-    if (sess.paneEl) sess.paneEl.hidden = (id !== tabId);
+  for (const [id, other] of terminalSessions.entries()) {
+    if (other.paneEl) other.paneEl.hidden = (id !== tabId);
   }
+
+  term.onData((data) => {
+    if (!sess.cleaned && sess.ws?.readyState === WebSocket.OPEN) {
+      sess.ws.send(JSON.stringify({ type: 'data', data }));
+    }
+  });
+  term.onResize(({ cols, rows }) => {
+    // This is the normal Terminal's resize hook. Claude Code/Codex keep their
+    // own independent handlers below and are intentionally untouched here.
+    sendTerminalResize(sess, cols, rows);
+  });
+
+  const resizeObserver = new ResizeObserver(() => {
+    if (sess.cleaned) return;
+    try {
+      fit.fit();
+      sendTerminalResize(sess, term.cols, term.rows);
+    } catch {}
+  });
+  resizeObserver.observe(paneEl);
+  sess.resizeObserver = resizeObserver;
+
+  try {
+    const wsUrl = await window.farnsworth.getTerminalWsUrl();
+    if (sess.cleaned) return sess;
+    const ws = new WebSocket(wsUrl);
+    ws.binaryType = 'arraybuffer';
+    sess.ws = ws;
+
+    ws.onopen = () => {
+      if (sess.cleaned) return;
+      fit.fit();
+      ws.send(JSON.stringify({ type: 'init', cwd }));
+      // Reset the dedupe key so the PTY always receives its initial size.
+      sess.lastResize = null;
+      sendTerminalResize(sess, term.cols, term.rows);
+    };
+    ws.onmessage = (e) => {
+      if (sess.cleaned) return;
+      try {
+        const msg = JSON.parse(e.data);
+        if (msg.type === 'ready' && msg.tabId) {
+          sess.ptyTabId = msg.tabId;
+          if (typeof msg.cwd === 'string' && msg.cwd) sess.cwd = msg.cwd;
+          settleTerminalReady(sess);
+        } else if (msg.type === 'data') {
+          const data = typeof msg.data === 'string' ? msg.data : String(msg.data ?? '');
+          if (!data) return;
+          appendTerminalReplay(sess, data);
+          sess.lastActivity = Date.now();
+          term.write(data);
+          forwardTerminalOutput(tabId, data);
+        } else if (msg.type === 'exit') {
+          // Preserve Farnsworth's existing desktop UX: leave the exited tab and
+          // its scrollback visible until the user closes it. Only the remote
+          // attachment ends because there is no live PTY left to drive.
+          if (!sess.ended) {
+            sess.ended = true;
+            sess.statusWritten = true;
+            try { term.write('\r\n\x1b[2m[process exited]\x1b[0m\r\n'); } catch {}
+            endCompanionTerminalAttachments(tabId, 'process-exited');
+          }
+        } else if (msg.type === 'error') {
+          const error = new Error(msg.message || 'terminal-error');
+          settleTerminalReady(sess, error);
+          cleanupTerminalSession(tabId, error.message, { notifyCompanions: true, writeStatus: false });
+        }
+      } catch (e) {
+        console.warn('[terminal-bridge] invalid terminal message:', e.message);
+      }
+    };
+    ws.onclose = () => {
+      if (sess.cleaned || sess.ended) return;
+      const reason = sess.closing ? 'desktop-session-closed' : 'desktop-session-disconnected';
+      cleanupTerminalSession(tabId, reason, { notifyCompanions: !sess.closing, writeStatus: !sess.closing });
+    };
+    ws.onerror = () => {
+      if (sess.cleaned || sess.ended) return;
+      const error = new Error('terminal-websocket-error');
+      settleTerminalReady(sess, error);
+      cleanupTerminalSession(tabId, error.message, { notifyCompanions: !sess.closing, writeStatus: false });
+    };
+  } catch (e) {
+    settleTerminalReady(sess, e instanceof Error ? e : new Error(String(e)));
+    cleanupTerminalSession(tabId, e.message || 'terminal-connect-failed', { notifyCompanions: true, writeStatus: false });
+  }
+  return sess;
 }
 
 // ------------------------------------------------------------
@@ -14006,44 +14195,78 @@ function renderTerminalTabs() {
   }
 }
 
+function invalidateCompanionTerminalAttachment(companionId) {
+  companionTerminalAttachGenerations.set(
+    companionId,
+    (companionTerminalAttachGenerations.get(companionId) || 0) + 1,
+  );
+  companionTerminalAttachments.delete(companionId);
+}
+
 function switchTerminalTab(tabId) {
   const sess = terminalSessions.get(tabId);
-  if (!sess) return;
+  if (!sess || sess.cleaned) return;
+  const changed = activeTerminalTabId !== tabId;
   activeTerminalTabId = tabId;
-  // Toggle pane visibility
   for (const [id, s] of terminalSessions.entries()) {
     if (s.paneEl) s.paneEl.hidden = (id !== tabId);
   }
   renderTerminalTabs();
+  // A companion follows the desktop's active terminal. Invalidate its old
+  // attachment before awaiting readiness so old-tab bytes cannot arrive after
+  // the reset for the newly selected tab.
+  if (changed) {
+    const companions = [...companionTerminalAttachments.keys()];
+    for (const companionId of companions) {
+      invalidateCompanionTerminalAttachment(companionId);
+      attachCompanionTerminal({ companionId, tabId, reset: true }).catch(() => {});
+    }
+  }
   setTimeout(() => {
-    try { sess.fit.fit(); sess.term.focus(); } catch {}
+    try { sess.fit?.fit(); sess.term?.focus(); } catch {}
   }, 30);
 }
 
 async function closeTerminalTab(tabId) {
   const sess = terminalSessions.get(tabId);
-  if (!sess) return;
-  // Tell main to kill the PTY (and drop the WS).
+  if (!sess || sess.cleaned) return;
+  const affectedCompanions = [...companionTerminalAttachments.entries()]
+    .filter(([, attachedTabId]) => attachedTabId === tabId)
+    .map(([companionId]) => companionId);
+  // Invalidate before killing the socket. This prevents its close/exit event
+  // from sending a stale terminal:exit before the companion is reattached.
+  for (const companionId of affectedCompanions) invalidateCompanionTerminalAttachment(companionId);
+
+  sess.closing = true;
   try { await window.farnsworth.terminalClose(sess.ptyTabId || tabId); } catch {}
-  try { sess.ws.close(); } catch {}
-  try { sess.term.dispose(); } catch {}
-  try { sess.paneEl.remove(); } catch {}
-  terminalSessions.delete(tabId);
-  // If we closed the active tab, activate the next available one.
-  if (activeTerminalTabId === tabId) {
-    const remaining = Array.from(terminalSessions.keys()).sort((a, b) => {
-      return terminalSessions.get(a).createdAt - terminalSessions.get(b).createdAt;
-    });
-    activeTerminalTabId = remaining[0] || null;
-    if (activeTerminalTabId) {
-      const next = terminalSessions.get(activeTerminalTabId);
-      for (const [id, s] of terminalSessions.entries()) {
-        if (s.paneEl) s.paneEl.hidden = (id !== activeTerminalTabId);
-      }
-      setTimeout(() => { try { next.fit.fit(); next.term.focus(); } catch {} }, 30);
+  // The WS may already have cleaned this session in response to the PTY exit;
+  // cleanupTerminalSession is idempotent and emits no duplicate stale exit.
+  cleanupTerminalSession(tabId, 'desktop-session-closed', {
+    notifyCompanions: false,
+    writeStatus: false,
+  });
+
+  const nextTabId = activeTerminalTabId;
+  const next = nextTabId ? terminalSessions.get(nextTabId) : null;
+  if (next) {
+    for (const [id, s] of terminalSessions.entries()) {
+      if (s.paneEl) s.paneEl.hidden = (id !== nextTabId);
     }
+    setTimeout(() => { try { next.fit?.fit(); next.term?.focus(); } catch {} }, 30);
   }
   renderTerminalTabs();
+  if (next && !next.cleaned) {
+    for (const companionId of affectedCompanions) {
+      attachCompanionTerminal({ companionId, tabId: nextTabId, reset: true }).catch(() => {});
+    }
+  } else {
+    for (const companionId of affectedCompanions) {
+      sendTerminalEventToCompanion('terminal:exit', companionId, {
+        tabId,
+        reason: 'desktop-session-closed',
+      });
+    }
+  }
 }
 
 // Apply left-panel-tab visibility settings (Jul 19).
