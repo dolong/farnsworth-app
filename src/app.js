@@ -4090,7 +4090,7 @@ function renderPhone() {
     <div class="phone__screen">
       ${state.farnsworthDev?.available
         ? `<div class="phone__screen-iframe phone__screen-browser-view" data-canvas-view="mobile" data-canvas-url="${state.farnsworthDev.url}/?view=mobile" style="width:100%;height:100%;display:block;background:#000"></div>`
-        : `<img src="src/assets/reddit/swordandsuppermobile.png" alt="Sword & Supper game" />`}
+        : `<img src="src/assets/reddit/farnsworth-offline-mobile.png" alt="Preview offline" />`}
     </div>
     <div class="phone__actions">
       <button class="post-view__pill post-view__pill--vote">
@@ -4135,7 +4135,7 @@ function renderDesktop() {
     <div class="desktop__stage">
       ${state.farnsworthDev?.available
         ? `<div class="desktop__stage-iframe desktop__stage-browser-view" data-canvas-view="desktop" data-canvas-url="${state.farnsworthDev.url}/?view=desktop" style="width:100%;height:100%;display:block;background:#000"></div>`
-        : `<img src="src/assets/reddit/swordandsuppermobile.png" alt="Sword & Supper game" />`}
+        : `<img src="src/assets/reddit/farnsworth-offline-wide.png" alt="Preview offline" />`}
     </div>
     <div class="desktop__actions">
       <button class="post-view__pill post-view__pill--vote">
@@ -4180,7 +4180,7 @@ function renderFullscreen() {
     <div class="fullscreen__stage">
       ${state.farnsworthDev?.available
         ? `<div class="fullscreen__stage-iframe fullscreen__stage-browser-view" data-canvas-view="fullscreen" data-canvas-url="${state.farnsworthDev.url}/?view=desktop" style="width:100%;height:100%;display:block;background:#000"></div>`
-        : `<img src="src/assets/reddit/swordandsuppermobile.png" alt="Sword & Supper game" />`}
+        : `<img src="src/assets/reddit/farnsworth-offline-wide.png" alt="Preview offline" />`}
     </div>
   `;
   return f;
