@@ -984,6 +984,7 @@ function createWindow({ fresh = false } = {}) {
     event.preventDefault();
     win._closeInProgress = true;
     try {
+      try { if (prodSession?.owner === win) { prodCanvasActive = false; await stopProdSession('window-close'); } } catch {}
       // Ask the renderer to flush any pending save synchronously. The
       // 500ms debounce in saveActiveConversation would otherwise lose
       // data on a quick X-click. executeJavaScript awaits the promise,
@@ -2400,7 +2401,328 @@ const _CANVAS_IFRAME_RECT_JS =
   'if(!f)return null;var r=f.getBoundingClientRect();' +
   'return {x:Math.max(0,Math.round(r.left)),y:Math.max(0,Math.round(r.top)),' +
   'width:Math.round(r.width),height:Math.round(r.height)};})()';
+
+// ============================================================
+// Prod browser surface (Aug 12 2026)
+// ============================================================
+// Operator-facing mirror of a real, visible agent-browser Chrome session.
+// This is intentionally separate from Test View's Electron WebContentsView
+// backend. Human input may travel over CDP; automated production tests must
+// keep the frame-aware browser-native adapter described in DEVVIT-TESTS.md.
+const PROD_DEFAULT_URL = 'https://www.reddit.com/r/social_poker_game/comments/1vfrajp/';
+const PROD_IDENTITY_DIR = path.join(SHARED_USER_DATA, 'prod-identities');
+const PROD_REGISTRY_PATH = path.join(PROD_IDENTITY_DIR, 'profiles.json');
+const PROD_ANOMALY_SOURCE = path.join(os.homedir(), 'Documents', 'Anomaly Intelligence', 'anomalyint', 'reddit-data-logs', '.reddit-auth.json');
+const PROD_ANOMALY_COPY = path.join(PROD_IDENTITY_DIR, 'state', 'anomalyint-reddit-auth.json');
+let prodSession = null;
+let latestProdFrame = null; // { buffer, width, height, metadata, ts }
+let prodCanvasActive = false;
+let prodCdpSeq = 0;
+const prodCdpPending = new Map();
+
+function prodAgentBrowserBin() {
+  // Explicit override is authoritative. This gives packaged verification a
+  // deterministic unavailable-browser path instead of silently trying a
+  // different binary than the operator configured.
+  if (process.env.AGENT_BROWSER_BIN) {
+    return fsSync.existsSync(process.env.AGENT_BROWSER_BIN) ? process.env.AGENT_BROWSER_BIN : null;
+  }
+  const candidates = [
+    '/opt/homebrew/bin/agent-browser',
+    '/usr/local/bin/agent-browser',
+    'agent-browser',
+  ];
+  for (const c of candidates) {
+    if (c === 'agent-browser' || fsSync.existsSync(c)) return c;
+  }
+  return null;
+}
+function prodSlug(raw) {
+  return String(raw || 'profile').trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'profile';
+}
+function prodReadRegistry() {
+  try {
+    const parsed = JSON.parse(fsSync.readFileSync(PROD_REGISTRY_PATH, 'utf8'));
+    return Array.isArray(parsed?.profiles) ? parsed : { profiles: [] };
+  } catch { return { profiles: [] }; }
+}
+function prodWriteRegistry(registry) {
+  fsSync.mkdirSync(PROD_IDENTITY_DIR, { recursive: true });
+  const tmp = PROD_REGISTRY_PATH + '.tmp';
+  fsSync.writeFileSync(tmp, JSON.stringify({ version: 1, profiles: registry.profiles || [] }, null, 2), { mode: 0o600 });
+  fsSync.renameSync(tmp, PROD_REGISTRY_PATH);
+}
+function prodStateMetadata(filePath) {
+  try {
+    const st = fsSync.statSync(filePath);
+    const json = JSON.parse(fsSync.readFileSync(filePath, 'utf8'));
+    return {
+      available: true,
+      sourceName: path.basename(filePath),
+      sizeBytes: st.size,
+      modifiedAt: st.mtime.toISOString(),
+      cookieCount: Array.isArray(json.cookies) ? json.cookies.length : 0,
+      originCount: Array.isArray(json.origins) ? json.origins.length : 0,
+    };
+  } catch (e) {
+    return { available: false, sourceName: path.basename(filePath || ''), error: e.code || 'unavailable' };
+  }
+}
+function prodPublicProfile(profile) {
+  const base = {
+    id: profile.id,
+    label: profile.label,
+    username: profile.username || null,
+    mode: profile.mode,
+    createdAt: profile.createdAt,
+    lastUsedAt: profile.lastUsedAt || null,
+  };
+  if (profile.mode === 'state') return { ...base, metadata: prodStateMetadata(profile.statePath) };
+  let available = false, modifiedAt = null;
+  try { const st = fsSync.statSync(profile.profilePath); available = st.isDirectory(); modifiedAt = st.mtime.toISOString(); } catch {}
+  return { ...base, metadata: { available, sourceName: path.basename(profile.profilePath || ''), modifiedAt } };
+}
+function prodSeedProfiles() {
+  fsSync.mkdirSync(path.join(PROD_IDENTITY_DIR, 'state'), { recursive: true });
+  fsSync.mkdirSync(path.join(PROD_IDENTITY_DIR, 'chrome-profiles'), { recursive: true });
+  const registry = prodReadRegistry();
+  if (!registry.profiles.some((x) => x.id === 'anomalyint')) {
+    if (fsSync.existsSync(PROD_ANOMALY_SOURCE) && !fsSync.existsSync(PROD_ANOMALY_COPY)) {
+      fsSync.copyFileSync(PROD_ANOMALY_SOURCE, PROD_ANOMALY_COPY);
+      try { fsSync.chmodSync(PROD_ANOMALY_COPY, 0o600); } catch {}
+    }
+    registry.profiles.unshift({
+      id: 'anomalyint', label: 'AnomalyInt', username: null, mode: 'state',
+      statePath: PROD_ANOMALY_COPY, createdAt: new Date().toISOString(), lastUsedAt: null,
+    });
+    prodWriteRegistry(registry);
+  } else if (!fsSync.existsSync(PROD_ANOMALY_COPY) && fsSync.existsSync(PROD_ANOMALY_SOURCE)) {
+    // Repair a missing managed snapshot, but never keep it synchronized with
+    // AnomalyInt's live scraper state. Prod and the scraper must not race.
+    try { fsSync.copyFileSync(PROD_ANOMALY_SOURCE, PROD_ANOMALY_COPY); fsSync.chmodSync(PROD_ANOMALY_COPY, 0o600); } catch {}
+  }
+  return prodReadRegistry();
+}
+function prodBroadcast(channel, payload) {
+  const owner = prodSession?.owner;
+  if (owner && !owner.isDestroyed()) { try { owner.webContents.send(channel, payload); } catch {} }
+}
+function prodStatus(extra = {}) {
+  if (!prodSession) return { running: false, state: 'stopped', ...extra };
+  return {
+    running: true,
+    state: prodSession.state,
+    profileId: prodSession.profileId,
+    sessionName: prodSession.sessionName,
+    url: prodSession.url || null,
+    title: prodSession.title || null,
+    viewport: prodSession.viewport || null,
+    webdriver: prodSession.webdriver,
+    headed: true,
+    engine: 'agent-browser',
+    frame: latestProdFrame ? { width: latestProdFrame.width, height: latestProdFrame.height, ts: latestProdFrame.ts } : null,
+    error: prodSession.error || null,
+    ...extra,
+  };
+}
+function prodEmitStatus(extra = {}) { const status = prodStatus(extra); prodBroadcast('prod:status', status); return status; }
+function prodExec(args, timeout = 45000) {
+  const bin = prodAgentBrowserBin();
+  if (!bin) return Promise.reject(Object.assign(new Error('agent-browser unavailable'), { code: 'agent_browser_unavailable' }));
+  return new Promise((resolve, reject) => {
+    child_process.execFile(bin, args, { timeout, maxBuffer: 4 * 1024 * 1024, env: { ...process.env, PATH: `/opt/homebrew/bin:/usr/local/bin:${process.env.PATH || ''}` } }, (err, stdout, stderr) => {
+      if (err) { err.stderr = stderr; err.stdout = stdout; reject(err); return; }
+      resolve(stdout);
+    });
+  });
+}
+function prodParseJsonOutput(stdout) {
+  const lines = String(stdout || '').trim().split(/\n+/).reverse();
+  for (const line of lines) { try { return JSON.parse(line); } catch {} }
+  throw new Error('agent-browser returned invalid JSON');
+}
+function prodCdpCall(method, params = {}, sessionId = null, timeout = 15000) {
+  return new Promise((resolve, reject) => {
+    if (!prodSession?.ws || prodSession.ws.readyState !== WebSocket.OPEN) return reject(new Error('prod CDP unavailable'));
+    const id = ++prodCdpSeq;
+    const timer = setTimeout(() => { prodCdpPending.delete(id); reject(new Error(`${method} timed out`)); }, timeout);
+    prodCdpPending.set(id, { resolve, reject, timer });
+    const msg = { id, method, params };
+    if (sessionId) msg.sessionId = sessionId;
+    prodSession.ws.send(JSON.stringify(msg));
+  });
+}
+async function prodAttachCdp(browserWsUrl) {
+  const ws = new WebSocket(browserWsUrl, { perMessageDeflate: false });
+  await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
+  prodSession.ws = ws;
+  ws.on('message', (raw) => {
+    let msg; try { msg = JSON.parse(String(raw)); } catch { return; }
+    if (msg.id && prodCdpPending.has(msg.id)) {
+      const p = prodCdpPending.get(msg.id); prodCdpPending.delete(msg.id); clearTimeout(p.timer);
+      msg.error ? p.reject(new Error(msg.error.message || 'CDP error')) : p.resolve(msg.result || {});
+      return;
+    }
+    if (msg.method === 'Page.screencastFrame' && prodSession && msg.sessionId === prodSession.pageSessionId) {
+      const data = msg.params?.data;
+      if (data) {
+        const buffer = Buffer.from(data, 'base64');
+        let width = 0, height = 0;
+        try { const n = nativeImage.createFromBuffer(buffer); const z = n.getSize(); width = z.width; height = z.height; } catch {}
+        latestProdFrame = { buffer, width, height, metadata: msg.params?.metadata || {}, ts: Date.now() };
+        prodBroadcast('prod:frame', { data, width, height, metadata: latestProdFrame.metadata, ts: latestProdFrame.ts });
+      }
+      try { prodCdpCall('Page.screencastFrameAck', { sessionId: msg.params.sessionId }, prodSession.pageSessionId, 5000).catch(() => {}); } catch {}
+    }
+  });
+  ws.on('close', () => {
+    if (prodSession) { prodSession.error = 'CDP connection closed'; prodSession.state = 'error'; prodEmitStatus(); }
+  });
+  const targets = await prodCdpCall('Target.getTargets');
+  const pages = (targets.targetInfos || []).filter((t) => t.type === 'page');
+  const page = pages.find((t) => /reddit\.com/i.test(t.url || '')) || pages.find((t) => t.url && t.url !== 'about:blank') || pages[0];
+  if (!page) throw new Error('No Chrome page target found');
+  const attached = await prodCdpCall('Target.attachToTarget', { targetId: page.targetId, flatten: true });
+  prodSession.pageTargetId = page.targetId;
+  prodSession.pageSessionId = attached.sessionId;
+  await prodCdpCall('Page.enable', {}, attached.sessionId);
+  await prodCdpCall('Runtime.enable', {}, attached.sessionId);
+  const evalResult = await prodCdpCall('Runtime.evaluate', {
+    expression: 'JSON.stringify({url:location.href,title:document.title,webdriver:navigator.webdriver,viewport:{width:innerWidth,height:innerHeight,devicePixelRatio:devicePixelRatio}})',
+    returnByValue: true,
+  }, attached.sessionId);
+  try {
+    const health = JSON.parse(evalResult.result?.value || '{}');
+    prodSession.url = health.url || page.url;
+    prodSession.title = health.title || page.title;
+    prodSession.webdriver = health.webdriver;
+    prodSession.viewport = health.viewport || null;
+  } catch { prodSession.url = page.url; prodSession.title = page.title; }
+  await prodCdpCall('Page.startScreencast', { format: 'jpeg', quality: 72, maxWidth: 1440, maxHeight: 1200, everyNthFrame: 1 }, attached.sessionId);
+}
+async function stopProdSession(reason = 'stop') {
+  const current = prodSession;
+  if (!current) return { ok: true, stopped: false };
+  prodSession = null;
+  latestProdFrame = null;
+  try { if (current.onOwnerReload) current.owner?.webContents?.removeListener('did-start-loading', current.onOwnerReload); } catch {}
+  for (const [id, p] of prodCdpPending) { clearTimeout(p.timer); p.reject(new Error('Prod session stopped')); prodCdpPending.delete(id); }
+  try { if (current.ws && current.ws.readyState === WebSocket.OPEN) current.ws.close(); } catch {}
+  try { await prodExec(['--session', current.sessionName, 'close', '--json'], 15000); } catch {}
+  // agent-browser can transiently leave a daemon/session record after close; one idempotent retry closes the real Chrome tree without touching other sessions.
+  try { await new Promise((r) => setTimeout(r, 250)); await prodExec(['--session', current.sessionName, 'close', '--json'], 10000); } catch {}
+  try { if (current.owner && !current.owner.isDestroyed()) current.owner.webContents.send('prod:status', { running: false, state: 'stopped', reason }); } catch {}
+  return { ok: true, stopped: true };
+}
+function stopProdSessionSync(reason = 'quit') {
+  prodCanvasActive = false;
+  const current = prodSession;
+  prodSession = null; latestProdFrame = null;
+  if (!current) return;
+  try { current.ws?.terminate(); } catch {}
+  const bin = prodAgentBrowserBin();
+  if (bin) {
+    try { child_process.spawnSync(bin, ['--session', current.sessionName, 'close', '--json'], { timeout: 10000, stdio: 'ignore', env: { ...process.env, PATH: `/opt/homebrew/bin:/usr/local/bin:${process.env.PATH || ''}` } }); } catch {}
+  }
+}
+async function startProdSession(event, { profileId, url } = {}) {
+  await stopProdSession('replace');
+  const registry = prodSeedProfiles();
+  const profile = registry.profiles.find((x) => x.id === profileId) || registry.profiles[0];
+  if (!profile) return { ok: false, error: 'profile_not_found' };
+  if (!['state', 'profile'].includes(profile.mode)) return { ok: false, error: 'invalid_persistence_mode' };
+  const targetUrl = /^https?:\/\//i.test(String(url || '')) ? String(url) : PROD_DEFAULT_URL;
+  const sessionName = `farnsworth-prod-${INSTANCE_NAME}-${profile.id}-${Date.now().toString(36)}`;
+  prodSession = { owner: BrowserWindow.fromWebContents(event.sender), profileId: profile.id, sessionName, state: 'launching', url: targetUrl, webdriver: null, viewport: null, error: null, ws: null };
+  const ownedSession = prodSession;
+  ownedSession.onOwnerReload = () => {
+    if (prodSession === ownedSession) {
+      prodCanvasActive = false;
+      stopProdSession('renderer-reload').catch(() => {});
+    }
+  };
+  try { ownedSession.owner?.webContents?.once('did-start-loading', ownedSession.onOwnerReload); } catch {}
+  prodEmitStatus();
+  try {
+    const identityArgs = profile.mode === 'state' ? ['--state', profile.statePath] : ['--profile', profile.profilePath];
+    const openArgs = ['--session', sessionName, ...identityArgs, '--headed', '--args', '--disable-blink-features=AutomationControlled', 'open', targetUrl, '--json'];
+    const opened = prodParseJsonOutput(await prodExec(openArgs, 60000));
+    if (opened.success === false) throw new Error(opened.error || 'browser launch failed');
+    prodSession.state = 'connecting'; prodEmitStatus();
+    const cdp = prodParseJsonOutput(await prodExec(['--session', sessionName, 'get', 'cdp-url', '--json'], 15000));
+    const browserWsUrl = cdp?.data?.cdpUrl;
+    if (!browserWsUrl) throw new Error('agent-browser did not expose a CDP endpoint');
+    await prodAttachCdp(browserWsUrl);
+    prodSession.state = 'ready';
+    profile.lastUsedAt = new Date().toISOString(); prodWriteRegistry(registry);
+    return { ok: true, status: prodEmitStatus(), profile: prodPublicProfile(profile) };
+  } catch (e) {
+    if (prodSession) { prodSession.state = 'error'; prodSession.error = e.message || String(e); }
+    const status = prodEmitStatus();
+    await stopProdSession('launch-error');
+    return { ok: false, error: e.code || 'launch_failed', message: e.message || String(e), status };
+  }
+}
+
+ipcMain.handle('prod:profile:list', () => {
+  const registry = prodSeedProfiles();
+  return { ok: true, profiles: registry.profiles.map(prodPublicProfile), defaultUrl: PROD_DEFAULT_URL };
+});
+ipcMain.handle('prod:profile:create', async (_event, { label, mode, username, sourcePath } = {}) => {
+  const cleanMode = mode === 'state' ? 'state' : 'profile';
+  const registry = prodSeedProfiles();
+  const idBase = prodSlug(label || `${cleanMode}-profile`);
+  let id = idBase, n = 2; while (registry.profiles.some((x) => x.id === id)) id = `${idBase}-${n++}`;
+  const rec = { id, label: String(label || id).trim().slice(0, 80), username: String(username || '').trim().slice(0, 80) || null, mode: cleanMode, createdAt: new Date().toISOString(), lastUsedAt: null };
+  if (cleanMode === 'state') {
+    let picked = sourcePath;
+    if (!picked) {
+      const win = BrowserWindow.getFocusedWindow() || mainWindow;
+      const result = await dialog.showOpenDialog(win, { title: 'Import agent-browser saved state', properties: ['openFile'], filters: [{ name: 'JSON', extensions: ['json'] }] });
+      if (result.canceled || !result.filePaths?.[0]) return { ok: false, canceled: true };
+      picked = result.filePaths[0];
+    }
+    try { JSON.parse(fsSync.readFileSync(picked, 'utf8')); } catch { return { ok: false, error: 'invalid_state_json' }; }
+    rec.statePath = path.join(PROD_IDENTITY_DIR, 'state', `${id}.json`);
+    fsSync.copyFileSync(picked, rec.statePath); try { fsSync.chmodSync(rec.statePath, 0o600); } catch {}
+  } else {
+    rec.profilePath = path.join(PROD_IDENTITY_DIR, 'chrome-profiles', id);
+    fsSync.mkdirSync(rec.profilePath, { recursive: true });
+  }
+  registry.profiles.push(rec); prodWriteRegistry(registry);
+  return { ok: true, profile: prodPublicProfile(rec), profiles: registry.profiles.map(prodPublicProfile) };
+});
+ipcMain.handle('prod:session:start', (event, payload) => { prodCanvasActive = true; return startProdSession(event, payload || {}); });
+ipcMain.handle('prod:session:stop', (_event, { reason } = {}) => { prodCanvasActive = false; return stopProdSession(reason || 'renderer'); });
+ipcMain.handle('prod:session:status', () => prodStatus());
+ipcMain.handle('prod:session:input', async (_event, msg = {}) => {
+  if (!prodSession?.pageSessionId) return { ok: false, error: 'not_ready' };
+  try {
+    const nx = Math.max(0, Math.min(1, Number(msg.nx) || 0));
+    const ny = Math.max(0, Math.min(1, Number(msg.ny) || 0));
+    const width = prodSession.viewport?.width || latestProdFrame?.width || 1200;
+    const height = prodSession.viewport?.height || latestProdFrame?.height || 800;
+    const x = Math.round(nx * width), y = Math.round(ny * height);
+    if (msg.kind === 'wheel') {
+      await prodCdpCall('Input.dispatchMouseEvent', { type: 'mouseWheel', x, y, deltaX: Number(msg.deltaX) || 0, deltaY: Number(msg.deltaY) || 0 }, prodSession.pageSessionId);
+    } else if (msg.kind === 'key') {
+      const key = String(msg.key || '');
+      const text = key.length === 1 ? key : undefined;
+      await prodCdpCall('Input.dispatchKeyEvent', { type: 'keyDown', key, code: String(msg.code || ''), text, modifiers: Number(msg.modifiers) || 0 }, prodSession.pageSessionId);
+      await prodCdpCall('Input.dispatchKeyEvent', { type: 'keyUp', key, code: String(msg.code || ''), modifiers: Number(msg.modifiers) || 0 }, prodSession.pageSessionId);
+    } else {
+      await prodCdpCall('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 }, prodSession.pageSessionId);
+      await prodCdpCall('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 }, prodSession.pageSessionId);
+    }
+    return { ok: true };
+  } catch (e) { return { ok: false, error: e.message }; }
+});
+
 const captureCanvasPNG = async () => {
+  if (prodCanvasActive && latestProdFrame?.buffer) {
+    const image = nativeImage.createFromBuffer(latestProdFrame.buffer);
+    return image && !image.isEmpty() ? image : null;
+  }
   const entries = [...canvasWebContentsViews.entries()];
   if (entries.length) {
     const img = await entries[entries.length - 1][1].webContents.capturePage();
@@ -4589,6 +4911,9 @@ app.on('before-quit', () => {
   try { db.closeEmbedWorker(); } catch (_) {}
 });
 
+// Authenticated production Chrome cleanup on app quit. Synchronous because before-quit is not awaited.
+app.on('before-quit', () => { try { stopProdSessionSync('before-quit'); } catch (e) { console.warn('[prod] quit cleanup failed:', e.message); } });
+
 // Devvit dev server + server-runner cleanup on app quit (Jul 30). Synchronous
 // on purpose: before-quit does not await async listeners, so a promise-based
 // kill would lose the race with process exit -- which is how these leaked in
@@ -5944,11 +6269,11 @@ const AGENT_TOOLS = [
   },
   {
     name: 'set_canvas_view',
-    description: 'Switch the canvas preview\'s top-level view. "live" shows the running app/game (Live Preview), "storybook" shows the component storybook, "code" shows the Monaco code editor. Use when the user asks to switch to live preview, storybook, or code view.',
+    description: 'Switch the canvas preview\'s top-level view. "live" shows the running app/game (Live Preview), "storybook" shows the component storybook, "code" shows the Monaco code editor, and "prod" shows the real headed Reddit browser. Use when the user asks to switch canvas views.',
     input_schema: {
       type: 'object',
       properties: {
-        view: { type: 'string', enum: ['live', 'storybook', 'code'], description: 'Which top-level canvas view to show.' }
+        view: { type: 'string', enum: ['live', 'storybook', 'code', 'prod'], description: 'Which top-level canvas view to show.' }
       },
       required: ['view']
     }
@@ -6209,8 +6534,8 @@ async function executeAgentTool(name, input, folderOverride) {
   }
   if (name === 'set_canvas_view') {
     const view = input?.view;
-    if (!['live', 'storybook', 'code'].includes(view)) {
-      return { ok: false, error: 'bad_view', message: 'view must be one of: live, storybook, code' };
+    if (!['live', 'storybook', 'code', 'prod'].includes(view)) {
+      return { ok: false, error: 'bad_view', message: 'view must be one of: live, storybook, code, prod' };
     }
     const target = BrowserWindow.getFocusedWindow() || mainWindow || openWindows[0];
     if (!target || target.isDestroyed()) return { ok: false, error: 'no_window' };

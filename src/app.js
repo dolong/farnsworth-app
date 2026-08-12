@@ -51,8 +51,15 @@ const state = {
   vmComments: [],             // [{ id, x, y, text, createdAt }] in 0-1 coords
   vmCommentsDisplay: false,   // expand comment text inline (for screenshots / chat capture)
   preview: 'post',            // post | mobile | desktop | fullscreen | testview
-  canvasMode: 'live',         // live | storybook | code
+  canvasMode: 'live',         // live | storybook | code | prod
   codeFile: '',
+  prod: {
+    profiles: [], selectedId: 'anomalyint',
+    url: 'https://www.reddit.com/r/social_poker_game/comments/1vfrajp/',
+    status: { running: false, state: 'stopped' },
+    frameDataUrl: null, frameWidth: 0, frameHeight: 0,
+    loadingProfiles: false, launching: false, error: null,
+  },
 
   // Farnsworth backend dev server (set by `npm run farnsworth` in
   // vibe-farnsworth-template). When available, canvas preview iframes
@@ -2065,6 +2072,13 @@ function setupTestCreator() {
 // CANVAS STAGE
 // ============================================================================
 function renderCanvas() {
+  // Leaving Prod is an authenticated-browser lifecycle transition, not just a DOM repaint.
+  if (state.canvasMode === 'prod') state._prodWasActive = true;
+  else if (state._prodWasActive) {
+    state._prodWasActive = false;
+    state.prod.launching = false;
+    window.farnsworth?.prodSessionStop?.('canvas-mode-exit');
+  }
   // renderCanvas() destroys + recreates the artboard, so the zoom
   // transform applied via updateZoom() is lost. The artboard is
   // re-mounted with id="canvas-artboard"; re-apply zoom on the next
@@ -2099,6 +2113,7 @@ function renderCanvas() {
   stage.innerHTML = '';
   if (viewport) {
     viewport.classList.toggle('canvas__viewport--code', state.canvasMode === 'code');
+    viewport.classList.toggle('canvas__viewport--prod', state.canvasMode === 'prod');
   }
 
   // Post View is a DOM-only mock — the WebContentsView layers must be hidden
@@ -2112,10 +2127,14 @@ function renderCanvas() {
     hideAllCanvasViews?.();
   } else if (state.canvasMode === 'live') {
     showAllCanvasViews?.();
+  } else {
+    hideAllCanvasViews?.();
   }
 
   if (state.canvasMode === 'live') {
     stage.appendChild(renderLivePreview());
+  } else if (state.canvasMode === 'prod') {
+    stage.appendChild(renderProdView());
   } else if (state.canvasMode === 'storybook') {
     stage.appendChild(renderStorybook());
   } else if (state.canvasMode === 'code') {
@@ -2131,11 +2150,11 @@ function renderCanvas() {
 
   // update overlay bar visibility
   const sizeToggles = $('#canvas-size-toggles');
-  if (sizeToggles) sizeToggles.style.display = state.canvasMode === 'live' ? 'flex' : 'none';
+  if (sizeToggles) sizeToggles.style.display = (state.canvasMode === 'live' || state.canvasMode === 'prod') ? 'flex' : 'none';
   // Mark up / Comments / Edit / Tweaks chips are for marking/story/preview
   // modes only — hide them in code view (the editor doesn't need them).
   const vmToggles = $('#vm-toggles');
-  if (vmToggles) vmToggles.style.display = state.canvasMode === 'code' ? 'none' : '';
+  if (vmToggles) vmToggles.style.display = (state.canvasMode === 'code' || state.canvasMode === 'prod') ? 'none' : '';
   // Code mode: the 100% zoom control becomes the find toggle. Zoom scales the
   // preview artboard via transform, and code mode has no artboard, so the
   // control was inert there -- Long clicked it on 0.1.12 and nothing happened.
@@ -2144,7 +2163,8 @@ function renderCanvas() {
   const zoomDisp = $('#zoom-display');
   const findBtn = $('#code-find-btn');
   const inCodeMode = state.canvasMode === 'code';
-  if (zoomDisp) zoomDisp.style.display = inCodeMode ? 'none' : '';
+  const inProdMode = state.canvasMode === 'prod';
+  if (zoomDisp) zoomDisp.style.display = (inCodeMode || inProdMode) ? 'none' : '';
   if (findBtn) {
     findBtn.style.display = inCodeMode ? 'flex' : 'none';
     findBtn.classList.toggle('is-active', !!state.codeFindOpen);
@@ -2169,7 +2189,7 @@ function renderCanvas() {
     document.querySelectorAll('#vm-strokes-canvas').forEach(oldCanvas => {
       if (oldCanvas._ro) oldCanvas._ro.disconnect();
     });
-    viewportEl.appendChild(renderVmOverlay());
+    if (state.canvasMode !== 'prod') viewportEl.appendChild(renderVmOverlay());
   }
   // Keep the resolution dropdown in sync with the current preview
   // category's default width — important on first render and after
@@ -2185,6 +2205,7 @@ function renderCanvas() {
   // auto-fit re-engages on the next visit). Runs after the calibrate rAF
   // registered during artboard render, so it measures final layout sizes.
   requestAnimationFrame(() => {
+    if (state.canvasMode === 'prod') return;
     if (state.preview === 'testview' && state.canvasMode === 'live' && state._zoomManualFor !== 'testview') {
       autoFitZoomToStage();
     } else {
@@ -2208,7 +2229,7 @@ function renderCanvas() {
   // placeholder's pixel rect from first paint -- no squish bug. The
   // ResizeObserver inside setupCanvasBrowserViews() keeps bounds in
   // sync on window resize / zoom / resolution preset changes.
-  requestAnimationFrame(() => setupCanvasBrowserViews());
+  if (state.canvasMode !== 'prod') requestAnimationFrame(() => setupCanvasBrowserViews());
 
   // Push canvas state to companion apps via the relay. The companion's
   // canvas viewer subscribes once on WS open; we re-push on every render
@@ -2226,7 +2247,10 @@ function captureCanvasState() {
   let html = null;
   let url = null;
   try {
-    if (state.canvasMode === 'code') {
+    if (state.canvasMode === 'prod') {
+      const ps = state.prod?.status || {};
+      html = `<div style="font-family:system-ui;padding:20px;color:#ddd;background:#101114"><strong>Prod Reddit</strong><div>${escapeHtml(ps.state || 'stopped')}</div><div>${escapeHtml(ps.url || state.prod?.url || '')}</div></div>`;
+    } else if (state.canvasMode === 'code') {
       // Code mode — no iframe preview; send the file name + Monaco text instead
       const activeFile = state.openFiles && state.openFiles[state.activeFileIdx];
       if (activeFile) {
@@ -3588,6 +3612,147 @@ async function stopFarnsworthDev() {
   }
   state.farnsworthDev = { available: false };
   renderCanvas();
+}
+
+
+function prodFormatBytes(n) {
+  const v = Number(n) || 0;
+  if (v < 1024) return `${v} B`;
+  if (v < 1024 * 1024) return `${(v / 1024).toFixed(1)} KB`;
+  return `${(v / 1024 / 1024).toFixed(1)} MB`;
+}
+function prodSafeMetadata(profile) {
+  return {
+    id: profile?.id || null,
+    label: profile?.label || null,
+    username: profile?.username || null,
+    persistenceMode: profile?.mode || null,
+    json: profile?.metadata ? {
+      filename: profile.metadata.sourceName || null,
+      available: profile.metadata.available === true,
+      size: prodFormatBytes(profile.metadata.sizeBytes),
+      modifiedAt: profile.metadata.modifiedAt || null,
+      cookieCount: Number.isFinite(profile.metadata.cookieCount) ? profile.metadata.cookieCount : null,
+      originCount: Number.isFinite(profile.metadata.originCount) ? profile.metadata.originCount : null,
+    } : null,
+  };
+}
+function prodApplyFrame(frame) {
+  if (!frame?.data) return;
+  state.prod.frameDataUrl = `data:image/jpeg;base64,${frame.data}`;
+  state.prod.frameWidth = frame.width || 0;
+  state.prod.frameHeight = frame.height || 0;
+  state.prod.status = { ...state.prod.status, frame: { width: state.prod.frameWidth, height: state.prod.frameHeight, ts: frame.ts || Date.now() } };
+  const img = document.getElementById('prod-browser-image');
+  if (img) { img.src = state.prod.frameDataUrl; img.hidden = false; }
+  const empty = document.getElementById('prod-browser-empty'); if (empty) empty.hidden = true;
+  const dims = document.getElementById('prod-frame-dims'); if (dims) dims.textContent = `${frame.width || 0} × ${frame.height || 0}`;
+}
+function prodApplyStatus(status) {
+  state.prod.status = status || { running: false, state: 'stopped' };
+  state.prod.launching = ['launching', 'connecting'].includes(state.prod.status.state);
+  const dot = document.getElementById('prod-status-dot');
+  if (dot) dot.className = `prod__status-dot is-${state.prod.status.state || 'stopped'}`;
+  const label = document.getElementById('prod-status-label');
+  if (label) label.textContent = state.prod.status.state || 'stopped';
+  const url = document.getElementById('prod-runtime-url');
+  if (url) url.textContent = state.prod.status.url || state.prod.url;
+  const health = document.getElementById('prod-health-json');
+  if (health) health.textContent = JSON.stringify({
+    engine: state.prod.status.engine || 'agent-browser',
+    headed: state.prod.status.headed !== false,
+    url: state.prod.status.url || null,
+    title: state.prod.status.title || null,
+    viewport: state.prod.status.viewport || null,
+    navigatorWebdriver: state.prod.status.webdriver,
+    frame: state.prod.status.frame || null,
+    error: state.prod.status.error || null,
+  }, null, 2);
+}
+async function prodLoadProfiles(start = true) {
+  if (state.prod.loadingProfiles) return;
+  state.prod.loadingProfiles = true;
+  try {
+    const res = await window.farnsworth?.prodProfileList?.();
+    if (!res?.ok) throw new Error(res?.error || 'Profile list failed');
+    state.prod.profiles = res.profiles || [];
+    if (!state.prod.profiles.some((p) => p.id === state.prod.selectedId)) state.prod.selectedId = state.prod.profiles[0]?.id || null;
+    if (res.defaultUrl && !state.prod.url) state.prod.url = res.defaultUrl;
+    if (state.canvasMode === 'prod') {
+      const stage = document.getElementById('canvas-stage');
+      if (stage) { stage.innerHTML = ''; stage.appendChild(renderProdView(false)); }
+      if (start) prodStartSelected();
+    }
+  } catch (e) { state.prod.error = e.message || String(e); prodApplyStatus({ running: false, state: 'error', error: state.prod.error }); }
+  finally { state.prod.loadingProfiles = false; }
+}
+async function prodStartSelected() {
+  if (state.canvasMode !== 'prod' || state.prod.launching || state.prod.status?.state === 'ready') return;
+  if (!state.prod.selectedId) { await prodLoadProfiles(false); if (!state.prod.selectedId) return; }
+  state.prod.launching = true; prodApplyStatus({ running: true, state: 'launching', engine: 'agent-browser', headed: true, url: state.prod.url });
+  try {
+    const res = await window.farnsworth.prodSessionStart({ profileId: state.prod.selectedId, url: state.prod.url });
+    if (!res?.ok) throw new Error(res?.message || res?.error || 'Browser launch failed');
+    prodApplyStatus(res.status);
+  } catch (e) { prodApplyStatus({ running: false, state: 'error', error: e.message || String(e), url: state.prod.url }); }
+  finally { state.prod.launching = false; }
+}
+async function prodCreateProfile(form) {
+  const label = form.querySelector('[name="label"]')?.value?.trim();
+  const mode = form.querySelector('[name="mode"]')?.value || 'profile';
+  if (!label) return;
+  const btn = form.querySelector('button[type="submit"]'); if (btn) btn.disabled = true;
+  try {
+    const res = await window.farnsworth.prodProfileCreate({ label, mode });
+    if (!res?.ok) { if (!res?.canceled) throw new Error(res?.error || 'Create failed'); return; }
+    state.prod.profiles = res.profiles || state.prod.profiles;
+    state.prod.selectedId = res.profile.id;
+    const stage = document.getElementById('canvas-stage'); if (stage) { stage.innerHTML = ''; stage.appendChild(renderProdView(false)); }
+  } catch (e) { showToast?.(`Prod profile: ${e.message || e}`); }
+  finally { if (btn) btn.disabled = false; }
+}
+function renderProdView(autoStart = true) {
+  const wrap = el('div', { class: 'prod', id: 'prod-view', 'data-prod-browser': 'true' });
+  const active = state.prod.profiles.find((p) => p.id === state.prod.selectedId) || state.prod.profiles[0];
+  const meta = prodSafeMetadata(active);
+  wrap.innerHTML = `
+    <section class="prod__browser-card">
+      <div class="prod__chrome">
+        <span class="prod__status-dot is-${escapeHtml(state.prod.status?.state || 'stopped')}" id="prod-status-dot"></span>
+        <span class="prod__status-label" id="prod-status-label" data-prod-status>${escapeHtml(state.prod.status?.state || 'stopped')}</span>
+        <input class="prod__url" id="prod-url" value="${escapeHtml(state.prod.url)}" aria-label="Production Reddit URL" />
+        <button class="prod__btn prod__btn--primary" id="prod-open">Open</button>
+        <button class="prod__btn" id="prod-stop">Stop</button>
+      </div>
+      <div class="prod__browser" id="prod-browser" tabindex="0">
+        <img id="prod-browser-image" alt="Real headed Chrome mirror" ${state.prod.frameDataUrl ? `src="${state.prod.frameDataUrl}"` : 'hidden'} />
+        <div class="prod__empty" id="prod-browser-empty" ${state.prod.frameDataUrl ? 'hidden' : ''}>
+          <div class="prod__empty-mark">PROD</div><strong>Launching real headed Chrome…</strong><span>No Electron or headless fallback.</span>
+        </div>
+      </div>
+      <div class="prod__browser-foot"><span id="prod-runtime-url">${escapeHtml(state.prod.status?.url || state.prod.url)}</span><span id="prod-frame-dims">${state.prod.frameWidth ? `${state.prod.frameWidth} × ${state.prod.frameHeight}` : 'waiting for frame'}</span></div>
+    </section>
+    <aside class="prod__panel">
+      <div class="prod__panel-head"><div><span class="prod__eyebrow">IDENTITIES</span><h3>Production profiles</h3></div><span class="prod__headed">Headed Chrome</span></div>
+      <div class="prod__profiles" id="prod-profiles">${state.prod.profiles.map((p) => `<button class="prod__profile ${p.id === state.prod.selectedId ? 'is-active' : ''}" data-prod-profile="${escapeHtml(p.id)}"><strong>${escapeHtml(p.label)}</strong><span>${escapeHtml(p.mode)} · ${escapeHtml(p.metadata?.sourceName || 'managed')}</span></button>`).join('') || '<div class="prod__loading">Loading profiles…</div>'}</div>
+      <div class="prod__settings"><div class="prod__section-title">Safe JSON settings</div><pre id="prod-profile-json">${escapeHtml(JSON.stringify(meta, null, 2))}</pre></div>
+      <div class="prod__settings"><div class="prod__section-title">Runtime health</div><pre id="prod-health-json">${escapeHtml(JSON.stringify({ engine: state.prod.status?.engine || 'agent-browser', headed: true, url: state.prod.status?.url || null, title: state.prod.status?.title || null, viewport: state.prod.status?.viewport || null, navigatorWebdriver: state.prod.status?.webdriver, frame: state.prod.status?.frame || null, error: state.prod.status?.error || null }, null, 2))}</pre></div>
+      <form class="prod__create" id="prod-create-form"><div class="prod__section-title">Create profile</div><input name="label" placeholder="Profile name" required /><select name="mode"><option value="profile">Persistent Chrome profile</option><option value="state">Import saved-state JSON…</option></select><button class="prod__btn prod__btn--primary" type="submit">Create</button></form>
+    </aside>`;
+  const browser = wrap.querySelector('#prod-browser');
+  const normalized = (e) => { const r = browser.getBoundingClientRect(); return { nx: (e.clientX-r.left)/r.width, ny: (e.clientY-r.top)/r.height }; };
+  browser.addEventListener('click', (e) => { browser.focus(); window.farnsworth?.prodSessionInput?.({ kind: 'click', ...normalized(e) }); });
+  browser.addEventListener('wheel', (e) => { e.preventDefault(); window.farnsworth?.prodSessionInput?.({ kind: 'wheel', ...normalized(e), deltaX: e.deltaX, deltaY: e.deltaY }); }, { passive: false });
+  browser.addEventListener('keydown', (e) => { e.preventDefault(); window.farnsworth?.prodSessionInput?.({ kind: 'key', key: e.key, code: e.code, modifiers: (e.altKey?1:0)|(e.ctrlKey?2:0)|(e.metaKey?4:0)|(e.shiftKey?8:0) }); });
+  wrap.querySelector('#prod-open')?.addEventListener('click', async () => { state.prod.url = wrap.querySelector('#prod-url').value.trim() || state.prod.url; await window.farnsworth?.prodSessionStop?.('navigate'); state.prod.status = { running:false,state:'stopped' }; prodStartSelected(); });
+  wrap.querySelector('#prod-stop')?.addEventListener('click', async () => { await window.farnsworth?.prodSessionStop?.('operator'); prodApplyStatus({ running:false,state:'stopped' }); });
+  wrap.querySelectorAll('[data-prod-profile]').forEach((b) => b.addEventListener('click', async () => { state.prod.selectedId = b.dataset.prodProfile; await window.farnsworth?.prodSessionStop?.('identity-switch'); state.prod.status={running:false,state:'stopped'}; const stage=document.getElementById('canvas-stage'); if(stage){stage.innerHTML='';stage.appendChild(renderProdView(false));} prodStartSelected(); }));
+  wrap.querySelector('#prod-create-form')?.addEventListener('submit', (e) => { e.preventDefault(); prodCreateProfile(e.currentTarget); });
+  requestAnimationFrame(() => {
+    if (!state.prod.profiles.length && !state.prod.loadingProfiles) prodLoadProfiles(autoStart);
+    else if (autoStart) prodStartSelected();
+  });
+  return wrap;
 }
 
 function renderLivePreview() {
@@ -10923,6 +11088,8 @@ function updateModeToggles() {
 
 function wire() {
   setupOverlayBarFit();
+  window.farnsworth?.onProdFrame?.(prodApplyFrame);
+  window.farnsworth?.onProdStatus?.(prodApplyStatus);
 
   // Titlebar "Search files ⌘K" chip. It looked like a control and named its
   // own shortcut, but had zero handlers -- clicking it did nothing. Opens the
@@ -11002,7 +11169,8 @@ function wire() {
 
   // Canvas mode toggles
   $$('.mode-toggle').forEach(t => t.addEventListener('click', () => {
-    state.canvasMode = t.dataset.mode;
+    const nextMode = t.dataset.mode;
+    state.canvasMode = nextMode;
     updateModeToggles();
     renderCanvas();
   }));
@@ -11023,6 +11191,7 @@ function wire() {
     // preview's setupCanvasBrowserViews will recreate any views it
     // needs immediately after.
     window.farnsworth?.canvasRemoveAllViews?.();
+    state.canvasMode = 'live';
     state.preview = t.dataset.size;
     // Reset the resolution dropdown to the category's default preset.
     syncResolutionDropdownToCategory();
@@ -12443,7 +12612,7 @@ async function sendChatMessage(opts) {
           '- take_canvas_screenshot(filename?) — capture the active canvas preview as a PNG and return the image so you can SEE what the app looks like right now. Use before writing tests (to discover selectors), after code changes (to verify the result), or any time the user asks what the app currently looks like. Returns the image directly.',
           '',
           '**Canvas + emulator control tools:**',
-          '- set_canvas_view(view) — switch the top-level canvas view: "live" (Live Preview), "storybook", or "code" (Monaco editor). Use when the user says "switch to live preview", "show me the code", "open storybook".',
+          '- set_canvas_view(view) — switch the top-level canvas view: "live" (Live Preview), "storybook", "code" (Monaco editor), or "prod" (real headed Reddit Chrome). Use when the user says "switch to live preview", "show me the code", "open storybook".',
           '- set_preview(preview) — within Live Preview, switch the surface: "post", "mobile", "desktop", "fullscreen", or "testview". Auto-switches into live view first. Use for "show the app mobile view", "switch to desktop", "show the post view".',
           '- switch_devvit_user(username) — switch the active Devvit emulator user (leading "u/" optional) and restart the dev server. Use for "switch to u/bob", "log in as carol". On an unknown name the tool returns the list of available users — relay those to the user.',
           '',
@@ -15369,7 +15538,7 @@ async function init() {
   if (window.farnsworth?.onCanvasSetMode) {
     window.farnsworth.onCanvasSetMode((payload) => {
       const mode = payload?.mode;
-      if (!['live', 'storybook', 'code'].includes(mode)) return;
+      if (!['live', 'storybook', 'code', 'prod'].includes(mode)) return;
       window.farnsworth?.canvasRemoveAllViews?.();
       state.canvasMode = mode;
       updateModeToggles();

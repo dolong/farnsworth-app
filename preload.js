@@ -44,6 +44,24 @@ contextBridge.exposeInMainWorld('farnsworth', {
   clearRecent: () => ipcRenderer.invoke('recent:clear'),
   appInfo: () => ipcRenderer.invoke('app:info'),
 
+  // Production Reddit browser surface — external headed agent-browser Chrome.
+  prodProfileList: () => ipcRenderer.invoke('prod:profile:list'),
+  prodProfileCreate: (payload) => ipcRenderer.invoke('prod:profile:create', payload || {}),
+  prodSessionStart: (payload) => ipcRenderer.invoke('prod:session:start', payload || {}),
+  prodSessionStop: (reason) => ipcRenderer.invoke('prod:session:stop', { reason }),
+  prodSessionStatus: () => ipcRenderer.invoke('prod:session:status'),
+  prodSessionInput: (payload) => ipcRenderer.invoke('prod:session:input', payload || {}),
+  onProdFrame: (callback) => {
+    const handler = (_e, payload) => { try { callback(payload); } catch (err) { console.error('[prod:frame]', err); } };
+    ipcRenderer.on('prod:frame', handler);
+    return () => ipcRenderer.removeListener('prod:frame', handler);
+  },
+  onProdStatus: (callback) => {
+    const handler = (_e, payload) => { try { callback(payload); } catch (err) { console.error('[prod:status]', err); } };
+    ipcRenderer.on('prod:status', handler);
+    return () => ipcRenderer.removeListener('prod:status', handler);
+  },
+
   // Canvas live preview — BrowserView-backed (Jul 9 ~18:20 ET).
   // Replaces the <webview>-tag approach which couldn't propagate CSS-driven
   // height changes to the inner viewport (the squished-150px bug).
