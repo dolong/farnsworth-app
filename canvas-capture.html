@@ -1,0 +1,104 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Farnsworth Canvas Capture</title></head>
+<body style="margin:0;background:#000;overflow:hidden">
+<button id="start-capture" style="position:absolute;inset:0;width:100%;height:100%">Start canvas capture</button>
+<script>
+(() => {
+  const peers = new Map();
+  let pendingCompanionId = null;
+
+  function send(type, companionId, payload = {}) {
+    return window.canvasCapture.send({ type, companionId, ...payload, ts: Date.now() });
+  }
+
+  function closePeer(companionId, notify = false) {
+    const entry = peers.get(companionId);
+    if (!entry) return;
+    entry.closing = true;
+    peers.delete(companionId);
+    try {
+      entry.pc.onicecandidate = null;
+      entry.pc.onconnectionstatechange = null;
+      entry.pc.close();
+    } catch {}
+    try {
+      for (const track of entry.stream?.getTracks?.() || []) {
+        track.onended = null;
+        track.stop();
+      }
+    } catch {}
+    if (notify) send('canvas:webrtc:closed', companionId);
+  }
+
+  async function startPeer(companionId) {
+    if (!companionId) return;
+    closePeer(companionId);
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { frameRate: { ideal: 30, max: 30 } }, audio: false,
+      });
+      const pc = new RTCPeerConnection({
+        iceServers: [{ urls: ['stun:stun.cloudflare.com:3478'] }],
+      });
+      const entry = { pc, stream, pendingIce: [], closing: false };
+      peers.set(companionId, entry);
+      for (const track of stream.getVideoTracks()) {
+        pc.addTrack(track, stream);
+        track.onended = () => {
+          if (entry.closing) return;
+          send('canvas:webrtc:error', companionId, { reason: 'source-ended' });
+          closePeer(companionId);
+        };
+      }
+      pc.onicecandidate = ({ candidate }) => {
+        if (candidate) send('canvas:webrtc:ice', companionId, { candidate: candidate.toJSON?.() || candidate });
+      };
+      pc.onconnectionstatechange = () => {
+        if (['failed', 'closed'].includes(pc.connectionState) && !entry.closing) {
+          send('canvas:webrtc:error', companionId, { reason: pc.connectionState });
+          closePeer(companionId);
+        }
+      };
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      send('canvas:webrtc:offer', companionId, {
+        description: { type: pc.localDescription.type, sdp: pc.localDescription.sdp },
+      });
+    } catch (error) {
+      try { for (const track of stream?.getTracks?.() || []) track.stop(); } catch {}
+      send('canvas:webrtc:error', companionId, { reason: error?.message || String(error) });
+    }
+  }
+
+  async function handleSignal(msg) {
+    const companionId = msg?.companionId;
+    const entry = companionId ? peers.get(companionId) : null;
+    if (!entry) return;
+    try {
+      if (msg.type === 'canvas:webrtc:answer' && msg.description) {
+        await entry.pc.setRemoteDescription(msg.description);
+        for (const candidate of entry.pendingIce.splice(0)) await entry.pc.addIceCandidate(candidate);
+      } else if (msg.type === 'canvas:webrtc:ice' && msg.candidate) {
+        if (entry.pc.remoteDescription) await entry.pc.addIceCandidate(msg.candidate);
+        else entry.pendingIce.push(msg.candidate);
+      } else if (msg.type === 'canvas:webrtc:close') {
+        closePeer(companionId);
+      }
+    } catch (error) {
+      send('canvas:webrtc:error', companionId, { reason: error?.message || String(error) });
+      closePeer(companionId);
+    }
+  }
+
+  window.__setCanvasCompanion = (companionId) => { pendingCompanionId = companionId; };
+  document.getElementById('start-capture').addEventListener('click', () => {
+    const companionId = pendingCompanionId;
+    pendingCompanionId = null;
+    startPeer(companionId);
+  });
+  window.canvasCapture.onSignal(handleSignal);
+  window.canvasCapture.onStop((msg) => closePeer(msg?.companionId));
+})();
+</script>
+</body></html>

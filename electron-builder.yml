@@ -30,6 +30,8 @@ files:
   - index.html
   - main.js
   - preload.js
+  - canvas-capture.html
+  - canvas-capture-preload.js
   - src/**/*
   # devvit-emulator/loader.mjs is injected into the user's dev-server
   # subprocess via NODE_OPTIONS --import. Also absent from packaged builds,

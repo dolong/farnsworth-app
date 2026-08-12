@@ -2325,6 +2325,75 @@ ipcMain.handle('devvit:set-project-settings', async (_event, workspacePath, curr
 //   target — its own debugger target is at port 9222 type=page
 
 const canvasWebContentsViews = new Map();
+
+// Companion WCV WebRTC capture (Aug 12 2026). A dedicated, invisible
+// BrowserWindow owns getDisplayMedia() + RTCPeerConnection. Main only selects
+// the active WebContentsView frame and carries signaling over the relay.
+// Post View is intentionally excluded because it needs an element crop.
+let canvasDisplayCaptureGrant = null;
+let canvasCaptureWindow = null;
+let canvasCaptureReady = null;
+function activeCanvasWebContentsView() {
+  const entries = [...canvasWebContentsViews.entries()];
+  return entries.length ? entries[entries.length - 1][1] : null;
+}
+function createCanvasCaptureWindow() {
+  canvasCaptureWindow = new BrowserWindow({
+    width: 180,
+    height: 80,
+    show: false,
+    frame: false,
+    transparent: true,
+    opacity: 0,
+    skipTaskbar: true,
+    focusable: false,
+    webPreferences: {
+      preload: path.join(__dirname, 'canvas-capture-preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false,
+      backgroundThrottling: false,
+    },
+  });
+  canvasCaptureReady = canvasCaptureWindow.loadFile(path.join(__dirname, 'canvas-capture.html'));
+}
+function installCanvasDisplayMediaHandler() {
+  const ses = canvasCaptureWindow?.webContents?.session;
+  if (!ses || !ses.setDisplayMediaRequestHandler) return;
+  ses.setDisplayMediaRequestHandler((request, callback) => {
+    const grant = canvasDisplayCaptureGrant;
+    canvasDisplayCaptureGrant = null; // one request per relay start
+    const requester = request?.frame;
+    const trustedRequester = requester && canvasCaptureWindow && !canvasCaptureWindow.isDestroyed() &&
+      requester === canvasCaptureWindow.webContents.mainFrame;
+    const trustedOrigin = trustedRequester && requester.url === canvasCaptureWindow.webContents.getURL();
+    const view = activeCanvasWebContentsView();
+    if (!grant || grant.expiresAt < Date.now() || !request.userGesture || !trustedOrigin ||
+        !view || view.webContents.isDestroyed()) {
+      callback({});
+      return;
+    }
+    callback({ video: view.webContents.mainFrame });
+  }, { useSystemPicker: false });
+}
+async function startCanvasCapturePeer(companionId) {
+  if (!canvasCaptureWindow || canvasCaptureWindow.isDestroyed()) {
+    createCanvasCaptureWindow();
+    installCanvasDisplayMediaHandler();
+  }
+  await canvasCaptureReady;
+  canvasDisplayCaptureGrant = { companionId, expiresAt: Date.now() + 10000 };
+  await canvasCaptureWindow.webContents.executeJavaScript(
+    `window.__setCanvasCompanion(${JSON.stringify(companionId)}); true`, true,
+  );
+  // Electron marks the request as user-initiated only when getDisplayMedia()
+  // runs from a trusted renderer input event. The window is fully transparent
+  // and shown inactive for this click, then hidden again immediately.
+  canvasCaptureWindow.showInactive();
+  canvasCaptureWindow.webContents.sendInputEvent({ type: 'mouseDown', x: 90, y: 40, button: 'left', clickCount: 1 });
+  canvasCaptureWindow.webContents.sendInputEvent({ type: 'mouseUp', x: 90, y: 40, button: 'left', clickCount: 1 });
+  setTimeout(() => { try { canvasCaptureWindow?.hide(); } catch {} }, 100);
+}
 const _CANVAS_IFRAME_RECT_JS =
   '(function(){var f=document.querySelector("iframe[src*=localhost]")' +
   '||document.querySelector("iframe");' +
@@ -7199,6 +7268,8 @@ app.whenReady().then(async () => {
   // first paint already has File / Edit / View / Window / Help menus.
   Menu.setApplicationMenu(buildMenu());
   createWindow();
+  createCanvasCaptureWindow();
+  installCanvasDisplayMediaHandler();
   startTerminalServer();
   startClaudeCodeServer();
   startCodexServer();
@@ -7401,7 +7472,7 @@ app.whenReady().then(async () => {
     // No localhost, no tunnel, no permission prompt — rides the relay the
     // companion is already connected to, so it works on any paired device.
     // ====================================================================
-    const companionCanvasStreams = new Map(); // companionId -> { timer, inFlight }
+    const companionCanvasStreams = new Map(); // companionId -> { transport, timer?, inFlight? }
     // The canvas preview has TWO render shapes (Jul 9 WebContentsView swap):
     //   - mobile/desktop/fullscreen previews are WebContentsViews (tracked in
     //     canvasWebContentsViews). They composite ABOVE the DOM, so they must
@@ -7423,7 +7494,12 @@ app.whenReady().then(async () => {
     };
     const stopCanvasStream = (companionId) => {
       const s = companionCanvasStreams.get(companionId);
-      if (s) { try { clearInterval(s.timer); } catch {} companionCanvasStreams.delete(companionId); }
+      if (!s) return;
+      if (s.timer) { try { clearInterval(s.timer); } catch {} }
+      if (s.transport === 'webrtc' && canvasCaptureWindow && !canvasCaptureWindow.isDestroyed()) {
+        canvasCaptureWindow.webContents.send('canvas-capture:stop', { companionId });
+      }
+      companionCanvasStreams.delete(companionId);
     };
     // Capture one JPEG frame from whatever the desktop is currently showing.
     const captureCanvasFrame = async (maxWidth, quality) => {
@@ -7443,17 +7519,39 @@ app.whenReady().then(async () => {
       return { data: img.toJPEG(quality).toString('base64'), w: out.width, h: out.height };
     };
     relayClient.on('canvas:screencast:start', async (msg) => {
-      const companionId = msg?.companionId || msg?.from || 'companion';
+      const companionId = msg?.companionId || msg?._from || msg?.from || 'companion';
       const fps = Math.min(Math.max(Number(msg?.fps) || 6, 1), 15);
       const quality = Math.min(Math.max(Number(msg?.quality) || 50, 20), 90);
       const maxWidth = Math.min(Math.max(Number(msg?.maxWidth) || 720, 240), 1280);
+      const forceJpeg = msg?.forceJpeg === true;
       stopCanvasStream(companionId); // clean re-subscribe
-      const hasTarget = canvasWebContentsViews.size > 0 || !!(await getIframeRect());
+
+      // WCV previews get a direct browser-surface MediaStreamTrack. The
+      // companion can explicitly request JPEG after a negotiation timeout;
+      // Post View always takes this fallback because it needs a DOM crop.
+      const view = activeCanvasWebContentsView();
+      if (view && !forceJpeg && canvasCaptureWindow && !canvasCaptureWindow.isDestroyed()) {
+        companionCanvasStreams.set(companionId, { transport: 'webrtc' });
+        relayClient.send({
+          type: 'canvas:screencast:started', companionId,
+          ok: true, transport: 'webrtc', ts: Date.now(),
+        });
+        try {
+          await startCanvasCapturePeer(companionId);
+        } catch (e) {
+          relayClient.send({ type: 'canvas:webrtc:error', companionId, reason: e?.message || String(e), ts: Date.now() });
+        }
+        return;
+      }
+
+      const hasTarget = !!view || !!(await getIframeRect());
       relayClient.send({
         type: 'canvas:screencast:started', companionId,
-        ok: hasTarget, reason: hasTarget ? undefined : 'no-active-view', ts: Date.now(),
+        ok: hasTarget, transport: 'jpeg',
+        reason: hasTarget ? undefined : 'no-active-view', ts: Date.now(),
       });
-      const stream = { timer: null, inFlight: false };
+      if (!hasTarget) return;
+      const stream = { transport: 'jpeg', timer: null, inFlight: false };
       stream.timer = setInterval(async () => {
         if (stream.inFlight) return; // don't stack captures
         stream.inFlight = true;
@@ -7466,8 +7564,15 @@ app.whenReady().then(async () => {
       companionCanvasStreams.set(companionId, stream);
     });
     relayClient.on('canvas:screencast:stop', (msg) => {
-      stopCanvasStream(msg?.companionId || msg?.from || 'companion');
+      stopCanvasStream(msg?.companionId || msg?._from || msg?.from || 'companion');
     });
+    for (const type of ['canvas:webrtc:answer', 'canvas:webrtc:ice', 'canvas:webrtc:close']) {
+      relayClient.on(type, (msg) => {
+        if (canvasCaptureWindow && !canvasCaptureWindow.isDestroyed()) {
+          canvasCaptureWindow.webContents.send('canvas-capture:signal', msg);
+        }
+      });
+    }
     relayClient.on('canvas:input', async (msg) => {
       const nx = Number(msg?.nx), ny = Number(msg?.ny);
       if (!Number.isFinite(nx) || !Number.isFinite(ny)) return;
@@ -8486,6 +8591,12 @@ ipcMain.handle('account:unpair', async () => {
 ipcMain.handle('relay:send', async (_event, msg) => {
   const rc = getRelayClient();
   return rc.send(msg);
+});
+ipcMain.handle('canvas-capture:send', async (event, msg) => {
+  if (!canvasCaptureWindow || canvasCaptureWindow.isDestroyed() || event.sender !== canvasCaptureWindow.webContents) {
+    return false;
+  }
+  return getRelayClient().send(msg);
 });
 ipcMain.handle('relay:status', async () => {
   const rc = getRelayClient();
