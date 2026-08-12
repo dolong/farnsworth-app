@@ -12882,6 +12882,130 @@ const terminalSessions = new Map(); // tabId -> { term, fit, ws, paneEl, label, 
 let activeTerminalTabId = null;
 let terminalTabCounter = 0;
 
+// Parallel state for the Claude Code panel — mirrors terminalSessions structure
+// but spawns the `claude` binary via the claude-code WebSocket server (port 9224).
+// This is the "official Claude Code embedded in Farnsworth" path: same
+// xterm.js rendering, but the underlying PTY runs `claude` instead of bash.
+const claudeCodeSessions = new Map(); // tabId -> { term, fit, ws, paneEl, label, createdAt, ptyTabId }
+let activeClaudeCodeTabId = null;
+let claudeCodeTabCounter = 0;
+
+// Tabs to persist across Farnsworth restarts (Jun 28 ~15:51 ET).
+// Mirrors the open tabs in `claudeCodeSessions` so the UI can recreate the
+// tab pills on startup before any PTYs are spawned. PTYs themselves are
+// not persisted — each tab re-spawns a fresh `claude` child process when
+// the user activates it (lazy init pattern, same as terminal tabs).
+let claudeCodePersistedTabs = []; // [{ id, label, createdAt, sessionId }]
+let claudeCodePersistedActiveId = null;
+
+// Session ID per tab (Jun 28 ~16:30 ET) — keyed by Farnsworth tabId so
+// the renderer can look up the Claude Code session UUID before the PTY
+// spawns. Populated by restoreClaudeCodeTabs() from the persisted list,
+// and updated when the server's `ready` message echoes back the
+// sessionId it actually used (which may be the one we sent, or a fresh
+// UUID main generated for new tabs).
+const claudeCodePersistedSessionsByTab = new Map(); // tabId -> uuid
+
+// Snapshot the current open tabs and active selection, then write to SQLite.
+// Called after any tab add/close/switch. Debounced via saveClaudeCodeTabsTimeout
+// so a burst of changes coalesces into one DB write.
+const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function isValidUuid(s) {
+  return typeof s === 'string' && uuidRe.test(s);
+}
+let saveClaudeCodeTabsTimeout = null;
+function persistClaudeCodeTabs() {
+  if (!window.farnsworth?.claudeCodeSaveTabs) return;
+  clearTimeout(saveClaudeCodeTabsTimeout);
+  saveClaudeCodeTabsTimeout = setTimeout(() => {
+    const tabs = Array.from(claudeCodeSessions.entries())
+      .sort((a, b) => a[1].createdAt - b[1].createdAt)
+      .map(([id, sess]) => ({
+        id,
+        label: sess.label,
+        createdAt: sess.createdAt,
+        // Persist the Claude Code sessionId so a fresh launch can
+        // `claude --resume <sessionId>` and pick up the prior
+        // conversation instead of starting blank. Only persist valid
+        // UUIDs — the claude CLI rejects anything else with "Invalid
+        // session ID" (Jun 28 ~16:33 ET bug). Stale junk from the
+        // first attempt (ffffffff-prefix fakes) gets dropped here so
+        // the next restore starts a fresh session instead of erroring.
+        sessionId: (() => {
+          const cand = sess.sessionId || claudeCodePersistedSessionsByTab.get(id);
+          return isValidUuid(cand) ? cand : null;
+        })(),
+      }));
+    window.farnsworth.claudeCodeSaveTabs({
+      tabs,
+      activeId: activeClaudeCodeTabId,
+    }).catch(() => {});
+  }, 200);
+}
+
+// Read saved tabs on startup. Returns the list and the active id; the
+// caller decides when to actually spawn each PTY (we restore tab pills
+// immediately so the user sees them, but only init PTYs for the active
+// tab + on tab switch).
+async function loadPersistedClaudeCodeTabs() {
+  if (!window.farnsworth?.claudeCodeListTabs) return { tabs: [], activeId: null };
+  try {
+    const r = await window.farnsworth.claudeCodeListTabs();
+    if (!r || !r.ok) return { tabs: [], activeId: null };
+    return { tabs: r.tabs || [], activeId: r.activeId || null };
+  } catch {
+    return { tabs: [], activeId: null };
+  }
+}
+
+function nextClaudeCodeTabId() {
+  claudeCodeTabCounter++;
+  return 'cc-' + claudeCodeTabCounter;
+}
+
+function nextClaudeCodeLabel() {
+  const n = claudeCodeTabCounter;
+  return n === 1 ? 'claude' : 'claude ' + n;
+}
+
+// Derive a tab title from the user's first message in a Claude Code
+// session (Jul 14 ~13:00 ET). Trims to ~40 chars so the cctab pill
+// stays readable; collapses whitespace; strips leading Re:/Fwd:/>;
+// strips leading slashes so "/login" becomes "login". Returns
+// 'New chat' for empty input.
+function generateTitleFromMessage(msg) {
+  if (!msg || typeof msg !== 'string') return 'New chat';
+  const firstLine = msg.trim().split('\n').find(l => l.trim()) || '';
+  let collapsed = firstLine.replace(/\s+/g, ' ').trim();
+  // Strip prompt-prefix chars (Claude Code's "❯ ", "›", "> ") + leading
+  // slashes + Re:/Fwd: prefixes. xterm's line buffer includes whatever
+  // was rendered on the prompt line, including the prompt char.
+  collapsed = collapsed
+    .replace(/^[❯›>]\s*/, '')
+    .replace(/^(re|fwd|>>)\s*:\s*/i, '')
+    .replace(/^\/+/, '')
+    .trim();
+  // Strip conversational openers so the title reads like a topic instead
+  // of a raw question. Falls back to the original text if stripping makes
+  // it too short (e.g., "please" alone -> "please" kept). Verified Jul 14
+  // ~15:35 ET: Long expected topic-style titles, not raw first-message text.
+  const openerStripped = collapsed.replace(
+    /^(how (do|can|should|would|could) (i|you|we)|how to|what (is|are|were)|can you|could you|i (need|want) to|please|let's|let us)\s+/i,
+    ''
+  ).trim();
+  if (openerStripped.length >= 3) {
+    collapsed = openerStripped;
+  }
+  // Strip trailing question mark / period so titles don't read as questions.
+  collapsed = collapsed.replace(/[?.!]+\s*$/, '');
+  // Sentence-case (capitalize first letter only) -- title-case looks weird
+  // for code topics ("Use Async/await" -> "Use Async/Await").
+  collapsed = collapsed.charAt(0).toUpperCase() + collapsed.slice(1);
+  if (!collapsed) return 'New chat';
+  if (collapsed.length <= 40) return collapsed;
+  return collapsed.slice(0, 37) + '...';
+}
+
 // Companion Terminal bridge (Aug 9 2026). The desktop renderer owns the real
 // terminal WebSocket and remains the sole PTY/winsize owner. The companion is
 // only another raw-byte viewport into that existing session.
