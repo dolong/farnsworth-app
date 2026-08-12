@@ -1,6 +1,6 @@
 {
   "name": "farnsworth",
-  "version": "0.1.31",
+  "version": "0.1.32",
   "description": "Farnsworth — the AI-native IDE for Reddit games.",
   "main": "main.js",
   "scripts": {
