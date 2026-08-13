@@ -80,9 +80,21 @@ fi
 ok "working tree clean (nothing uncommitted would be silently dropped)"
 
 # ── Step 1: clear stale dist ─────────────────────────────────────────────────
-find dist -maxdepth 1 -type f \( -name '*Farnsworth*' -o -name '*.yml' -o -name '*.json' \) -delete 2>/dev/null
-rm -rf dist/mac dist/mac-arm64 dist/.icon-set dist/builder-* 2>/dev/null
-ok "cleared stale dist artifacts"
+# Decide FIRST whether this resume can reuse the existing build. This check has
+# to happen before the wipe, or --resume always rebuilds identical bytes.
+REUSE=0
+if [ "$RESUME" = "1" ] && [ -d "dist/mac-arm64/Farnsworth.app" ] && [ -f "dist/latest-mac.yml" ]; then
+  HAVE_VER=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" \
+             "dist/mac-arm64/Farnsworth.app/Contents/Info.plist" 2>/dev/null)
+  [ "$HAVE_VER" = "$VERSION" ] && REUSE=1
+fi
+if [ "$REUSE" = "1" ]; then
+  ok "keeping verified v$VERSION artifacts already in dist (--resume)"
+else
+  find dist -maxdepth 1 -type f \( -name '*Farnsworth*' -o -name '*.yml' -o -name '*.json' \) -delete 2>/dev/null
+  rm -rf dist/mac dist/mac-arm64 dist/.icon-set dist/builder-* 2>/dev/null
+  ok "cleared stale dist artifacts"
+fi
 
 # ── Step 2: bump + commit + tag (tag NOT pushed yet) ─────────────────────────
 PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null)
@@ -102,15 +114,8 @@ info "comparing against previous tag: ${PREV_TAG:-none}"
 # ── Step 3: signed build ─────────────────────────────────────────────────────
 # On --resume, reuse artifacts that already built and match this version rather
 # than burning another 3 minutes rebuilding identical bytes.
-SKIP_BUILD=0
-if [ "$RESUME" = "1" ] && [ -d "dist/mac-arm64/Farnsworth.app" ]; then
-  HAVE_VER=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" \
-             "dist/mac-arm64/Farnsworth.app/Contents/Info.plist" 2>/dev/null)
-  if [ "$HAVE_VER" = "$VERSION" ] && [ -f "dist/latest-mac.yml" ]; then
-    SKIP_BUILD=1
-    ok "reusing already-built v$VERSION artifacts (--resume)"
-  fi
-fi
+SKIP_BUILD=$REUSE
+[ "$SKIP_BUILD" = "1" ] && ok "skipping rebuild — reusing verified v$VERSION artifacts"
 
 BUILD_START=$(date +%s)
 if [ "$SKIP_BUILD" = "1" ]; then
@@ -281,7 +286,7 @@ ok "temp files cleaned"
 
 say ""
 say "=== SHIPPED $TAG ==="
-say "  version:  $VERSION (was $CUR)"
+say "  version:  $VERSION"
 say "  release:  https://github.com/$REPO/releases/tag/$TAG"
 say "  id:       $RID"
 say "  assets:   9/9 uploaded, latest-mac.yml public at $YML_VER"
