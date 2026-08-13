@@ -179,8 +179,10 @@ fi
 # The asar audit proves the right code shipped. It does not prove it runs.
 # A clean --user-data-dir also exercises the fresh-install path.
 rm -rf /tmp/fw-bootcheck /tmp/fw-bootcheck.log
-nohup "dist/mac-arm64/Farnsworth.app/Contents/MacOS/Farnsworth" \
-  --user-data-dir=/tmp/fw-bootcheck --instance=relcheck > /tmp/fw-bootcheck.log 2>&1 &
+# Subshell + disown: without it, bash job control prints "Killed: 9" to stdout
+# when the pkill below lands, which pollutes the otherwise clean step output.
+( nohup "dist/mac-arm64/Farnsworth.app/Contents/MacOS/Farnsworth" \
+    --user-data-dir=/tmp/fw-bootcheck --instance=relcheck > /tmp/fw-bootcheck.log 2>&1 & disown ) 2>/dev/null
 sleep 22
 RENDERERS=$(ps -eo command -ww | grep "dist/mac-arm64" | grep -c -- "--type=renderer")
 BOOTERR=$(grep -iE "error|fail" /tmp/fw-bootcheck.log 2>/dev/null \
