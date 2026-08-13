@@ -2695,7 +2695,10 @@ ipcMain.handle('prod:profile:create', async (_event, { label, mode, username, so
 ipcMain.handle('prod:session:start', (event, payload) => { prodCanvasActive = true; return startProdSession(event, payload || {}); });
 ipcMain.handle('prod:session:stop', (_event, { reason } = {}) => { prodCanvasActive = false; return stopProdSession(reason || 'renderer'); });
 ipcMain.handle('prod:session:status', () => prodStatus());
-ipcMain.handle('prod:session:input', async (_event, msg = {}) => {
+// Shared by the renderer's live mirror (prod:session:input) and the chat
+// agent's prod_input tool. Coordinates are NORMALIZED (0..1) so a caller
+// that only has a screenshot can aim without knowing the real viewport.
+async function prodInput(msg = {}) {
   if (!prodSession?.pageSessionId) return { ok: false, error: 'not_ready' };
   try {
     const nx = Math.max(0, Math.min(1, Number(msg.nx) || 0));
@@ -2705,6 +2708,13 @@ ipcMain.handle('prod:session:input', async (_event, msg = {}) => {
     const x = Math.round(nx * width), y = Math.round(ny * height);
     if (msg.kind === 'wheel') {
       await prodCdpCall('Input.dispatchMouseEvent', { type: 'mouseWheel', x, y, deltaX: Number(msg.deltaX) || 0, deltaY: Number(msg.deltaY) || 0 }, prodSession.pageSessionId);
+    } else if (msg.kind === 'type') {
+      // Whole-string entry. Input.insertText is one IME-style commit, which
+      // is what React-controlled Reddit inputs actually want; per-char
+      // dispatchKeyEvent drops characters on fast typing.
+      const text = String(msg.text ?? '');
+      if (!text) return { ok: false, error: 'missing_text' };
+      await prodCdpCall('Input.insertText', { text }, prodSession.pageSessionId);
     } else if (msg.kind === 'key') {
       const key = String(msg.key || '');
       const text = key.length === 1 ? key : undefined;
@@ -2716,7 +2726,8 @@ ipcMain.handle('prod:session:input', async (_event, msg = {}) => {
     }
     return { ok: true };
   } catch (e) { return { ok: false, error: e.message }; }
-});
+}
+ipcMain.handle('prod:session:input', async (_event, msg = {}) => prodInput(msg));
 
 // ─── Prod script runner (Aug 13) ─────────────────────────────────────────────
 // Runs the SAME <project>/.farnsworth/devvit-tests/*.json cases Test View runs,
@@ -2857,7 +2868,8 @@ function prodAdaptSteps(steps, notes = []) {
 }
 
 // Open a production URL and expand its custom post into the desktop app view.
-ipcMain.handle('prod:app:open', async (_event, { url } = {}) => {
+// Shared by the Scripts panel button and the chat agent's prod_open_app_view.
+async function prodAppOpen({ url } = {}) {
   if (!prodSession?.pageSessionId) return { ok: false, error: 'not_ready' };
   try {
     if (url && /^https?:\/\//i.test(String(url))) {
@@ -2873,9 +2885,11 @@ ipcMain.handle('prod:app:open', async (_event, { url } = {}) => {
   } catch (e) {
     return { ok: false, error: 'app_view_failed', message: e.message || String(e) };
   }
-});
+}
+ipcMain.handle('prod:app:open', async (_event, payload = {}) => prodAppOpen(payload));
 
-ipcMain.handle('prod:test:run', async (_event, { path: testPath, timeout } = {}) => {
+// Shared by the Scripts panel Run button and the chat agent's prod_run_script.
+async function prodRunScript({ path: testPath, timeout } = {}) {
   if (!prodSession?.pageSessionId) return { ok: false, error: 'not_ready' };
   if (!testPath || typeof testPath !== 'string') return { ok: false, error: 'missing_path' };
   const mod = await getNodeTestRunner();
@@ -2913,7 +2927,8 @@ ipcMain.handle('prod:test:run', async (_event, { path: testPath, timeout } = {})
     prodBroadcast('prod:test:state', { status: 'failed', path: testPath, error: message, ts: Date.now() });
     return { ok: false, error: 'run_failed', message, notes };
   }
-});
+}
+ipcMain.handle('prod:test:run', async (_event, payload = {}) => prodRunScript(payload));
 
 const captureCanvasPNG = async () => {
   if (prodCanvasActive && latestProdFrame?.buffer) {
@@ -6496,6 +6511,69 @@ const AGENT_TOOLS = [
       },
       required: ['username']
     }
+  },
+  // ─── Prod tools (Aug 13) ───────────────────────────────────────────────
+  // These drive the REAL signed-in Reddit session in a headed Chrome, not
+  // the local emulator. Actions here are visible to Reddit and permanent.
+  {
+    name: 'prod_open_url',
+    description: 'Open a real Reddit URL in Prod view — a headed Chrome signed in as the real Reddit account. Starts the Prod session if it is not already running and switches the canvas to Prod so the user can watch. Use for "open r/foo in prod", "go to this reddit post in the real browser". This is the REAL Reddit, not the local emulator: actions are visible to Reddit and permanent.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: 'Full https:// Reddit URL to open.' },
+        profileId: { type: 'string', description: 'Optional identity profile id from prod_status. Omit to use the default signed-in profile.' }
+      },
+      required: ['url']
+    }
+  },
+  {
+    name: 'prod_status',
+    description: 'Report the Prod session state: running or stopped, current URL, page title, viewport size, the identity profiles available, and whether an app view is open. Call this FIRST when unsure whether Prod is running, and after actions to confirm where the browser actually is.',
+    input_schema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'prod_open_app_view',
+    description: 'On a Reddit custom-post page, click the post\'s splash image to load its interactive Devvit app view (the playable game), then attach to that app frame. Required before prod_run_script or before interacting with a game. Optionally navigates to a post URL first. Returns the resolved app-view URL.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: 'Optional post URL to navigate to first. Omit to use the page already open.' }
+      }
+    }
+  },
+  {
+    name: 'prod_input',
+    description: 'Send a click, scroll, keypress, or text into the live Prod browser. Coordinates are NORMALIZED 0..1 (nx=0.5, ny=0.5 is dead center), so take a screenshot with take_canvas_screenshot first and aim by eye. kind="click" needs nx+ny; "type" needs text (click the field first); "key" needs key (e.g. "Enter"); "wheel" needs deltaY plus nx+ny. This drives the REAL signed-in account — do not click things the user did not ask for.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        kind: { type: 'string', enum: ['click', 'type', 'key', 'wheel'], description: 'What kind of input to send.' },
+        nx: { type: 'number', description: 'Normalized X, 0..1 (left..right). For click and wheel.' },
+        ny: { type: 'number', description: 'Normalized Y, 0..1 (top..bottom). For click and wheel.' },
+        text: { type: 'string', description: 'Text to type, for kind="type". Click the target field first.' },
+        key: { type: 'string', description: 'Key name for kind="key", e.g. "Enter", "Escape", "a".' },
+        deltaY: { type: 'number', description: 'Scroll amount for kind="wheel". Positive scrolls down.' }
+      },
+      required: ['kind']
+    }
+  },
+  {
+    name: 'prod_run_script',
+    description: 'Run one of the project\'s .farnsworth/devvit-tests/*.json scripts against the REAL Reddit app view instead of the local emulator. Call prod_open_app_view first. Accepts a bare script name (e.g. "lobby-recover") or an absolute path; use test_list to see what exists. Returns steps passed/total, errors, and captured vars. These scripts take real actions on the real account.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Script name without .json, or an absolute path to the JSON file.' },
+        timeout: { type: 'number', description: 'Optional overall timeout in milliseconds. Defaults to 20 minutes.' }
+      },
+      required: ['name']
+    }
+  },
+  {
+    name: 'prod_stop',
+    description: 'Stop the Prod browser session and close its headed Chrome window. Use when the user says they are done with prod, or to recover from a stuck session before starting a fresh one.',
+    input_schema: { type: 'object', properties: {} }
   }
 ];
 
@@ -6581,6 +6659,105 @@ async function executeAgentTool(name, input, folderOverride) {
     const sz = img.getSize();
     return { ok: true, path: outPath, base64: pngBuf.toString('base64'), width: sz.width, height: sz.height };
   }
+  // ─── Prod tools (Aug 13) ───────────────────────────────────────────────
+  // Above the folder gate on purpose: driving the real Reddit browser does
+  // not require an open project. Only prod_run_script needs a folder, and
+  // only to resolve a bare script name — it takes absolute paths without one.
+  if (name === 'prod_status') {
+    const registry = prodSeedProfiles();
+    return {
+      ok: true,
+      status: prodStatus(),
+      appViewOpen: !!prodSession?.gameTargetId,
+      appViewUrl: prodSession?.gameUrl || null,
+      profiles: registry.profiles.map(prodPublicProfile),
+    };
+  }
+  if (name === 'prod_open_url') {
+    const url = String(input?.url || '').trim();
+    if (!/^https?:\/\//i.test(url)) {
+      return { ok: false, error: 'bad_input', message: 'url must be a full http(s) URL' };
+    }
+    const target = BrowserWindow.getFocusedWindow() || mainWindow || openWindows[0];
+    if (!target || target.isDestroyed()) return { ok: false, error: 'no_window' };
+    // Show the user what we're driving.
+    target.webContents.send('canvas:setMode', { mode: 'prod' });
+    // Reuse a live session when we have one; a restart would drop the
+    // already-attached app frame and cost a fresh browser launch.
+    if (prodSession?.pageSessionId && !input?.profileId) {
+      try {
+        await prodCdpCall('Page.navigate', { url }, prodSession.pageSessionId, 30000);
+        await new Promise((r) => setTimeout(r, 3000));
+        prodSession.url = url;
+        prodSession.gameTargetId = null; prodSession.gameUrl = null; // new page, old app frame is gone
+        prodCanvasActive = true;
+        return { ok: true, reused: true, status: prodEmitStatus() };
+      } catch (e) {
+        return { ok: false, error: 'navigate_failed', message: e.message || String(e) };
+      }
+    }
+    prodCanvasActive = true;
+    const started = await startProdSession({ sender: target.webContents }, { profileId: input?.profileId, url });
+    if (!started?.ok) { prodCanvasActive = false; return started; }
+    return { ok: true, reused: false, ...started };
+  }
+  if (name === 'prod_open_app_view') {
+    const res = await prodAppOpen({ url: input?.url });
+    if (!res?.ok && res?.error === 'not_ready') {
+      return { ok: false, error: 'not_ready', message: 'Prod session is not running. Call prod_open_url first.' };
+    }
+    return res;
+  }
+  if (name === 'prod_input') {
+    const kind = String(input?.kind || 'click');
+    if (!['click', 'type', 'key', 'wheel'].includes(kind)) {
+      return { ok: false, error: 'bad_input', message: 'kind must be one of: click, type, key, wheel' };
+    }
+    if ((kind === 'click' || kind === 'wheel') && (input?.nx == null || input?.ny == null)) {
+      return { ok: false, error: 'bad_input', message: `kind="${kind}" requires normalized nx and ny (0..1)` };
+    }
+    if (kind === 'type' && !String(input?.text || '')) {
+      return { ok: false, error: 'bad_input', message: 'kind="type" requires text' };
+    }
+    if (kind === 'key' && !String(input?.key || '')) {
+      return { ok: false, error: 'bad_input', message: 'kind="key" requires key' };
+    }
+    const res = await prodInput({
+      kind, nx: input?.nx, ny: input?.ny,
+      text: input?.text, key: input?.key, code: input?.code,
+      deltaX: input?.deltaX, deltaY: input?.deltaY,
+    });
+    if (!res?.ok && res?.error === 'not_ready') {
+      return { ok: false, error: 'not_ready', message: 'Prod session is not running. Call prod_open_url first.' };
+    }
+    return res;
+  }
+  if (name === 'prod_stop') {
+    prodCanvasActive = false;
+    const res = await stopProdSession('agent');
+    return { ok: true, stopped: true, result: res ?? null };
+  }
+  if (name === 'prod_run_script') {
+    const raw = String(input?.name || '').trim();
+    if (!raw) return { ok: false, error: 'bad_input', message: 'name required' };
+    let testPath = raw;
+    if (!path.isAbsolute(testPath)) {
+      const f = folderOverride || currentFolderSetting();
+      if (!f) {
+        return { ok: false, error: 'no_folder', message: 'No workspace folder open, so a bare script name cannot be resolved. Open a folder or pass an absolute path.' };
+      }
+      const file = testPath.endsWith('.json') ? testPath : `${testPath}.json`;
+      testPath = path.join(f, '.farnsworth', 'devvit-tests', file);
+    }
+    try { await fs.access(testPath); }
+    catch { return { ok: false, error: 'not_found', message: `No script at ${testPath}. Use test_list to see available scripts.` }; }
+    const res = await prodRunScript({ path: testPath, timeout: input?.timeout });
+    if (!res?.ok && res?.error === 'not_ready') {
+      return { ok: false, error: 'not_ready', message: 'Prod session is not running. Call prod_open_url, then prod_open_app_view, before running a script.' };
+    }
+    return res;
+  }
+
   const folder = folderOverride || currentFolderSetting();
   if (!folder) {
     return { ok: false, error: 'no_folder', message: 'No workspace folder open. Open a folder first.' };

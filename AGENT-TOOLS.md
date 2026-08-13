@@ -6,7 +6,7 @@ Living spec for the Farnsworth chat agent tool design space.
 
 ---
 
-## Current tools (18)
+## Current tools (24)
 
 ### File system
 
@@ -28,9 +28,38 @@ Living spec for the Farnsworth chat agent tool design space.
 |---|---|
 | `open_testview` | Switch canvas to Test View. Legacy entry point — prefer `set_preview("testview")`. |
 | `take_canvas_screenshot(filename?)` | Capture the active canvas preview and return the PNG to the agent for visual verification. |
-| `set_canvas_view(view)` | Switch top-level view: `"live"` / `"storybook"` / `"code"`. |
+| `set_canvas_view(view)` | Switch top-level view: `"live"` / `"storybook"` / `"code"` / `"prod"` (real headed Reddit Chrome). |
 | `set_preview(preview)` | Within Live, switch surface: `"post"` / `"mobile"` / `"desktop"` / `"fullscreen"` / `"testview"`. Auto-switches to live. |
 | `switch_devvit_user(username)` | Switch active emulator user (restarts dev server). Returns available list on miss. |
+
+### Prod (real Reddit)
+
+Drives a headed Chrome signed in as a **real Reddit account**, not the Devvit emulator.
+Actions are visible to Reddit, affect that account, and are not undoable. All six sit
+**above** the workspace-folder gate in `executeAgentTool` — Prod needs no open project
+(only `prod_run_script` touches the folder, and only to resolve a bare script name).
+
+| Tool | Description |
+|---|---|
+| `prod_status()` | Session state, URL, title, viewport, identity profiles, whether an app view is attached. |
+| `prod_open_url(url, profileId?)` | Open a real Reddit URL. Starts the session if needed; reuses a live one by navigating. Switches the canvas to Prod. |
+| `prod_open_app_view(url?)` | Click a custom post's splash into its interactive Devvit app view and attach to that OOPIF. |
+| `prod_input({kind, nx, ny, text, key, deltaY})` | `click` / `type` / `key` / `wheel` into the live browser. Coordinates **normalized 0..1**. |
+| `prod_run_script(name, timeout?)` | Run a `.farnsworth/devvit-tests/*.json` script against the real app view. Bare name or absolute path. |
+| `prod_stop()` | Stop the session and close the Chrome window. |
+
+**Working order:** `prod_open_url` -> `prod_open_app_view` (interactive posts only) -> `prod_run_script` or `prod_input`.
+
+**No DOM access.** Prod is a frame mirror, not a queryable document: there is no
+`document.querySelector` for the agent. Interaction is screenshot-aim-verify —
+`take_canvas_screenshot`, then `prod_input` with normalized coordinates, then
+screenshot again to confirm. `prod_run_script` is the deterministic alternative and
+should be preferred whenever a script already covers the flow.
+
+**Shared implementation.** `prod_input`, `prod_open_app_view`, and `prod_run_script`
+call the same `prodInput` / `prodAppOpen` / `prodRunScript` functions the Scripts
+panel buttons use through `prod:session:input` / `prod:app:open` / `prod:test:run`,
+so the agent path and the UI path cannot drift.
 
 ### Testing
 
