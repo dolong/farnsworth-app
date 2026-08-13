@@ -2718,6 +2718,203 @@ ipcMain.handle('prod:session:input', async (_event, msg = {}) => {
   } catch (e) { return { ok: false, error: e.message }; }
 });
 
+// ─── Prod script runner (Aug 13) ─────────────────────────────────────────────
+// Runs the SAME <project>/.farnsworth/devvit-tests/*.json cases Test View runs,
+// but against the real Reddit post's Devvit app instead of the local emulator.
+//
+// The production game renders in a cross-origin *.webview.devvit.net OOPIF, so
+// parent-page JS cannot reach it — we resolve and attach to that target
+// directly. Verified Aug 13: CDP Input dispatched to an OOPIF session uses
+// FRAME-LOCAL coordinates and produces isTrusted events, which is exactly the
+// contract src/farnsworth-test-runner.mjs already assumes. So we reuse the
+// entire 16-action runner through a shim that speaks prodCdpCall instead of
+// Electron's webContents.debugger, rather than maintaining a second runner.
+const PROD_DEVVIT_HOST_RE = /webview\.devvit\.net/i;
+
+async function prodDevvitTargets() {
+  const { targetInfos = [] } = await prodCdpCall('Target.getTargets');
+  return targetInfos.filter((t) => PROD_DEVVIT_HOST_RE.test(t.url || ''));
+}
+const prodPickGameTarget = (targets) => targets.find((t) => /\/game\.html/i.test(t.url || '')) || null;
+const prodPickSplashTarget = (targets) => targets.find((t) => /\/splash\.html/i.test(t.url || '')) || null;
+
+async function prodAttachTarget(targetId) {
+  const { sessionId } = await prodCdpCall('Target.attachToTarget', { targetId, flatten: true });
+  await prodCdpCall('Runtime.enable', {}, sessionId).catch(() => {});
+  await prodCdpCall('Page.enable', {}, sessionId).catch(() => {});
+  return sessionId;
+}
+
+// A custom post renders splash.html until it is clicked; the desktop app view
+// (game.html) is a DIFFERENT target that only exists afterwards. This is the
+// programmatic equivalent of clicking the post into the app.
+async function prodOpenAppView({ timeout = 25000 } = {}) {
+  let targets = await prodDevvitTargets();
+  let game = prodPickGameTarget(targets);
+  if (game) return game;
+  const splash = prodPickSplashTarget(targets);
+  if (!splash) throw new Error('no Devvit webview on this page — open a custom post first');
+  const splashSession = await prodAttachTarget(splash.targetId);
+  let point = {};
+  try {
+    const r = await prodCdpCall('Runtime.evaluate', {
+      expression: `(()=>{const el=document.querySelector('[data-testid="game-root"]')||document.body;const r=el.getBoundingClientRect();return JSON.stringify({x:r.x+r.width/2,y:r.y+r.height/2})})()`,
+      returnByValue: true,
+    }, splashSession);
+    point = JSON.parse(r.result?.value || '{}');
+  } catch {}
+  const x = Number(point.x) || 100, y = Number(point.y) || 100;
+  for (const type of ['mouseMoved', 'mousePressed', 'mouseReleased']) {
+    await prodCdpCall('Input.dispatchMouseEvent', {
+      type, x, y,
+      button: type === 'mouseMoved' ? 'none' : 'left',
+      clickCount: type === 'mouseMoved' ? 0 : 1,
+    }, splashSession).catch(() => {});
+  }
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 700));
+    targets = await prodDevvitTargets();
+    game = prodPickGameTarget(targets);
+    if (game) return game;
+  }
+  throw new Error('app view did not open within timeout');
+}
+
+async function prodResolveGameSession({ open = true } = {}) {
+  const targets = await prodDevvitTargets();
+  let game = prodPickGameTarget(targets);
+  if (!game && open) game = await prodOpenAppView();
+  if (!game) throw new Error('no Devvit app view target');
+  const sessionId = await prodAttachTarget(game.targetId);
+  // A freshly created app view — first open, or the frame recreated by a reload
+  // step — needs its JWT and remote assets before any selector can match. Waiting
+  // for the app root here means a test's own first step doesn't burn its timeout
+  // on boot, which is what made a 15s lobby wait fail while the very next step
+  // found the lobby fine.
+  const bootDeadline = Date.now() + 20000;
+  while (Date.now() < bootDeadline) {
+    try {
+      const r = await prodCdpCall('Runtime.evaluate', {
+        expression: `!!document.querySelector('[data-testid="game-root"]')`,
+        returnByValue: true,
+      }, sessionId, 10000);
+      if (r.result?.value === true) break;
+    } catch {}
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  return { targetId: game.targetId, sessionId, url: game.url };
+}
+
+// webContents.debugger stand-in backed by the Prod CDP socket. Also recovers
+// from the two ways an OOPIF session legitimately dies mid-run: an explicit
+// reload step, and the frame being torn down and recreated under us.
+function prodRunnerShim(initial) {
+  const state = { ...initial };
+  const isStale = (m) => /Session with given id not found|No target with given id|Inspected target navigated or closed|Target closed/i.test(m || '');
+  async function sendCommand(method, params = {}) {
+    // Screenshots go through the top-level page so a test captures the whole
+    // production post (Reddit chrome + app view), not just the bare frame —
+    // and because an OOPIF session cannot capture its own surface.
+    if (method === 'Page.captureScreenshot' && prodSession?.pageSessionId) {
+      return await prodCdpCall(method, params, prodSession.pageSessionId, 30000);
+    }
+    if (method === 'Page.reload') {
+      try { await prodCdpCall(method, params, state.sessionId, 20000); } catch {}
+      await new Promise((r) => setTimeout(r, 2500));
+      Object.assign(state, await prodResolveGameSession({ open: true }));
+      return {};
+    }
+    try {
+      return await prodCdpCall(method, params, state.sessionId, 30000);
+    } catch (e) {
+      if (!isStale(e.message)) throw e;
+      Object.assign(state, await prodResolveGameSession({ open: true }));
+      return await prodCdpCall(method, params, state.sessionId, 30000);
+    }
+  }
+  return { state, wc: { debugger: { isAttached: () => true, attach() {}, detach() {}, sendCommand } } };
+}
+
+// Production identity is whoever the Chrome profile/state is signed in as —
+// there is no emulator to switch users in. Instead of rejecting tests that
+// carry a switchUser step, rewrite it into a recorded read of the REAL
+// signed-in user, so a single test file runs in both lanes unchanged.
+const PROD_USER_EXPR = `(()=>{try{const t=new URLSearchParams(location.search).get('token');const p=JSON.parse(atob(t.split('.')[1]));return (p&&p.devvit&&p.devvit.user&&p.devvit.user.name)||'';}catch(e){return '';}})()`;
+
+function prodAdaptSteps(steps, notes = []) {
+  if (!Array.isArray(steps)) return [];
+  return steps.map((step) => {
+    if (!step || typeof step !== 'object') return step;
+    if (step.action === 'switchUser' || step.action === 'switchDevvitUser') {
+      notes.push(`switchUser("${step.username || ''}") skipped — production runs as the signed-in Reddit user`);
+      return { action: 'extract', expression: PROD_USER_EXPR, into: 'prodUser' };
+    }
+    const next = { ...step };
+    if (Array.isArray(step.steps)) next.steps = prodAdaptSteps(step.steps, notes);
+    return next;
+  });
+}
+
+// Open a production URL and expand its custom post into the desktop app view.
+ipcMain.handle('prod:app:open', async (_event, { url } = {}) => {
+  if (!prodSession?.pageSessionId) return { ok: false, error: 'not_ready' };
+  try {
+    if (url && /^https?:\/\//i.test(String(url))) {
+      await prodCdpCall('Page.navigate', { url: String(url) }, prodSession.pageSessionId, 30000);
+      await new Promise((r) => setTimeout(r, 5000));
+      prodSession.url = String(url);
+    }
+    const game = await prodResolveGameSession({ open: true });
+    prodSession.gameTargetId = game.targetId;
+    prodSession.gameUrl = game.url;
+    prodEmitStatus();
+    return { ok: true, appView: { url: game.url } };
+  } catch (e) {
+    return { ok: false, error: 'app_view_failed', message: e.message || String(e) };
+  }
+});
+
+ipcMain.handle('prod:test:run', async (_event, { path: testPath, timeout } = {}) => {
+  if (!prodSession?.pageSessionId) return { ok: false, error: 'not_ready' };
+  if (!testPath || typeof testPath !== 'string') return { ok: false, error: 'missing_path' };
+  const mod = await getNodeTestRunner();
+  if (!mod) return { ok: false, error: 'runner_unavailable' };
+  let raw;
+  try { raw = await require('fs').promises.readFile(testPath, 'utf8'); }
+  catch (e) { return { ok: false, error: 'read_failed', message: e.message }; }
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch (e) { return { ok: false, error: 'invalid_json', message: e.message }; }
+  const rawSteps = Array.isArray(parsed) ? parsed : (parsed?.steps ?? []);
+  if (!Array.isArray(rawSteps) || rawSteps.length === 0) return { ok: false, error: 'no_steps' };
+  const notes = [];
+  const steps = prodAdaptSteps(rawSteps, notes);
+  try {
+    const game = await prodResolveGameSession({ open: true });
+    const shim = prodRunnerShim(game);
+    prodBroadcast('prod:test:state', { status: 'running', path: testPath, total: steps.length, ts: Date.now() });
+    const result = await mod.runTest(shim.wc, steps, { timeout: Number(timeout) || 20 * 60 * 1000 });
+    const vars = { ...result.vars };
+    delete vars.__lastScreenshot; // base64 blobs never cross the IPC boundary
+    const payload = {
+      ok: result.ok,
+      steps: result.steps,
+      total: result.total,
+      errors: result.errors,
+      notes,
+      vars,
+      screenshots: result.screenshots?.length || 0,
+      appViewUrl: shim.state.url,
+    };
+    prodBroadcast('prod:test:state', { status: result.ok ? 'passed' : 'failed', path: testPath, ...payload, ts: Date.now() });
+    return payload;
+  } catch (e) {
+    const message = e.message || String(e);
+    prodBroadcast('prod:test:state', { status: 'failed', path: testPath, error: message, ts: Date.now() });
+    return { ok: false, error: 'run_failed', message, notes };
+  }
+});
+
 const captureCanvasPNG = async () => {
   if (prodCanvasActive && latestProdFrame?.buffer) {
     const image = nativeImage.createFromBuffer(latestProdFrame.buffer);

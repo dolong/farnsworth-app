@@ -3735,6 +3735,7 @@ function renderProdView(autoStart = true) {
     <aside class="prod__panel">
       <div class="prod__panel-head"><div><span class="prod__eyebrow">IDENTITIES</span><h3>Production profiles</h3></div><span class="prod__headed">Headed Chrome</span></div>
       <div class="prod__profiles" id="prod-profiles">${state.prod.profiles.map((p) => `<button class="prod__profile ${p.id === state.prod.selectedId ? 'is-active' : ''}" data-prod-profile="${escapeHtml(p.id)}"><strong>${escapeHtml(p.label)}</strong><span>${escapeHtml(p.mode)} · ${escapeHtml(p.metadata?.sourceName || 'managed')}</span></button>`).join('') || '<div class="prod__loading">Loading profiles…</div>'}</div>
+      <div class="prod__settings prod__scripts"><div class="prod__section-title">Scripts</div><div class="prod__script-list" id="prod-script-list"><div class="prod__loading">Loading scripts…</div></div><div class="prod__script-row"><button class="prod__btn" id="prod-app-open" title="Click the post into its desktop app view">Open app view</button><button class="prod__btn prod__btn--primary" id="prod-script-run">Run script</button></div><pre class="prod__script-output" id="prod-script-output" hidden></pre></div>
       <div class="prod__settings"><div class="prod__section-title">Safe JSON settings</div><pre id="prod-profile-json">${escapeHtml(JSON.stringify(meta, null, 2))}</pre></div>
       <div class="prod__settings"><div class="prod__section-title">Runtime health</div><pre id="prod-health-json">${escapeHtml(JSON.stringify({ engine: state.prod.status?.engine || 'agent-browser', headed: true, url: state.prod.status?.url || null, title: state.prod.status?.title || null, viewport: state.prod.status?.viewport || null, navigatorWebdriver: state.prod.status?.webdriver, frame: state.prod.status?.frame || null, error: state.prod.status?.error || null }, null, 2))}</pre></div>
       <form class="prod__create" id="prod-create-form"><div class="prod__section-title">Create profile</div><input name="label" placeholder="Profile name" required /><select name="mode"><option value="profile">Persistent Chrome profile</option><option value="state">Import saved-state JSON…</option></select><button class="prod__btn prod__btn--primary" type="submit">Create</button></form>
@@ -3748,9 +3749,74 @@ function renderProdView(autoStart = true) {
   wrap.querySelector('#prod-stop')?.addEventListener('click', async () => { await window.farnsworth?.prodSessionStop?.('operator'); prodApplyStatus({ running:false,state:'stopped' }); });
   wrap.querySelectorAll('[data-prod-profile]').forEach((b) => b.addEventListener('click', async () => { state.prod.selectedId = b.dataset.prodProfile; await window.farnsworth?.prodSessionStop?.('identity-switch'); state.prod.status={running:false,state:'stopped'}; const stage=document.getElementById('canvas-stage'); if(stage){stage.innerHTML='';stage.appendChild(renderProdView(false));} prodStartSelected(); }));
   wrap.querySelector('#prod-create-form')?.addEventListener('submit', (e) => { e.preventDefault(); prodCreateProfile(e.currentTarget); });
+
+  // Scripts — the SAME <project>/.farnsworth/devvit-tests/*.json files Test
+  // View lists, executed against the real post's Devvit app view instead of the
+  // local emulator. Author/save in Test View, run here: one file, two lanes.
+  const scriptList = wrap.querySelector('#prod-script-list');
+  const setScriptOutput = (text, show = true) => {
+    const out = wrap.querySelector('#prod-script-output');
+    if (!out) return;
+    out.textContent = text || '';
+    out.hidden = !show;
+  };
+  const renderScripts = () => {
+    if (!scriptList) return;
+    const items = state.prod.scripts || [];
+    if (!items.length) { scriptList.innerHTML = '<div class="prod__loading">No scripts in this project.</div>'; return; }
+    scriptList.innerHTML = items.map((t) => `<button class="prod__script ${t.path === state.prod.selectedScript ? 'is-active' : ''}" data-prod-script="${escapeHtml(t.path)}">${escapeHtml(t.name)}</button>`).join('');
+    scriptList.querySelectorAll('[data-prod-script]').forEach((b) => b.addEventListener('click', () => {
+      state.prod.selectedScript = b.dataset.prodScript;
+      renderScripts();
+    }));
+  };
+  const loadScripts = async () => {
+    try {
+      const res = await window.farnsworth?.testList?.({ folder: state.folder });
+      state.prod.scripts = res?.ok ? (res.tests || []) : [];
+      if (!state.prod.scripts.some((t) => t.path === state.prod.selectedScript)) {
+        state.prod.selectedScript = state.prod.scripts[0]?.path || null;
+      }
+    } catch { state.prod.scripts = []; }
+    renderScripts();
+  };
+  wrap.querySelector('#prod-app-open')?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget; btn.disabled = true;
+    setScriptOutput('Opening the post into its desktop app view…');
+    try {
+      const res = await window.farnsworth?.prodAppOpen?.({ url: wrap.querySelector('#prod-url')?.value?.trim() || undefined });
+      setScriptOutput(res?.ok ? `App view ready:\n${res.appView?.url || ''}` : `App view failed: ${res?.message || res?.error}`);
+    } catch (err) { setScriptOutput(`App view failed: ${err.message || err}`); }
+    finally { btn.disabled = false; }
+  });
+  wrap.querySelector('#prod-script-run')?.addEventListener('click', async (e) => {
+    if (!state.prod.selectedScript) { setScriptOutput('Pick a script first.'); return; }
+    const btn = e.currentTarget; btn.disabled = true;
+    setScriptOutput('Running…');
+    try {
+      const res = await window.farnsworth?.prodTestRun?.({ path: state.prod.selectedScript });
+      const lines = [res?.ok ? 'PASS' : 'FAIL'];
+      if (typeof res?.steps === 'number') lines.push(`${res.steps}/${res.total} steps completed`);
+      (res?.notes || []).forEach((n) => lines.push(`note: ${n}`));
+      (res?.errors || []).forEach((n) => lines.push(`error: ${n}`));
+      if (res?.message) lines.push(res.message);
+      if (res?.vars && Object.keys(res.vars).length) lines.push(`vars: ${JSON.stringify(res.vars, null, 1)}`);
+      setScriptOutput(lines.join('\n'));
+    } catch (err) { setScriptOutput(`Run failed: ${err.message || err}`); }
+    finally { btn.disabled = false; }
+  });
+  if (!state.prod.__testStateBound) {
+    state.prod.__testStateBound = true;
+    window.farnsworth?.onProdTestState?.((payload) => {
+      const out = document.getElementById('prod-script-output');
+      if (out && payload?.status === 'running') { out.hidden = false; out.textContent = `Running ${payload.total || ''} steps…`; }
+    });
+  }
+
   requestAnimationFrame(() => {
     if (!state.prod.profiles.length && !state.prod.loadingProfiles) prodLoadProfiles(autoStart);
     else if (autoStart) prodStartSelected();
+    loadScripts();
   });
   return wrap;
 }

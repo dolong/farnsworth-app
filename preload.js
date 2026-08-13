@@ -51,6 +51,13 @@ contextBridge.exposeInMainWorld('farnsworth', {
   prodSessionStop: (reason) => ipcRenderer.invoke('prod:session:stop', { reason }),
   prodSessionStatus: () => ipcRenderer.invoke('prod:session:status'),
   prodSessionInput: (payload) => ipcRenderer.invoke('prod:session:input', payload || {}),
+  prodAppOpen: (payload) => ipcRenderer.invoke('prod:app:open', payload || {}),
+  prodTestRun: (payload) => ipcRenderer.invoke('prod:test:run', payload || {}),
+  onProdTestState: (callback) => {
+    const handler = (_e, payload) => { try { callback(payload); } catch (err) { console.error('[prod:test:state]', err); } };
+    ipcRenderer.on('prod:test:state', handler);
+    return () => ipcRenderer.removeListener('prod:test:state', handler);
+  },
   onProdFrame: (callback) => {
     const handler = (_e, payload) => { try { callback(payload); } catch (err) { console.error('[prod:frame]', err); } };
     ipcRenderer.on('prod:frame', handler);

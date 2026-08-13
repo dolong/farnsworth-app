@@ -54,7 +54,7 @@ async function action_waitFor(webContents, vars, step) {
   while (Date.now() < deadline) {
     try {
       const result = await webContents.debugger.sendCommand('Runtime.evaluate', {
-        expression: `!!document.querySelector('${escapeCSS(selector)}')`,
+        expression: `!!document.querySelector(${selectorLiteral(selector)})`,
         returnByValue: true,
       })
       if (result.result?.value === true) return
@@ -73,7 +73,7 @@ async function action_waitForNotVisible(webContents, vars, step) {
   while (Date.now() < deadline) {
     try {
       const result = await webContents.debugger.sendCommand('Runtime.evaluate', {
-        expression: `!document.querySelector('${escapeCSS(selector)}')`,
+        expression: `!document.querySelector(${selectorLiteral(selector)})`,
         returnByValue: true,
       })
       if (result.result?.value === true) return
@@ -135,7 +135,7 @@ async function action_type(webContents, vars, step) {
 
   // Focus the element first
   await webContents.debugger.sendCommand('Runtime.evaluate', {
-    expression: `document.querySelector('${escapeCSS(selector)}')?.focus()`,
+    expression: `document.querySelector(${selectorLiteral(selector)})?.focus()`,
   })
 
   // Insert text
@@ -147,6 +147,17 @@ async function action_screenshot(webContents, vars, step) {
     format: 'png',
     fromSurface: true,
   })
+  // Honour step.path like the Python runner does. Without this, a test that
+  // says {"action":"screenshot","path":"/tmp/x.png"} silently produced no file
+  // and the step still "passed" — the base64 went to the caller and nowhere else.
+  if (step.path) {
+    try {
+      const { writeFile } = await import('fs/promises')
+      await writeFile(step.path, Buffer.from(result.data, 'base64'))
+    } catch (err) {
+      throw new Error(`screenshot: could not write ${step.path}: ${err.message}`)
+    }
+  }
   // Return base64 data — caller decides what to do with it
   return { _screenshot: result.data }
 }
@@ -206,6 +217,8 @@ async function action_if(webContents, vars, step) {
 async function action_while(webContents, vars, step) {
   const max = step.max ?? 100
   const until = step.until
+  const maxConsecutiveFailures = step.maxConsecutiveFailures ?? 8
+  let consecutiveFailures = 0
 
   for (let i = 0; i < max; i++) {
     // Check until condition at top of each iteration
@@ -222,13 +235,23 @@ async function action_while(webContents, vars, step) {
     try {
       await runSteps(webContents, vars, step.steps, { abortOnFail: true })
     } catch (err) {
-      // Nested steps abort on failure but the while loop catches to continue
-      // Actually — the Python runner returns SUCCESS from the while step on failure
-      // and logs "max N reached". Let's match: on failure in nested steps, we just
-      // stop the loop and return success.
-      console.warn(`[test-runner] while loop iteration ${i} failed: ${err.message}`)
-      break
+      // A single failed iteration must NOT end the loop. These loops poll a
+      // live, animating game: an element chosen by an extract can legitimately
+      // disappear before the very next click (picker closes, possession ends),
+      // and breaking there abandons the run mid-match while still reporting
+      // success. Verified Aug 13 against production — one stale defense-picker
+      // click ended a full-match test at H1 with gameOver:false.
+      // Keep going, but bail out after enough CONSECUTIVE failures that the
+      // loop is clearly wedged rather than merely racing.
+      consecutiveFailures++
+      console.warn(`[test-runner] while loop iteration ${i} failed (${consecutiveFailures} in a row): ${err.message}`)
+      if (consecutiveFailures >= maxConsecutiveFailures) {
+        console.warn(`[test-runner] while loop giving up after ${consecutiveFailures} consecutive failures`)
+        break
+      }
+      continue
     }
+    consecutiveFailures = 0
   }
   // max iterations reached — return success (matching Python runner behavior)
 }
@@ -438,17 +461,27 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
-function escapeCSS(selector) {
-  // Minimal escaping for use inside JS string literals in Runtime.evaluate
-  // This is intentionally simple — we're wrapping in a template literal backtick
-  // so only backticks and backslashes need escaping
-  return selector.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$/g, '\\$')
+// Emit the selector as a COMPLETE, correctly-escaped JS string literal —
+// including its own quotes — for embedding in a Runtime.evaluate expression.
+//
+// The previous version escaped backslashes/backticks/$ and left the caller to
+// wrap the result in single quotes. That silently broke every selector
+// containing a single quote, which is the single most common form in this
+// codebase's tests: `[data-testid='lobby-screen']` produced
+//   document.querySelector('[data-testid='lobby-screen']')
+// which is a syntax error, so the evaluate threw, waitFor swallowed it as
+// "not found yet" and timed out, and click reported "element not found" for
+// elements that were plainly on screen. Found Aug 13 while running a full-match
+// test against production. JSON.stringify handles quotes, backslashes and
+// control characters correctly in one step.
+function selectorLiteral(selector) {
+  return JSON.stringify(String(selector))
 }
 
 async function getElementBox(webContents, selector) {
   const result = await webContents.debugger.sendCommand('Runtime.evaluate', {
     expression: `(() => {
-      const el = document.querySelector('${escapeCSS(selector)}');
+      const el = document.querySelector(${selectorLiteral(selector)});
       if (!el) return null;
       const r = el.getBoundingClientRect();
       return { x: r.x, y: r.y, width: r.width, height: r.height };
