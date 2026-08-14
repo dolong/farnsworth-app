@@ -2072,6 +2072,9 @@ function setupTestCreator() {
 // CANVAS STAGE
 // ============================================================================
 function renderCanvas() {
+  // Keep the Scripts panel's run-target badge honest whenever the canvas moves
+  // between Prod and everything else.
+  syncScriptsTarget();
   // Leaving Prod is an authenticated-browser lifecycle transition, not just a DOM repaint.
   if (state.canvasMode === 'prod') state._prodWasActive = true;
   else if (state._prodWasActive) {
@@ -3735,7 +3738,6 @@ function renderProdView(autoStart = true) {
     <aside class="prod__panel">
       <div class="prod__panel-head"><div><span class="prod__eyebrow">IDENTITIES</span><h3>Production profiles</h3></div><span class="prod__headed">Headed Chrome</span></div>
       <div class="prod__profiles" id="prod-profiles">${state.prod.profiles.map((p) => `<button class="prod__profile ${p.id === state.prod.selectedId ? 'is-active' : ''}" data-prod-profile="${escapeHtml(p.id)}"><strong>${escapeHtml(p.label)}</strong><span>${escapeHtml(p.mode)} · ${escapeHtml(p.metadata?.sourceName || 'managed')}</span></button>`).join('') || '<div class="prod__loading">Loading profiles…</div>'}</div>
-      <div class="prod__settings prod__scripts"><div class="prod__section-title">Scripts</div><div class="prod__script-list" id="prod-script-list"><div class="prod__loading">Loading scripts…</div></div><div class="prod__script-row"><button class="prod__btn" id="prod-app-open" title="Click the post into its desktop app view">Open app view</button><button class="prod__btn prod__btn--primary" id="prod-script-run">Run script</button></div><pre class="prod__script-output" id="prod-script-output" hidden></pre></div>
       <div class="prod__settings"><div class="prod__section-title">Safe JSON settings</div><pre id="prod-profile-json">${escapeHtml(JSON.stringify(meta, null, 2))}</pre></div>
       <div class="prod__settings"><div class="prod__section-title">Runtime health</div><pre id="prod-health-json">${escapeHtml(JSON.stringify({ engine: state.prod.status?.engine || 'agent-browser', headed: true, url: state.prod.status?.url || null, title: state.prod.status?.title || null, viewport: state.prod.status?.viewport || null, navigatorWebdriver: state.prod.status?.webdriver, frame: state.prod.status?.frame || null, error: state.prod.status?.error || null }, null, 2))}</pre></div>
       <form class="prod__create" id="prod-create-form"><div class="prod__section-title">Create profile</div><input name="label" placeholder="Profile name" required /><select name="mode"><option value="profile">Persistent Chrome profile</option><option value="state">Import saved-state JSON…</option></select><button class="prod__btn prod__btn--primary" type="submit">Create</button></form>
@@ -3750,73 +3752,16 @@ function renderProdView(autoStart = true) {
   wrap.querySelectorAll('[data-prod-profile]').forEach((b) => b.addEventListener('click', async () => { state.prod.selectedId = b.dataset.prodProfile; await window.farnsworth?.prodSessionStop?.('identity-switch'); state.prod.status={running:false,state:'stopped'}; const stage=document.getElementById('canvas-stage'); if(stage){stage.innerHTML='';stage.appendChild(renderProdView(false));} prodStartSelected(); }));
   wrap.querySelector('#prod-create-form')?.addEventListener('submit', (e) => { e.preventDefault(); prodCreateProfile(e.currentTarget); });
 
-  // Scripts — the SAME <project>/.farnsworth/devvit-tests/*.json files Test
-  // View lists, executed against the real post's Devvit app view instead of the
-  // local emulator. Author/save in Test View, run here: one file, two lanes.
-  const scriptList = wrap.querySelector('#prod-script-list');
-  const setScriptOutput = (text, show = true) => {
-    const out = wrap.querySelector('#prod-script-output');
-    if (!out) return;
-    out.textContent = text || '';
-    out.hidden = !show;
-  };
-  const renderScripts = () => {
-    if (!scriptList) return;
-    const items = state.prod.scripts || [];
-    if (!items.length) { scriptList.innerHTML = '<div class="prod__loading">No scripts in this project.</div>'; return; }
-    scriptList.innerHTML = items.map((t) => `<button class="prod__script ${t.path === state.prod.selectedScript ? 'is-active' : ''}" data-prod-script="${escapeHtml(t.path)}">${escapeHtml(t.name)}</button>`).join('');
-    scriptList.querySelectorAll('[data-prod-script]').forEach((b) => b.addEventListener('click', () => {
-      state.prod.selectedScript = b.dataset.prodScript;
-      renderScripts();
-    }));
-  };
-  const loadScripts = async () => {
-    try {
-      const res = await window.farnsworth?.testList?.({ folder: state.folder });
-      state.prod.scripts = res?.ok ? (res.tests || []) : [];
-      if (!state.prod.scripts.some((t) => t.path === state.prod.selectedScript)) {
-        state.prod.selectedScript = state.prod.scripts[0]?.path || null;
-      }
-    } catch { state.prod.scripts = []; }
-    renderScripts();
-  };
-  wrap.querySelector('#prod-app-open')?.addEventListener('click', async (e) => {
-    const btn = e.currentTarget; btn.disabled = true;
-    setScriptOutput('Opening the post into its desktop app view…');
-    try {
-      const res = await window.farnsworth?.prodAppOpen?.({ url: wrap.querySelector('#prod-url')?.value?.trim() || undefined });
-      setScriptOutput(res?.ok ? `App view ready:\n${res.appView?.url || ''}` : `App view failed: ${res?.message || res?.error}`);
-    } catch (err) { setScriptOutput(`App view failed: ${err.message || err}`); }
-    finally { btn.disabled = false; }
-  });
-  wrap.querySelector('#prod-script-run')?.addEventListener('click', async (e) => {
-    if (!state.prod.selectedScript) { setScriptOutput('Pick a script first.'); return; }
-    const btn = e.currentTarget; btn.disabled = true;
-    setScriptOutput('Running…');
-    try {
-      const res = await window.farnsworth?.prodTestRun?.({ path: state.prod.selectedScript });
-      const lines = [res?.ok ? 'PASS' : 'FAIL'];
-      if (typeof res?.steps === 'number') lines.push(`${res.steps}/${res.total} steps completed`);
-      (res?.notes || []).forEach((n) => lines.push(`note: ${n}`));
-      (res?.errors || []).forEach((n) => lines.push(`error: ${n}`));
-      if (res?.message) lines.push(res.message);
-      if (res?.vars && Object.keys(res.vars).length) lines.push(`vars: ${JSON.stringify(res.vars, null, 1)}`);
-      setScriptOutput(lines.join('\n'));
-    } catch (err) { setScriptOutput(`Run failed: ${err.message || err}`); }
-    finally { btn.disabled = false; }
-  });
-  if (!state.prod.__testStateBound) {
-    state.prod.__testStateBound = true;
-    window.farnsworth?.onProdTestState?.((payload) => {
-      const out = document.getElementById('prod-script-output');
-      if (out && payload?.status === 'running') { out.hidden = false; out.textContent = `Running ${payload.total || ''} steps…`; }
-    });
-  }
+  // The Prod scripts list, Run button and output moved to the right sidebar's
+  // Scripts tab on Aug 13. It listed exactly the same
+  // <project>/.farnsworth/devvit-tests/*.json files Test View listed, so the
+  // project had two script UIs over one source of truth and they had already
+  // drifted (this one could run but not create, edit or delete). The sidebar
+  // panel picks its run target from the canvas mode instead.
 
   requestAnimationFrame(() => {
     if (!state.prod.profiles.length && !state.prod.loadingProfiles) prodLoadProfiles(autoStart);
     else if (autoStart) prodStartSelected();
-    loadScripts();
   });
   return wrap;
 }
@@ -4550,352 +4495,35 @@ function renderTestView() {
   game.appendChild(shell);
   wrap.appendChild(game);
 
-  // Right: test runner panel.
-  const panel = el('div', { class: 'testview__panel' });
-
-  // Header with title + actions (+ New, Refresh, Reset Game).
-  // + New opens the editor in 'new' mode; the standalone NLP test creator
-  // modal that used to live in the canvas overlay bar (Jul 10 ~23:50 ET)
-  // was removed when Long asked to combine test building features into
-  // Test View (Jul 11 ~16:42 ET).
-  const head = el('div', { class: 'testview__panel-head' });
-  head.innerHTML = `
-    <div class="testview__panel-title">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2v6L4 18a2 2 0 0 0 1.7 3h12.6a2 2 0 0 0 1.7-3L15 8V2M9 2h6M9 14h6"/></svg>
-      Tests
-    </div>
-    <div class="testview__panel-actions">
-      <button class="testview__btn testview__btn--accent" id="testview-new" title="Create a new test (or generate from description)">+ New</button>
-      <button class="testview__btn testview__btn--ghost" id="testview-refresh" title="Re-list tests from ~/Documents/farnsworth-tests/tests/">Refresh</button>
-      <button class="testview__btn testview__btn--primary" id="testview-reset-game" title="Reload the game WebContentsView to a fresh instance">Reset Game</button>
-    </div>
+  // The scripts list, editor and run output used to live here as an in-canvas
+  // right panel. They moved to the right sidebar's Scripts tab (Aug 13): the
+  // same .farnsworth/devvit-tests/*.json files were listed by two different
+  // UIs that had already drifted apart, and the inline JSON textarea was a
+  // worse editor than the Monaco instance sitting one canvas mode away.
+  // Test View keeps only what is genuinely Test-View-specific: the game frame
+  // itself, which now gets the full canvas width, and Reset Game.
+  const tools = el('div', { class: 'testview__tools' });
+  tools.innerHTML = `
+    <button class="testview__btn testview__btn--primary" id="testview-reset-game" title="Reload the game WebContentsView to a fresh instance">Reset Game</button>
+    <button class="testview__btn testview__btn--ghost" id="testview-open-scripts" title="Open the Scripts panel in the sidebar">Scripts…</button>
   `;
-  panel.appendChild(head);
+  wrap.appendChild(tools);
 
-  // Test list — populated by loadTestViewTests() (async). Each row has
-  // Run / Edit / × buttons. Edit opens the editor in 'edit' mode; ×
-  // confirms and calls test:delete.
-  const list = el('div', { class: 'testview__list' });
-  list.id = 'testview-list';
-  list.innerHTML = '<div class="testview__list-empty">Loading tests…</div>';
-  panel.appendChild(list);
-
-  // Editor section — toggles open when + New or Edit is clicked. Hidden
-  // by default. Holds: name input + description (optional, for NLP
-  // generate) + JSON textarea + Save / Save & Run / Cancel buttons. Replaces
-  // the standalone NLP test creator modal (deprecated Jul 11 ~16:42 ET).
-  const editor = el('div', { class: 'testview__editor', id: 'testview-editor', hidden: true });
-  editor.innerHTML = `
-    <div class="testview__editor-head">
-      <span class="testview__editor-title" id="testview-editor-title">Edit test</span>
-      <button class="testview__editor-close" id="testview-editor-close" aria-label="Close editor" title="Close editor">×</button>
-    </div>
-    <div class="testview__editor-body">
-      <label class="testview__editor-label">Test name</label>
-      <input type="text" class="testview__editor-input" id="testview-editor-name" placeholder="my-test-name" spellcheck="false" />
-
-      <details class="testview__editor-generate-section">
-        <summary class="testview__editor-generate-toggle">Generate from description (optional, uses LLM)</summary>
-        <textarea class="testview__editor-desc" id="testview-editor-desc" rows="2" placeholder="e.g. Click PLAY, dismiss welcome, screenshot lobby"></textarea>
-        <button class="testview__btn testview__btn--ghost" id="testview-editor-generate">Generate</button>
-      </details>
-
-      <label class="testview__editor-label">JSON</label>
-      <textarea class="testview__editor-json" id="testview-editor-json" rows="14" spellcheck="false" placeholder='{"name": "my-test", "steps": [{"action": "reload"}]}'></textarea>
-
-      <div class="testview__editor-status" id="testview-editor-status"></div>
-
-      <div class="testview__editor-actions">
-        <button class="testview__btn testview__btn--primary" id="testview-editor-save">Save</button>
-        <button class="testview__btn testview__btn--accent" id="testview-editor-save-run">Save & Run</button>
-        <button class="testview__btn testview__btn--ghost" id="testview-editor-cancel">Cancel</button>
-      </div>
-    </div>
-  `;
-  panel.appendChild(editor);
-
-  // Output panel — populated by runTestViewTest() (async).
-  const output = el('div', { class: 'testview__output' });
-  output.id = 'testview-output';
-  output.innerHTML = '<div class="testview__output-empty">Select a test above and click Run. Output appears here.</div>';
-  panel.appendChild(output);
-
-  wrap.appendChild(panel);
-
-  // Wire up the buttons + populate the test list. Defer to next frame so
-  // the DOM is in place before handlers attach.
   requestAnimationFrame(() => {
-    const refreshBtn = panel.querySelector('#testview-refresh');
-    const resetBtn = panel.querySelector('#testview-reset-game');
-    const newBtn = panel.querySelector('#testview-new');
-    if (refreshBtn) refreshBtn.addEventListener('click', () => {
-      closeTestViewEditor(panel);
-      loadTestViewTests(panel);
+    tools.querySelector('#testview-reset-game')?.addEventListener('click', () => resetTestViewGame(wrap));
+    tools.querySelector('#testview-open-scripts')?.addEventListener('click', () => {
+      document.querySelector('.righttab[data-tab="scripts"]')?.click();
     });
-    if (resetBtn) resetBtn.addEventListener('click', () => resetTestViewGame(wrap));
-    if (newBtn) newBtn.addEventListener('click', () => openTestViewEditor(panel, 'new'));
-
-    // Editor button handlers
-    const editorCloseBtn = panel.querySelector('#testview-editor-close');
-    const editorCancelBtn = panel.querySelector('#testview-editor-cancel');
-    const editorSaveBtn = panel.querySelector('#testview-editor-save');
-    const editorSaveRunBtn = panel.querySelector('#testview-editor-save-run');
-    const editorGenerateBtn = panel.querySelector('#testview-editor-generate');
-    if (editorCloseBtn) editorCloseBtn.addEventListener('click', () => closeTestViewEditor(panel));
-    if (editorCancelBtn) editorCancelBtn.addEventListener('click', () => closeTestViewEditor(panel));
-    if (editorSaveBtn) editorSaveBtn.addEventListener('click', () => saveTestViewEditor(panel));
-    if (editorSaveRunBtn) editorSaveRunBtn.addEventListener('click', () => saveAndRunTestViewEditor(panel));
-    if (editorGenerateBtn) editorGenerateBtn.addEventListener('click', () => generateTestViewEditor(panel));
-
-    loadTestViewTests(panel);
   });
 
   return wrap;
 }
 
-// Populate the test list by calling window.farnsworth.testList() (test:list IPC).
-// Re-renders the list rows on every call. Each row has Run / Edit / × buttons.
-// Pass state.folder so the IPC resolves to <folder>/.farnsworth/devvit-tests/
-// (per-project test location, Jul 11 ~18:38 ET).
-async function loadTestViewTests(panel) {
-  const list = panel.querySelector('#testview-list');
-  if (!list) return;
-  const result = await window.farnsworth?.testList?.({ folder: state.folder });
-  if (!result || !result.ok) {
-    // Surface a hint when there's no active folder — Test View needs
-    // a project root to resolve the per-project tests dir
-    // (<folder>/.farnsworth/devvit-tests/). Jul 11 ~18:38 ET.
-    if (result.error === 'no_folder') {
-      list.innerHTML = '<div class="testview__list-empty">Pick a folder first. Tests live at <code>&lt;project&gt;/.farnsworth/devvit-tests/</code>.</div>';
-      return;
-    }
-    list.innerHTML = `<div class="testview__list-empty">Failed to list tests: ${result?.error || 'unknown'}</div>`;
-    return;
-  }
-  if (!result.tests || result.tests.length === 0) {
-    const dir = result.dir || `${state.folder || '<folder>'}/.farnsworth/devvit-tests/`;
-    list.innerHTML = `<div class="testview__list-empty">No tests found in <code>${dir}</code>. Click + New to create one.</div>`;
-    return;
-  }
-  list.innerHTML = '';
-  for (const t of result.tests) {
-    const row = el('div', { class: 'testview__test-row', 'data-test-path': t.path });
-    row.innerHTML = `
-      <div class="testview__test-info">
-        <div class="testview__test-name">${t.name}.json</div>
-        <div class="testview__test-meta">${t.size} bytes · ${new Date(t.modified).toLocaleString()}</div>
-      </div>
-      <div class="testview__test-actions">
-        <button class="testview__btn testview__btn--primary testview__test-run" data-test-path="${t.path}" title="Run this test">Run</button>
-        <button class="testview__btn testview__btn--ghost testview__test-edit" data-test-name="${t.name}" title="Edit JSON in the inline editor">Edit</button>
-        <button class="testview__btn testview__btn--danger testview__test-delete" data-test-name="${t.name}" title="Delete this test">×</button>
-      </div>
-    `;
-    row.querySelector('.testview__test-run').addEventListener('click', () => runTestViewTest(panel, t));
-    row.querySelector('.testview__test-edit').addEventListener('click', () => openTestViewEditor(panel, 'edit', t.name));
-    row.querySelector('.testview__test-delete').addEventListener('click', () => deleteTestViewTest(panel, t.name));
-    list.appendChild(row);
-  }
-}
-
-// Open the inline editor in 'new' or 'edit' mode. In 'edit' mode, reads
-// the JSON from disk via test:read and populates the fields. In 'new'
-// mode, leaves them empty for the user to fill in.
-async function openTestViewEditor(panel, mode, testName) {
-  const editor = panel.querySelector('#testview-editor');
-  if (!editor) return;
-  const titleEl = editor.querySelector('#testview-editor-title');
-  const nameEl = editor.querySelector('#testview-editor-name');
-  const jsonEl = editor.querySelector('#testview-editor-json');
-  const descEl = editor.querySelector('#testview-editor-desc');
-  const statusEl = editor.querySelector('#testview-editor-status');
-
-  editor.dataset.mode = mode;
-  editor.dataset.originalName = testName || '';
-
-  if (mode === 'edit') {
-    titleEl.textContent = `Edit: ${testName}.json`;
-    statusEl.textContent = 'Loading...';
-    statusEl.className = 'testview__editor-status';
-    editor.hidden = false;
-
-    const res = await window.farnsworth?.testRead?.({ folder: state.folder, name: testName });
-    if (!res?.ok) {
-      statusEl.textContent = `Failed to read: ${res?.error || 'unknown'}`;
-      statusEl.className = 'testview__editor-status is-error';
-      return;
-    }
-    nameEl.value = res.name;
-    jsonEl.value = res.json;
-    descEl.value = '';
-    statusEl.textContent = '';
-    statusEl.className = 'testview__editor-status';
-  } else {
-    titleEl.textContent = 'New test';
-    nameEl.value = '';
-    jsonEl.value = '';
-    descEl.value = '';
-    statusEl.textContent = 'Type a description and click Generate, or write JSON directly.';
-    statusEl.className = 'testview__editor-status is-hint';
-    editor.hidden = false;
-    setTimeout(() => nameEl.focus(), 50);
-  }
-}
-
-function closeTestViewEditor(panel) {
-  const editor = panel.querySelector('#testview-editor');
-  if (editor) editor.hidden = true;
-}
-
-// Validate + save the editor's JSON via test:save. On success, refreshes
-// the list and returns {name, path}. On failure, shows the error in the
-// status line and returns null.
-async function saveTestViewEditor(panel) {
-  const editor = panel.querySelector('#testview-editor');
-  const nameEl = editor.querySelector('#testview-editor-name');
-  const jsonEl = editor.querySelector('#testview-editor-json');
-  const statusEl = editor.querySelector('#testview-editor-status');
-
-  const name = nameEl.value.trim();
-  const json = jsonEl.value.trim();
-
-  if (!name) {
-    statusEl.textContent = 'Name required.';
-    statusEl.className = 'testview__editor-status is-error';
-    return null;
-  }
-  if (!json) {
-    statusEl.textContent = 'JSON required.';
-    statusEl.className = 'testview__editor-status is-error';
-    return null;
-  }
-  try { JSON.parse(json); } catch (e) {
-    statusEl.textContent = 'Invalid JSON: ' + e.message;
-    statusEl.className = 'testview__editor-status is-error';
-    return null;
-  }
-
-  statusEl.textContent = 'Saving...';
-  statusEl.className = 'testview__editor-status';
-
-  const res = await window.farnsworth?.testSave?.({ folder: state.folder, name, json });
-  if (!res?.ok) {
-    statusEl.textContent = 'Save failed: ' + (res?.error || 'unknown');
-    statusEl.className = 'testview__editor-status is-error';
-    return null;
-  }
-
-  statusEl.textContent = `Saved to ${res.path}`;
-  statusEl.className = 'testview__editor-status is-success';
-
-  await loadTestViewTests(panel);
-
-  return { ok: true, name: res.name, path: res.path };
-}
-
-// Save + run in one flow. The 'Save & Run' button. After a successful
-// save, runs the test and streams output into the output panel, then
-// closes the editor.
-async function saveAndRunTestViewEditor(panel) {
-  const result = await saveTestViewEditor(panel);
-  if (!result) return;
-  await runTestViewTest(panel, { name: result.name, path: result.path });
-  closeTestViewEditor(panel);
-}
-
-// Delete a test via test:delete IPC. Confirms first via browser confirm.
-// If the deleted test was being edited, closes the editor too.
-async function deleteTestViewTest(panel, testName) {
-  if (!confirm(`Delete ${testName}.json? This cannot be undone.`)) return;
-  const res = await window.farnsworth?.testDelete?.({ folder: state.folder, name: testName });
-  if (!res?.ok) {
-    alert(`Delete failed: ${res?.error || 'unknown'}`);
-    return;
-  }
-  await loadTestViewTests(panel);
-  const editor = panel.querySelector('#testview-editor');
-  if (editor && !editor.hidden && editor.dataset.originalName === testName) {
-    closeTestViewEditor(panel);
-  }
-}
-
-// Generate JSON from a plain-English description via the NLP helper
-// (TEST_CREATOR_SYSTEM_PROMPT + generateTestFromNLP). Reuses the LLM
-// + keyword-fallback path from the now-deprecated standalone test
-// creator modal — the description input + Generate button inside the
-// inline editor preserve the ability to bootstrap new tests from
-// English without needing to leave Test View.
-async function generateTestViewEditor(panel) {
-  const editor = panel.querySelector('#testview-editor');
-  const descEl = editor.querySelector('#testview-editor-desc');
-  const jsonEl = editor.querySelector('#testview-editor-json');
-  const nameEl = editor.querySelector('#testview-editor-name');
-  const statusEl = editor.querySelector('#testview-editor-status');
-
-  const description = descEl.value.trim();
-  if (!description) {
-    statusEl.textContent = 'Type a description first.';
-    statusEl.className = 'testview__editor-status is-error';
-    return;
-  }
-
-  statusEl.textContent = 'Generating...';
-  statusEl.className = 'testview__editor-status';
-
-  const result = await generateTestFromNLP(description);
-  if (!result.ok) {
-    statusEl.textContent = 'Generation failed.';
-    statusEl.className = 'testview__editor-status is-error';
-    return;
-  }
-
-  jsonEl.value = JSON.stringify(result.json, null, 2);
-  if (!nameEl.value.trim()) nameEl.value = result.json.name || deriveTestName(description);
-  statusEl.textContent = result.source === 'llm' ? 'Generated via LLM (editable).' : 'Generated via keyword fallback (LLM unavailable).';
-  statusEl.className = 'testview__editor-status is-success';
-}
-
-// Run a single test, stream output into the output panel.
-async function runTestViewTest(panel, t) {
-  const output = panel.querySelector('#testview-output');
-  if (!output) return;
-  output.innerHTML = `<div class="testview__output-header">▶ Running ${t.name}.json…</div><pre class="testview__output-pre"></pre>`;
-  const pre = output.querySelector('.testview__output-pre');
-  const result = await window.farnsworth?.testRun?.({ path: t.path });
-  if (!result) {
-    setTestViewOutput(output, `▶ ${t.name}.json · ERROR`, 'Test runner IPC failed (no response from main).');
-    return;
-  }
-  // No exit code means the runner never started -- bad interpreter, missing
-  // script, unusable cwd. Show the actual reason: packaged v0.1.5 rendered
-  // "Exit ?" plus two empty output blocks for every test, which told the user
-  // nothing at all (Jul 29).
-  if (result.code === undefined || result.code === null) {
-    setTestViewOutput(output, `▶ ${t.name}.json · ERROR`,
-      `Could not start the test runner\n\n${result.message || result.error || 'No exit code and no output from the runner.'}`);
-    return;
-  }
-  const status = result.ok ? 'PASS' : (result.failed > 0 ? `FAIL (${result.failed} failed)` : 'ERROR');
-  setTestViewOutput(output, `▶ ${t.name}.json · ${status}`,
-    `Exit ${result.code} · ${status}\n\n--- stdout ---\n${result.stdout || '(empty)'}\n\n--- stderr ---\n${result.stderr || '(empty)'}`);
-}
-
-// Render the Test View output panel: a selectable <pre> plus a copy button in
-// the header. Long (Jul 29): "you didn't make the error section of test view
-// selectable so i cant just copy paste the text". Reuses the chat copy button
-// so the affordance and the copied-checkmark feedback match the rest of the app.
-function setTestViewOutput(output, headerText, bodyText) {
-  output.innerHTML = '';
-  const header = el('div', { class: 'testview__output-header' });
-  const label = el('span', {});
-  label.textContent = headerText;
-  header.appendChild(label);
-  header.appendChild(makeMsgCopyBtn(() => bodyText, 'testview__copy'));
-  const pre = el('pre', { class: 'testview__output-pre' });
-  pre.textContent = bodyText;
-  output.appendChild(header);
-  output.appendChild(pre);
-}
+// The Test View list / inline editor / output functions lived here until
+// Aug 13. They were replaced wholesale by the Scripts sidebar panel
+// (renderScriptsPanel and friends): one list, two run targets, and Monaco
+// instead of a 352px-wide <textarea>. generateTestFromNLP and deriveTestName
+// survive and are now reached from the panel's + New button.
 
 // Reset the game WebContentsView by re-calling canvasCreateView with the same
 // viewId (main.js handler reloads the URL in place, which resets the game's
@@ -5148,7 +4776,224 @@ function renderRightPanel() {
 
   if (state.rightTab === 'files') content.appendChild(renderFiles());
   else if (state.rightTab === 'tasks') content.appendChild(renderTasks());
+  else if (state.rightTab === 'scripts') content.appendChild(renderScriptsPanel());
   else if (state.rightTab === 'live') content.appendChild(renderLive());
+}
+
+// ─── Scripts panel (Aug 13) ──────────────────────────────────────────────────
+// One list of <project>/.farnsworth/devvit-tests/*.json, two run targets.
+// Which target is armed follows the canvas: Prod mode runs against the real
+// signed-in Reddit post, anything else runs the local emulator. Editing is
+// NOT here — clicking a script opens it in the Monaco code editor, which has
+// tabs, find/replace, real undo, and the full canvas width. This panel owns
+// browse / run / create / delete.
+function renderScriptsPanel() {
+  const wrap = el('div', { class: 'scripts' });
+  const isProd = state.canvasMode === 'prod';
+  const target = isProd ? 'prod' : 'local';
+
+  wrap.innerHTML = `
+    <div class="scripts__head">
+      <div class="scripts__head-row">
+        <div class="scripts__title">Scripts</div>
+        <div class="scripts__head-actions">
+          <button class="scripts__btn scripts__btn--accent" id="scripts-new" title="Create a new script (optionally generated from a description)">+ New</button>
+          <button class="scripts__btn scripts__btn--ghost" id="scripts-refresh" title="Re-list scripts from disk">Refresh</button>
+        </div>
+      </div>
+      <div class="scripts__target scripts__target--${target}" id="scripts-target">
+        <span class="scripts__target-dot"></span>
+        <span class="scripts__target-label">${isProd ? 'PROD · real Reddit' : 'LOCAL · emulator'}</span>
+        <span class="scripts__target-hint">${isProd ? 'runs on your live account' : 'runs in Test View'}</span>
+      </div>
+      <button class="scripts__btn scripts__btn--ghost scripts__appview" id="scripts-app-open" ${isProd ? '' : 'hidden'} title="Click the post into its interactive app view (required before running)">Open app view</button>
+    </div>
+    <div class="scripts__list" id="scripts-list"><div class="scripts__empty">Loading scripts…</div></div>
+    <div class="scripts__output" id="scripts-output" hidden></div>
+  `;
+
+  wrap.querySelector('#scripts-refresh')?.addEventListener('click', () => loadScriptsPanel(wrap));
+  wrap.querySelector('#scripts-new')?.addEventListener('click', () => newScriptFromPanel(wrap));
+  wrap.querySelector('#scripts-app-open')?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget; btn.disabled = true;
+    setScriptsOutput(wrap, 'Opening app view…', 'Clicking the post into its interactive Devvit app view…');
+    try {
+      const res = await window.farnsworth?.prodAppOpen?.({});
+      setScriptsOutput(wrap, res?.ok ? 'App view ready' : 'App view failed',
+        res?.ok ? (res.appView?.url || '') : (res?.message || res?.error || 'unknown'));
+    } catch (err) { setScriptsOutput(wrap, 'App view failed', String(err.message || err)); }
+    finally { btn.disabled = false; }
+  });
+
+  // Prod runs stream step progress from main. Bind once per session, and write
+  // through the live DOM node rather than a captured `wrap` — the panel is
+  // rebuilt on every tab switch, so a captured reference would go stale and the
+  // progress would silently land on a detached element.
+  if (!state.prod.__testStateBound) {
+    state.prod.__testStateBound = true;
+    window.farnsworth?.onProdTestState?.((payload) => {
+      const pre = document.querySelector('#scripts-output .scripts__output-pre');
+      if (!pre) return;
+      if (payload?.status === 'running') {
+        pre.textContent = `Running${payload.total ? ` ${payload.step || '?'}/${payload.total}` : ''} steps…${payload.action ? `\n→ ${payload.action}` : ''}`;
+      }
+    });
+  }
+
+  loadScriptsPanel(wrap);
+  return wrap;
+}
+
+// The Run button means two very different things depending on canvas mode, so
+// the target badge has to track mode changes live. Patch it in place rather
+// than re-rendering the panel — a full re-render would wipe run output the
+// moment the user switched the canvas to look at something.
+function syncScriptsTarget() {
+  const badge = document.getElementById('scripts-target');
+  if (!badge) return;
+  const isProd = state.canvasMode === 'prod';
+  badge.classList.toggle('scripts__target--prod', isProd);
+  badge.classList.toggle('scripts__target--local', !isProd);
+  const label = badge.querySelector('.scripts__target-label');
+  const hint = badge.querySelector('.scripts__target-hint');
+  if (label) label.textContent = isProd ? 'PROD · real Reddit' : 'LOCAL · emulator';
+  if (hint) hint.textContent = isProd ? 'runs on your live account' : 'runs in Test View';
+  const appOpen = document.getElementById('scripts-app-open');
+  if (appOpen) appOpen.hidden = !isProd;
+}
+
+async function loadScriptsPanel(wrap) {
+  const list = wrap.querySelector('#scripts-list');
+  if (!list) return;
+  const res = await window.farnsworth?.testList?.({ folder: state.folder });
+  if (!res?.ok) {
+    list.innerHTML = res?.error === 'no_folder'
+      ? '<div class="scripts__empty">Open a project folder first. Scripts live at <code>&lt;project&gt;/.farnsworth/devvit-tests/</code>.</div>'
+      : `<div class="scripts__empty">Could not list scripts: ${escapeHtml(res?.error || 'unknown')}</div>`;
+    return;
+  }
+  const tests = res.tests || [];
+  if (!tests.length) {
+    list.innerHTML = '<div class="scripts__empty">No scripts yet. Click <strong>+ New</strong> to create one.</div>';
+    return;
+  }
+  list.innerHTML = '';
+  for (const t of tests) {
+    const row = el('div', { class: 'scripts__row', 'data-path': t.path });
+    row.innerHTML = `
+      <button class="scripts__name" data-open="${escapeHtml(t.path)}" title="Open in the code editor">
+        <span class="scripts__name-text">${escapeHtml(t.name)}</span>
+        <span class="scripts__name-meta">${(t.size / 1024).toFixed(1)}K</span>
+      </button>
+      <div class="scripts__row-actions">
+        <button class="scripts__btn scripts__btn--primary" data-run="${escapeHtml(t.path)}" title="Run this script">Run</button>
+        <button class="scripts__btn scripts__btn--danger" data-del="${escapeHtml(t.name)}" title="Delete this script">×</button>
+      </div>
+    `;
+    // Clicking the name opens the file in Monaco — no inline editor.
+    row.querySelector('[data-open]').addEventListener('click', () => openScriptInEditor(t.path));
+    row.querySelector('[data-run]').addEventListener('click', () => runScriptFromPanel(wrap, t));
+    row.querySelector('[data-del]').addEventListener('click', async () => {
+      if (!confirm(`Delete ${t.name}.json? This cannot be undone.`)) return;
+      const d = await window.farnsworth?.testDelete?.({ folder: state.folder, name: t.name });
+      if (!d?.ok) { alert(`Delete failed: ${d?.error || 'unknown'}`); return; }
+      loadScriptsPanel(wrap);
+    });
+    list.appendChild(row);
+  }
+}
+
+// Switch the canvas to code mode and mount the script in Monaco. Order is
+// load-bearing: renderCanvas() has to run FIRST so the editor host element
+// exists, otherwise openFileByPath resolves against nothing and the click
+// looks like it silently did nothing (caught live, Aug 13).
+async function openScriptInEditor(filePath) {
+  if (state.canvasMode !== 'code') {
+    state.canvasMode = 'code';
+    renderCanvas();
+    await new Promise((r) => setTimeout(r, 60));
+  }
+  await openFileByPath(filePath);
+}
+
+function setScriptsOutput(wrap, headerText, bodyText) {
+  const out = wrap.querySelector('#scripts-output');
+  if (!out) return;
+  out.hidden = false;
+  out.innerHTML = '';
+  const header = el('div', { class: 'scripts__output-head' });
+  const label = el('span', {});
+  label.textContent = headerText;
+  header.appendChild(label);
+  header.appendChild(makeMsgCopyBtn(() => bodyText, 'scripts__copy'));
+  const pre = el('pre', { class: 'scripts__output-pre' });
+  pre.textContent = bodyText;
+  out.appendChild(header);
+  out.appendChild(pre);
+}
+
+// Run against whichever lane the canvas is showing. Prod spends real
+// resources on the live account, so it gets an explicit confirm.
+async function runScriptFromPanel(wrap, t) {
+  const isProd = state.canvasMode === 'prod';
+  if (isProd && !confirm(`Run ${t.name}.json against REAL Reddit?\n\nThis acts on your live signed-in account and can spend in-game energy or currency.`)) return;
+
+  const btn = wrap.querySelector(`[data-run="${CSS.escape(t.path)}"]`);
+  if (btn) btn.disabled = true;
+  setScriptsOutput(wrap, `▶ ${t.name}.json · running…`, isProd ? 'Running against real Reddit…' : 'Running against the local emulator…');
+  try {
+    if (isProd) {
+      const res = await window.farnsworth?.prodTestRun?.({ path: t.path });
+      const lines = [res?.ok ? 'PASS' : 'FAIL'];
+      if (typeof res?.steps === 'number') lines.push(`${res.steps}/${res.total} steps completed`);
+      (res?.notes || []).forEach((n) => lines.push(`note: ${n}`));
+      (res?.errors || []).forEach((e) => lines.push(`error: ${typeof e === 'string' ? e : JSON.stringify(e)}`));
+      if (res?.message) lines.push(res.message);
+      if (res?.appViewUrl) lines.push(`app view: ${res.appViewUrl}`);
+      setScriptsOutput(wrap, `▶ ${t.name}.json · ${res?.ok ? 'PASS' : 'FAIL'} (prod)`, lines.join('\n'));
+    } else {
+      const res = await window.farnsworth?.testRun?.({ path: t.path });
+      if (!res) { setScriptsOutput(wrap, `▶ ${t.name}.json · ERROR`, 'Test runner IPC failed (no response from main).'); return; }
+      if (res.code === undefined || res.code === null) {
+        setScriptsOutput(wrap, `▶ ${t.name}.json · ERROR`,
+          `Could not start the test runner\n\n${res.message || res.error || 'No exit code and no output from the runner.'}`);
+        return;
+      }
+      const status = res.ok ? 'PASS' : (res.failed > 0 ? `FAIL (${res.failed} failed)` : 'ERROR');
+      setScriptsOutput(wrap, `▶ ${t.name}.json · ${status}`,
+        `Exit ${res.code} · ${status}\n\n--- stdout ---\n${res.stdout || '(empty)'}\n\n--- stderr ---\n${res.stderr || '(empty)'}`);
+    }
+  } catch (err) {
+    setScriptsOutput(wrap, `▶ ${t.name}.json · ERROR`, String(err.message || err));
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+// + New: name, optional plain-English description. With a description we run
+// the same NLP generator the old inline editor used; without one we scaffold a
+// minimal valid script. Either way it opens in Monaco for real editing.
+async function newScriptFromPanel(wrap) {
+  if (!state.folder) { alert('Open a project folder first.'); return; }
+  const rawName = prompt('Script name (no .json):');
+  if (!rawName) return;
+  const name = rawName.trim().toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '');
+  if (!name) { alert('That name has no usable characters.'); return; }
+
+  const description = prompt('Describe what it should do (optional — leave blank for an empty script):') || '';
+  let json;
+  if (description.trim()) {
+    setScriptsOutput(wrap, `Generating ${name}.json…`, 'Asking the model to draft steps from your description…');
+    const gen = await generateTestFromNLP(description.trim());
+    json = gen?.ok ? gen.json : null;
+    if (!json) { setScriptsOutput(wrap, 'Generation failed', 'Falling back to an empty script.'); }
+  }
+  if (!json) json = { name, description: description.trim() || undefined, steps: [] };
+
+  const res = await window.farnsworth?.testSave?.({ folder: state.folder, name, json: JSON.stringify(json, null, 2) });
+  if (!res?.ok) { alert(`Save failed: ${res?.error || 'unknown'}`); return; }
+  await loadScriptsPanel(wrap);
+  if (res.path) await openScriptInEditor(res.path);
 }
 
 function renderFiles() {
@@ -10269,6 +10114,7 @@ function openCommandPalette() {
       { id: 'settings',    label: 'Settings',     shortcut: '⌘,',  run: () => openSettings('ai') },
       { id: 'toggle-files', label: 'Show Files Tab', shortcut: '⌘1', run: () => { state.rightTab = 'files'; renderRightPanel(); } },
       { id: 'toggle-tasks', label: 'Show Tasks Tab', shortcut: '⌘2', run: () => { state.rightTab = 'tasks'; renderRightPanel(); } },
+      { id: 'toggle-scripts', label: 'Show Scripts Tab', run: () => { state.rightTab = 'scripts'; renderRightPanel(); } },
       { id: 'toggle-live',  label: 'Show Live Tab',  shortcut: '⌘3', run: () => { state.rightTab = 'live';  renderRightPanel(); } },
       { id: 'toggle-left',  label: 'Toggle Left Panel',  shortcut: '⌥⌘B', run: () => toggleLeftPanel() },
       { id: 'toggle-right', label: 'Toggle Right Panel', shortcut: '⌥⌘R', run: () => toggleRightPanel() },
@@ -11846,11 +11692,11 @@ function wire() {
   });
 
   // Test creator (NLP-driven test script authoring, Jul 10 ~23:50 ET)
-  // DEPRECATED Jul 11 ~16:42 ET — combined into Test View's inline
-  // editor (openTestViewEditor / saveTestViewEditor / generateTestViewEditor).
+  // DEPRECATED Jul 11 — folded into Test View's inline editor, which was
+  // itself removed Aug 13 in favour of the Scripts sidebar panel.
   // The NLP helpers (TEST_CREATOR_SYSTEM_PROMPT, generateTestFromNLP,
-  // keywordFallbackParse, deriveTestName) are still used by Test View's
-  // "Generate from description" button — they're not removed.
+  // keywordFallbackParse, deriveTestName) survive: they now back the
+  // Scripts panel's + New button.
   // setupTestCreator() intentionally NOT called: the modal HTML + button
   // in index.html were removed; the NLP functions remain callable.
 }

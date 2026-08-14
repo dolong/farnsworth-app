@@ -7416,3 +7416,120 @@ body.density-compact .msg__body { font-size: 12.5px; }
 .prod__script-row .prod__btn { flex:1; }
 .prod__script-output { margin:0; max-height:190px; overflow:auto; padding:9px; border-radius:8px; border:1px solid #26282d; background:#111214; color:#aeb3bd; font:9.5px/1.45 var(--font-mono); user-select:text; white-space:pre-wrap; word-break:break-word; }
 @media (max-width: 1280px) { .prod { grid-template-columns:minmax(0,1fr) 270px; } }
+
+/* ─── Scripts panel (right sidebar, Aug 13) ─────────────────────────────────
+   One list of .farnsworth/devvit-tests/*.json. Run target follows the canvas
+   mode: Prod = real Reddit, anything else = local emulator. Editing happens in
+   Monaco, not here — the 352px sidebar is for browse/run/create only. */
+.scripts { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+.scripts__head { padding: 13px 14px 10px; border-bottom: 1px solid var(--border-subtle); flex: 0 0 auto; }
+.scripts__head-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.scripts__title { font-size: 9px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: var(--text-muted); }
+.scripts__head-actions { display: flex; gap: 6px; }
+
+.scripts__btn {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 4px 9px; border-radius: 6px;
+  border: 1px solid #3a3d44; background: #1e2128; color: #d7dae0;
+  font-size: 10.5px; font-weight: 600; font-family: inherit; cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, opacity 120ms ease;
+}
+.scripts__btn:hover { background: #262a31; border-color: #4a4d54; color: #fff; }
+.scripts__btn:active { transform: translateY(1px); }
+.scripts__btn:disabled { opacity: .45; cursor: default; transform: none; }
+.scripts__btn--accent { background: var(--accent-blurple); border-color: var(--accent-blurple); color: #fff; }
+.scripts__btn--accent:hover { background: #6b77f5; border-color: #6b77f5; }
+.scripts__btn--primary { background: #2b3040; border-color: #454b60; color: #cfd6ff; }
+.scripts__btn--primary:hover { background: #343b50; border-color: #5b638a; color: #fff; }
+.scripts__btn--danger { padding: 4px 8px; color: #8b9098; }
+.scripts__btn--danger:hover { background: rgba(242,63,67,.14); border-color: var(--accent-red); color: #ff8b8e; }
+.scripts__btn--ghost { background: transparent; }
+
+/* Target indicator — the one thing that must never be ambiguous, since the
+   same Run button either hits an emulator or Long's real Reddit account. */
+.scripts__target {
+  display: flex; align-items: center; gap: 7px;
+  padding: 6px 9px; border-radius: 7px;
+  font-size: 10.5px; font-weight: 600;
+  border: 1px solid var(--border-default); background: #16181d;
+}
+.scripts__target-dot { width: 6px; height: 6px; border-radius: 50%; flex: 0 0 auto; }
+.scripts__target-hint { margin-left: auto; font-weight: 500; font-size: 9.5px; color: var(--text-muted); }
+.scripts__target--local .scripts__target-dot { background: var(--accent-green); box-shadow: 0 0 6px rgba(59,165,92,.7); }
+.scripts__target--local .scripts__target-label { color: #7fd39a; }
+.scripts__target--prod { border-color: rgba(240,136,62,.45); background: rgba(240,136,62,.09); }
+.scripts__target--prod .scripts__target-dot { background: var(--accent-orange); box-shadow: 0 0 6px rgba(240,136,62,.8); }
+.scripts__target--prod .scripts__target-label { color: #ffb87a; }
+.scripts__appview { margin-top: 8px; width: 100%; justify-content: center; }
+
+.scripts__list { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 8px 8px 12px; }
+.scripts__empty { padding: 18px 12px; font-size: 11.5px; line-height: 1.55; color: var(--text-muted); text-align: center; }
+.scripts__empty code { font-family: 'JetBrains Mono', monospace; font-size: 10.5px; color: #8fa4c8; word-break: break-all; }
+
+.scripts__row {
+  display: flex; align-items: center; gap: 6px;
+  padding: 3px 4px 3px 6px; border-radius: 7px;
+  border: 1px solid transparent;
+}
+.scripts__row:hover { background: #16181d; border-color: var(--border-subtle); }
+.scripts__name {
+  flex: 1 1 auto; min-width: 0;
+  display: flex; align-items: baseline; gap: 7px;
+  background: none; border: none; padding: 5px 2px;
+  font-family: inherit; text-align: left; cursor: pointer; color: var(--text-secondary);
+}
+.scripts__name:hover .scripts__name-text { color: #fff; text-decoration: underline; text-underline-offset: 2px; }
+.scripts__name-text {
+  font-size: 12px; font-weight: 500;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.scripts__name-meta {
+  flex: 0 0 auto; font-size: 9.5px; color: var(--text-muted);
+  font-family: 'JetBrains Mono', monospace;
+  opacity: 0; transition: opacity 120ms ease;
+}
+.scripts__row:hover .scripts__name-meta { opacity: 1; }
+/* Run stays visible: it is the whole point of the panel, and hiding the
+   primary action behind hover made the list read as a passive file listing.
+   Delete is destructive and stays on hover. */
+.scripts__row-actions { flex: 0 0 auto; display: flex; gap: 4px; align-items: center; }
+.scripts__row-actions .scripts__btn--primary { opacity: .55; transition: opacity 120ms ease; }
+.scripts__row:hover .scripts__row-actions .scripts__btn--primary,
+.scripts__row:focus-within .scripts__row-actions .scripts__btn--primary { opacity: 1; }
+.scripts__row-actions .scripts__btn--danger { opacity: 0; transition: opacity 120ms ease; }
+.scripts__row:hover .scripts__row-actions .scripts__btn--danger,
+.scripts__row:focus-within .scripts__row-actions .scripts__btn--danger { opacity: 1; }
+
+.scripts__output {
+  flex: 0 0 auto; max-height: 44%;
+  display: flex; flex-direction: column; min-height: 0;
+  border-top: 1px solid var(--border-default); background: #0e1013;
+}
+.scripts__output-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 7px 10px 7px 12px;
+  font-size: 10.5px; font-weight: 600; color: #b9c0cc;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.scripts__output-pre {
+  flex: 1 1 auto; min-height: 0; overflow: auto;
+  margin: 0; padding: 9px 12px 12px;
+  font-family: 'JetBrains Mono', monospace; font-size: 10.5px; line-height: 1.5;
+  color: #a8b0bd; white-space: pre-wrap; word-break: break-word;
+  user-select: text;
+}
+
+/* Test View lost its in-canvas right panel on Aug 13 (scripts moved to the
+   sidebar), so the game frame now centres in the full canvas width instead of
+   being pushed left by a 50%-wide list. */
+.testview { justify-content: center; position: relative; }
+.testview__tools {
+  position: absolute; top: 12px; right: 14px; z-index: 4;
+  display: flex; gap: 6px;
+  padding: 5px; border-radius: 9px;
+  background: rgba(14,16,19,.82);
+  border: 1px solid var(--border-default);
+  backdrop-filter: blur(8px);
+  opacity: .38; transition: opacity 140ms ease;
+}
+.testview:hover .testview__tools, .testview__tools:focus-within { opacity: 1; }
