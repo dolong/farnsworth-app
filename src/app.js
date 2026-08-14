@@ -3660,17 +3660,9 @@ function prodApplyStatus(status) {
   if (label) label.textContent = state.prod.status.state || 'stopped';
   const url = document.getElementById('prod-runtime-url');
   if (url) url.textContent = state.prod.status.url || state.prod.url;
-  const health = document.getElementById('prod-health-json');
-  if (health) health.textContent = JSON.stringify({
-    engine: state.prod.status.engine || 'agent-browser',
-    headed: state.prod.status.headed !== false,
-    url: state.prod.status.url || null,
-    title: state.prod.status.title || null,
-    viewport: state.prod.status.viewport || null,
-    navigatorWebdriver: state.prod.status.webdriver,
-    frame: state.prod.status.frame || null,
-    error: state.prod.status.error || null,
-  }, null, 2);
+  // Runtime health used to be written into a <pre> in the Prod canvas. That
+  // panel is gone; the Scripts sidebar's profile modal reads state.prod.status
+  // directly when opened, so there is nothing to push to here.
 }
 async function prodLoadProfiles(start = true) {
   if (state.prod.loadingProfiles) return;
@@ -3735,13 +3727,11 @@ function renderProdView(autoStart = true) {
       </div>
       <div class="prod__browser-foot"><span id="prod-runtime-url">${escapeHtml(state.prod.status?.url || state.prod.url)}</span><span id="prod-frame-dims">${state.prod.frameWidth ? `${state.prod.frameWidth} × ${state.prod.frameHeight}` : 'waiting for frame'}</span></div>
     </section>
-    <aside class="prod__panel">
-      <div class="prod__panel-head"><div><span class="prod__eyebrow">IDENTITIES</span><h3>Production profiles</h3></div><span class="prod__headed">Headed Chrome</span></div>
-      <div class="prod__profiles" id="prod-profiles">${state.prod.profiles.map((p) => `<button class="prod__profile ${p.id === state.prod.selectedId ? 'is-active' : ''}" data-prod-profile="${escapeHtml(p.id)}"><strong>${escapeHtml(p.label)}</strong><span>${escapeHtml(p.mode)} · ${escapeHtml(p.metadata?.sourceName || 'managed')}</span></button>`).join('') || '<div class="prod__loading">Loading profiles…</div>'}</div>
-      <div class="prod__settings"><div class="prod__section-title">Safe JSON settings</div><pre id="prod-profile-json">${escapeHtml(JSON.stringify(meta, null, 2))}</pre></div>
-      <div class="prod__settings"><div class="prod__section-title">Runtime health</div><pre id="prod-health-json">${escapeHtml(JSON.stringify({ engine: state.prod.status?.engine || 'agent-browser', headed: true, url: state.prod.status?.url || null, title: state.prod.status?.title || null, viewport: state.prod.status?.viewport || null, navigatorWebdriver: state.prod.status?.webdriver, frame: state.prod.status?.frame || null, error: state.prod.status?.error || null }, null, 2))}</pre></div>
-      <form class="prod__create" id="prod-create-form"><div class="prod__section-title">Create profile</div><input name="label" placeholder="Profile name" required /><select name="mode"><option value="profile">Persistent Chrome profile</option><option value="state">Import saved-state JSON…</option></select><button class="prod__btn prod__btn--primary" type="submit">Create</button></form>
-    </aside>`;
+    <!-- The identities panel (profiles + safe JSON + runtime health + create
+         form) moved to the right sidebar's Scripts tab on Aug 13. It held a
+         permanent third of the Prod canvas for a setting touched once a
+         session, squeezing the actual Reddit mirror. Profiles now sit above
+         Scripts in the sidebar and open their JSON in a modal. -->`;
   const browser = wrap.querySelector('#prod-browser');
   const normalized = (e) => { const r = browser.getBoundingClientRect(); return { nx: (e.clientX-r.left)/r.width, ny: (e.clientY-r.top)/r.height }; };
   browser.addEventListener('click', (e) => { browser.focus(); window.farnsworth?.prodSessionInput?.({ kind: 'click', ...normalized(e) }); });
@@ -3749,8 +3739,6 @@ function renderProdView(autoStart = true) {
   browser.addEventListener('keydown', (e) => { e.preventDefault(); window.farnsworth?.prodSessionInput?.({ kind: 'key', key: e.key, code: e.code, modifiers: (e.altKey?1:0)|(e.ctrlKey?2:0)|(e.metaKey?4:0)|(e.shiftKey?8:0) }); });
   wrap.querySelector('#prod-open')?.addEventListener('click', async () => { state.prod.url = wrap.querySelector('#prod-url').value.trim() || state.prod.url; await window.farnsworth?.prodSessionStop?.('navigate'); state.prod.status = { running:false,state:'stopped' }; prodStartSelected(); });
   wrap.querySelector('#prod-stop')?.addEventListener('click', async () => { await window.farnsworth?.prodSessionStop?.('operator'); prodApplyStatus({ running:false,state:'stopped' }); });
-  wrap.querySelectorAll('[data-prod-profile]').forEach((b) => b.addEventListener('click', async () => { state.prod.selectedId = b.dataset.prodProfile; await window.farnsworth?.prodSessionStop?.('identity-switch'); state.prod.status={running:false,state:'stopped'}; const stage=document.getElementById('canvas-stage'); if(stage){stage.innerHTML='';stage.appendChild(renderProdView(false));} prodStartSelected(); }));
-  wrap.querySelector('#prod-create-form')?.addEventListener('submit', (e) => { e.preventDefault(); prodCreateProfile(e.currentTarget); });
 
   // The Prod scripts list, Run button and output moved to the right sidebar's
   // Scripts tab on Aug 13. It listed exactly the same
@@ -4808,11 +4796,20 @@ function renderScriptsPanel() {
       </div>
       <button class="scripts__btn scripts__btn--ghost scripts__appview" id="scripts-app-open" ${isProd ? '' : 'hidden'} title="Click the post into its interactive app view (required before running)">Open app view</button>
     </div>
+    <div class="scripts__profiles" id="scripts-profiles">
+      <div class="scripts__subhead">
+        <span class="scripts__subtitle">Profiles</span>
+        <button class="scripts__btn scripts__btn--ghost scripts__btn--mini" id="scripts-profile-new" title="Create a production profile">+</button>
+      </div>
+      <div class="scripts__profile-list" id="scripts-profile-list"><div class="scripts__empty scripts__empty--tight">Loading profiles…</div></div>
+    </div>
+    <div class="scripts__subhead scripts__subhead--list"><span class="scripts__subtitle">Scripts</span></div>
     <div class="scripts__list" id="scripts-list"><div class="scripts__empty">Loading scripts…</div></div>
     <div class="scripts__output" id="scripts-output" hidden></div>
   `;
 
-  wrap.querySelector('#scripts-refresh')?.addEventListener('click', () => loadScriptsPanel(wrap));
+  wrap.querySelector('#scripts-refresh')?.addEventListener('click', () => { loadScriptsPanel(wrap); loadScriptsProfiles(wrap); });
+  wrap.querySelector('#scripts-profile-new')?.addEventListener('click', () => createProfileFromPanel(wrap));
   wrap.querySelector('#scripts-new')?.addEventListener('click', () => newScriptFromPanel(wrap));
   wrap.querySelector('#scripts-app-open')?.addEventListener('click', async (e) => {
     const btn = e.currentTarget; btn.disabled = true;
@@ -4841,7 +4838,142 @@ function renderScriptsPanel() {
   }
 
   loadScriptsPanel(wrap);
+  loadScriptsProfiles(wrap);
   return wrap;
+}
+
+// ─── Profiles (moved out of the in-canvas Prod panel, Aug 13) ────────────────
+// Which Reddit identity Prod runs as. It sits above Scripts because it is the
+// upstream choice: the profile decides WHO a Prod script runs as. It used to
+// occupy a permanent third of the Prod canvas alongside two JSON dumps, for a
+// setting touched about once a session. Clicking a profile opens its details in
+// a modal; switching identity is an explicit button in there, not a side effect
+// of the click, because switching tears down the running browser session.
+async function loadScriptsProfiles(wrap) {
+  const list = wrap.querySelector('#scripts-profile-list');
+  if (!list) return;
+  if (!state.prod.profiles.length && !state.prod.loadingProfiles) {
+    try {
+      const res = await window.farnsworth?.prodProfileList?.();
+      if (res?.ok) {
+        state.prod.profiles = res.profiles || [];
+        if (!state.prod.profiles.some((p) => p.id === state.prod.selectedId)) {
+          state.prod.selectedId = state.prod.profiles[0]?.id || null;
+        }
+      }
+    } catch { /* leave the empty state below */ }
+  }
+  renderScriptsProfiles(wrap);
+}
+
+function renderScriptsProfiles(wrap) {
+  const list = wrap.querySelector('#scripts-profile-list');
+  if (!list) return;
+  const profiles = state.prod.profiles || [];
+  if (!profiles.length) {
+    list.innerHTML = '<div class="scripts__empty scripts__empty--tight">No production profiles yet.</div>';
+    return;
+  }
+  list.innerHTML = '';
+  for (const p of profiles) {
+    const active = p.id === state.prod.selectedId;
+    const row = el('button', { class: `scripts__profile${active ? ' is-active' : ''}`, 'data-profile': p.id, title: 'View profile details' });
+    row.innerHTML = `
+      <span class="scripts__profile-dot" aria-hidden="true"></span>
+      <span class="scripts__profile-text">
+        <span class="scripts__profile-name">${escapeHtml(p.label || p.id)}</span>
+        <span class="scripts__profile-meta">${escapeHtml(p.mode || 'profile')}${p.username ? ` · ${escapeHtml(p.username)}` : ''}</span>
+      </span>
+      ${active ? '<span class="scripts__profile-badge">active</span>' : ''}
+    `;
+    row.addEventListener('click', () => openProfileModal(wrap, p.id));
+    list.appendChild(row);
+  }
+}
+
+// Profile details modal: the safe JSON metadata and runtime health that used to
+// be two permanently-mounted <pre> blocks in the Prod canvas. Runtime health is
+// only rendered for the profile actually running, since it describes the live
+// session, not the profile record.
+function openProfileModal(wrap, profileId) {
+  const p = (state.prod.profiles || []).find((x) => x.id === profileId);
+  if (!p) return;
+  const isActive = p.id === state.prod.selectedId;
+  const running = isActive && state.prod.status?.running;
+  const meta = prodSafeMetadata(p);
+  const health = {
+    engine: state.prod.status?.engine || 'agent-browser',
+    headed: true,
+    url: state.prod.status?.url || null,
+    title: state.prod.status?.title || null,
+    viewport: state.prod.status?.viewport || null,
+    navigatorWebdriver: state.prod.status?.webdriver,
+    frame: state.prod.status?.frame || null,
+    error: state.prod.status?.error || null,
+  };
+
+  document.getElementById('profile-modal')?.remove();
+  const overlay = el('div', { class: 'search-overlay', id: 'profile-modal' });
+  overlay.innerHTML = `
+    <div class="search-overlay__panel profile-modal__panel">
+      <div class="profile-modal__head">
+        <div>
+          <span class="scripts__subtitle">Production profile</span>
+          <h3 class="profile-modal__title">${escapeHtml(p.label || p.id)}</h3>
+        </div>
+        <button class="profile-modal__close" id="profile-modal-close" aria-label="Close">×</button>
+      </div>
+      <div class="profile-modal__body">
+        <div class="profile-modal__section">
+          <div class="scripts__subtitle">Safe JSON settings</div>
+          <pre class="profile-modal__pre">${escapeHtml(JSON.stringify(meta, null, 2))}</pre>
+        </div>
+        <div class="profile-modal__section">
+          <div class="scripts__subtitle">Runtime health${running ? '' : ' <span class="profile-modal__dim">(not the running session)</span>'}</div>
+          <pre class="profile-modal__pre">${escapeHtml(running ? JSON.stringify(health, null, 2) : 'This profile is not the running Prod session.')}</pre>
+        </div>
+      </div>
+      <div class="profile-modal__foot">
+        <span class="profile-modal__dim">${isActive ? 'This is the selected identity.' : 'Switching restarts the Prod browser session.'}</span>
+        <div class="profile-modal__foot-actions">
+          <button class="scripts__btn scripts__btn--ghost" id="profile-modal-cancel">Close</button>
+          ${isActive ? '' : '<button class="scripts__btn scripts__btn--accent" id="profile-modal-use">Use this profile</button>'}
+        </div>
+      </div>
+    </div>
+  `;
+  const close = () => { overlay.remove(); document.removeEventListener('keydown', onKey); };
+  const onKey = (e) => { if (e.key === 'Escape') close(); };
+  document.addEventListener('keydown', onKey);
+  overlay.addEventListener('mousedown', (e) => { if (e.target === overlay) close(); });
+  overlay.querySelector('#profile-modal-close')?.addEventListener('click', close);
+  overlay.querySelector('#profile-modal-cancel')?.addEventListener('click', close);
+  overlay.querySelector('#profile-modal-use')?.addEventListener('click', async () => {
+    close();
+    state.prod.selectedId = p.id;
+    renderScriptsProfiles(wrap);
+    // Only touch the browser session if Prod is actually on screen. Switching
+    // identity from Test View should record the choice, not launch Chrome.
+    if (state.canvasMode === 'prod') {
+      await window.farnsworth?.prodSessionStop?.('identity-switch');
+      state.prod.status = { running: false, state: 'stopped' };
+      const stage = document.getElementById('canvas-stage');
+      if (stage) { stage.innerHTML = ''; stage.appendChild(renderProdView(false)); }
+      prodStartSelected();
+    }
+  });
+  document.body.appendChild(overlay);
+}
+
+async function createProfileFromPanel(wrap) {
+  const label = prompt('Profile name:');
+  if (!label || !label.trim()) return;
+  // Reuse prodCreateProfile verbatim rather than re-implementing the IPC call:
+  // it owns the saved-state import dialog and the canceled-vs-failed handling.
+  const form = el('form');
+  form.innerHTML = `<input name="label" value="${escapeHtml(label.trim())}" /><select name="mode"><option value="profile" selected></option></select><button type="submit"></button>`;
+  await prodCreateProfile(form);
+  renderScriptsProfiles(wrap);
 }
 
 // The Run button means two very different things depending on canvas mode, so
