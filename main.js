@@ -5361,7 +5361,12 @@ ipcMain.handle('fs:listFiles', async (_event, folderPath, opts = {}) => {
   if (!folderPath) return { ok: false, error: 'missing_args' };
   const maxDepth = opts.maxDepth || 8;
   const maxEntries = opts.maxEntries || 20000;
-  const skipDirs = new Set(['node_modules', '.git', '.farnsworth', 'dist', 'build', 'coverage', '.next', '.cache', '.DS_Store']);
+  // `.farnsworth` is deliberately NOT skipped: it holds the project's test
+  // scripts (.farnsworth/devvit-tests/*.json), which are real source files the
+  // user edits. Excluding it made them invisible to quick-open, so the only
+  // way to reach a script was expanding two levels of the file tree. It is a
+  // small directory (config + test JSON), not a cache.
+  const skipDirs = new Set(['node_modules', '.git', 'dist', 'build', 'coverage', '.next', '.cache', '.DS_Store']);
   const files = [];
   let truncated = false;
   async function walk(dir, depth) {
@@ -5371,7 +5376,9 @@ ipcMain.handle('fs:listFiles', async (_event, folderPath, opts = {}) => {
     catch { return; }
     for (const ent of entries) {
       if (files.length >= maxEntries) { truncated = true; return; }
-      if (ent.name.startsWith('.') && ent.name !== '.env' && !opts.includeHidden) continue;
+      // `.farnsworth` is allowed through the dotfile filter for the same
+      // reason it is not in skipDirs: it contains editable test scripts.
+      if (ent.name.startsWith('.') && ent.name !== '.env' && ent.name !== '.farnsworth' && !opts.includeHidden) continue;
       if (skipDirs.has(ent.name)) continue;
       const full = path.join(dir, ent.name);
       const rel = full.startsWith(folderPath) ? full.slice(folderPath.length + 1) : full;
