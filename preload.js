@@ -227,7 +227,16 @@ contextBridge.exposeInMainWorld('farnsworth', {
 
   // Test scripts (NLP test creator, Jul 10 ~23:50 ET)
   testSave: ({ folder, name, json }) => ipcRenderer.invoke('test:save', { folder, name, json }),
-  testRun: ({ path }) => ipcRenderer.invoke('test:run', { path }),
+  // record: true/false forces recording for this run; omit to follow the
+  // Test View Record toggle (setting key 'test.record', default on).
+  testRun: ({ path, record }) => ipcRenderer.invoke('test:run', { path, record }),
+  testRecordingsList: ({ folder, limit } = {}) => ipcRenderer.invoke('test:recordings:list', { folder, limit }),
+  testRecordingsOpen: ({ folder, path, reveal } = {}) => ipcRenderer.invoke('test:recordings:open', { folder, path, reveal }),
+  onTestRecordChanged: (cb) => {
+    const h = (_e, payload) => cb(payload);
+    ipcRenderer.on('test:record:changed', h);
+    return () => ipcRenderer.removeListener('test:record:changed', h);
+  },
   testList: ({ folder } = {}) => ipcRenderer.invoke('test:list', { folder }),
   testRead: ({ folder, name }) => ipcRenderer.invoke('test:read', { folder, name }),
   testDelete: ({ folder, name }) => ipcRenderer.invoke('test:delete', { folder, name }),

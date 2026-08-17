@@ -1249,7 +1249,7 @@ function renderMessage(m) {
       iconSvg.setAttribute('class', 'chip__icon');
       iconSvg.setAttribute('viewBox', '0 0 24 24');
       iconSvg.setAttribute('fill', 'none');
-      iconSvg.setAttribute('stroke', c.kind === 'read' ? '#3ab7f0' : c.kind === 'search' ? '#f0b232' : c.kind === 'edit' ? '#eb459e' : c.kind === 'terminal' ? '#7e6bff' : c.kind === 'settings' ? '#fbbf24' : '#3ba55c');
+      iconSvg.setAttribute('stroke', c.kind === 'read' ? '#3ab7f0' : c.kind === 'search' ? '#f0b232' : c.kind === 'edit' ? '#eb459e' : c.kind === 'terminal' ? '#7e6bff' : c.kind === 'settings' ? '#fbbf24' : c.kind === 'video' ? '#ff5c5c' : '#3ba55c');
       iconSvg.setAttribute('stroke-width', '2');
       iconSvg.setAttribute('stroke-linecap', 'round');
       iconSvg.setAttribute('stroke-linejoin', 'round');
@@ -1258,6 +1258,9 @@ function renderMessage(m) {
       else if (c.kind === 'edit') iconSvg.innerHTML = '<path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/>';
       else if (c.kind === 'terminal') {
         iconSvg.innerHTML = '<path d="M4 17l6-6-6-6M12 19h8"/>';
+      } else if (c.kind === 'video') {
+        // Play triangle in a rounded frame — a recorded test run.
+        iconSvg.innerHTML = '<rect x="2.5" y="5" width="19" height="14" rx="2.5"/><path d="M10.5 9.2l4.6 2.8-4.6 2.8z"/>';
       } else if (c.kind === 'settings') {
         // Cogwheel — matches the Farnsworth settings cog in the Live cogwheel popover
         iconSvg.innerHTML = '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>';
@@ -1274,6 +1277,12 @@ function renderMessage(m) {
         chip.addEventListener('click', () => runPendingGitCommit(m));
       } else if (c.action === 'git-commit-cancel') {
         chip.addEventListener('click', () => cancelPendingGitCommit(m));
+      } else if (c.action === 'open-recording') {
+        // Recorded test run — open the .webm in the OS video player.
+        chip.addEventListener('click', async () => {
+          const res = await window.farnsworth?.testRecordingsOpen?.({ path: c.recordingPath });
+          if (res && !res.ok) console.warn('[chat] could not open recording:', res.error);
+        });
       }
 
       // For terminal chips, open a centered modal on click (Vellum pattern).
@@ -4492,6 +4501,10 @@ function renderTestView() {
   // itself, which now gets the full canvas width, and Reset Game.
   const tools = el('div', { class: 'testview__tools' });
   tools.innerHTML = `
+    <button class="testview__btn testview__btn--record" id="testview-record" title="Record test runs to video with a burned-in step overlay">
+      <span class="testview__rec-dot"></span><span class="testview__rec-label">Record</span>
+    </button>
+    <button class="testview__btn testview__btn--ghost" id="testview-recordings" title="Open the recordings folder (<project>/.farnsworth/recordings)">Recordings…</button>
     <button class="testview__btn testview__btn--primary" id="testview-reset-game" title="Reload the game WebContentsView to a fresh instance">Reset Game</button>
     <button class="testview__btn testview__btn--ghost" id="testview-open-scripts" title="Open the Scripts panel in the sidebar">Scripts…</button>
   `;
@@ -4502,9 +4515,51 @@ function renderTestView() {
     tools.querySelector('#testview-open-scripts')?.addEventListener('click', () => {
       document.querySelector('.righttab[data-tab="scripts"]')?.click();
     });
+
+    // Record toggle — the persisted 'test.record' setting main.js reads before
+    // every Node-runner run. Default is ON, so an absent row means on.
+    const recBtn = tools.querySelector('#testview-record');
+    if (recBtn) {
+      paintTestRecordButton(recBtn, state.testRecordEnabled !== false);
+      window.farnsworth?.getSetting?.('test.record').then((v) => {
+        state.testRecordEnabled = !(v === '0' || v === 'false');
+        paintTestRecordButton(recBtn, state.testRecordEnabled);
+      }).catch(() => {});
+      recBtn.addEventListener('click', async () => {
+        const next = !(state.testRecordEnabled !== false);
+        state.testRecordEnabled = next;
+        paintTestRecordButton(recBtn, next);
+        await window.farnsworth?.setSetting?.('test.record', next ? '1' : '0');
+      });
+      // Chat can flip the same toggle via set_test_recording — keep the button
+      // honest instead of showing a stale state until the next re-render.
+      if (!state._testRecordUnsub && window.farnsworth?.onTestRecordChanged) {
+        state._testRecordUnsub = window.farnsworth.onTestRecordChanged(({ enabled }) => {
+          state.testRecordEnabled = !!enabled;
+          const live = document.querySelector('#testview-record');
+          if (live) paintTestRecordButton(live, !!enabled);
+        });
+      }
+    }
+
+    tools.querySelector('#testview-recordings')?.addEventListener('click', async () => {
+      const res = await window.farnsworth?.testRecordingsOpen?.({ folder: state.folder });
+      if (res && !res.ok) console.warn('[testview] could not open recordings folder:', res.error);
+    });
   });
 
   return wrap;
+}
+
+// Record-toggle button paint. Kept out of renderTestView so the chat-driven
+// change listener can repaint the live button without a full canvas re-render.
+function paintTestRecordButton(btn, on) {
+  btn.classList.toggle('testview__btn--record-on', !!on);
+  const label = btn.querySelector('.testview__rec-label');
+  if (label) label.textContent = on ? 'Record: on' : 'Record: off';
+  btn.title = on
+    ? 'Test runs are recorded to <project>/.farnsworth/recordings with a burned-in step overlay. Click to stop recording runs.'
+    : 'Test runs are not being recorded. Click to record every run to video.';
 }
 
 // The Test View list / inline editor / output functions lived here until
@@ -12651,7 +12706,12 @@ async function sendChatMessage(opts) {
           '- test_list() — list all tests in the active workspace\'s .farnsworth/devvit-tests/',
           '- test_read(name) — read a test JSON file by name',
           '- test_save(name, json) — save a test JSON file (validates JSON first)',
-          '- test_run(path) — run a test (path is ABSOLUTE, not relative — get it from test_list or test_save)',
+          '- test_run(path, record?) — run a test (path is ABSOLUTE, not relative — get it from test_list or test_save). Runs are recorded to video by default; pass record:true/false to force it on or off for this run.',
+          '- test_recordings_list(limit?) — list recorded run videos for this workspace (newest first) from .farnsworth/recordings/',
+          '- open_recordings_folder(path?) — reveal the recordings folder in Finder, or one specific .webm',
+          '- set_test_recording(enabled) — turn default test-run recording on or off (same toggle as the Record button in Test View)',
+          '',
+          '**Recording test runs:** a recorded run returns a `video` object with the .webm path. The video has a burned-in overlay showing each step number, action, selector, elapsed time and pass/fail state, so it is a real artifact — ALWAYS give the user the full path when one comes back, and offer to reveal it with open_recordings_folder. Recording only works on the Node runner path: tests containing `switchUser` or `llm-step` run under Python and cannot be recorded, so say so plainly instead of claiming a video exists. Recording needs an active Test View / mobile / desktop game preview to capture.',
           '',
           '- take_canvas_screenshot(filename?) — capture the active canvas preview as a PNG and return the image so you can SEE what the app looks like right now. Use before writing tests (to discover selectors), after code changes (to verify the result), or any time the user asks what the app currently looks like. Returns the image directly.',
           '',
@@ -12945,12 +13005,34 @@ async function sendChatMessage(opts) {
             // missing dep); error alone is just a machine-readable slug.
             resultContent = `Error: ${toolRes.message || toolRes.error}`;
           } else {
-            resultContent = `Exit ${toolRes.code}, ${toolRes.failed || 0} failed\n\nSTDOUT:\n${toolRes.stdout || '(empty)'}\n\nSTDERR:\n${toolRes.stderr || '(empty)'}`;
+            const vid = toolRes.video?.path
+              ? `\n\nVIDEO: ${toolRes.video.path} (${Math.round((toolRes.video.bytes || 0) / 1024)}KB, ${((toolRes.video.durationMs || 0) / 1000).toFixed(1)}s). Give the user this path.`
+              : '';
+            resultContent = `Exit ${toolRes.code}, ${toolRes.failed || 0} failed\n\nSTDOUT:\n${toolRes.stdout || '(empty)'}\n\nSTDERR:\n${toolRes.stderr || '(empty)'}${vid}`;
+          }
+          // A recorded run gets a clickable chip so the video is one click
+          // away instead of a path the user has to copy into Finder.
+          if (toolRes.video?.path) {
+            const recChips = [...(agentMsg.chips || []), {
+              label: `Watch recording — ${toolRes.video.path.split('/').pop()}`,
+              kind: 'video',
+              action: 'open-recording',
+              recordingPath: toolRes.video.path,
+            }];
+            updateAgentMsg({ chips: recChips });
           }
         } else if (!toolRes.ok) {
           resultContent = `Error: ${toolRes.message || toolRes.error || 'tool failed'}`;
         } else if (tu.name === 'test_list') {
           resultContent = JSON.stringify(toolRes.tests || [], null, 2);
+        } else if (tu.name === 'test_recordings_list') {
+          resultContent = (toolRes.recordings || []).length
+            ? JSON.stringify(toolRes.recordings, null, 2)
+            : `No recordings yet in ${toolRes.dir}`;
+        } else if (tu.name === 'open_recordings_folder') {
+          resultContent = `Revealed ${toolRes.path} in Finder`;
+        } else if (tu.name === 'set_test_recording') {
+          resultContent = `Test-run recording is now ${toolRes.enabled ? 'ON' : 'OFF'}${toolRes.note ? ' — ' + toolRes.note : ''}`;
         } else if (tu.name === 'test_read') {
           resultContent = toolRes.json || '(empty)';
         } else if (tu.name === 'test_save') {

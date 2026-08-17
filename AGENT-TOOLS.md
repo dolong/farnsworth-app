@@ -6,7 +6,7 @@ Living spec for the Farnsworth chat agent tool design space.
 
 ---
 
-## Current tools (24)
+## Current tools (27)
 
 ### File system
 
@@ -68,7 +68,18 @@ so the agent path and the UI path cannot drift.
 | `test_list` | List JSON tests in `<project>/.farnsworth/devvit-tests/`. |
 | `test_read(name)` | Read a test file. Returns raw JSON string. |
 | `test_save(name, json)` | Write + validate a test file. Name normalized to lowercase-dashes. |
-| `test_run(path)` | Run a test via `farnsworth-test.py` (CDP). Returns stdout/stderr/exitCode/failed count. |
+| `test_run(path, record?)` | Run a test. Shares `runTestByPath` with the `test:run` IPC: Node-native runner first (recordable), Python `farnsworth-test.py` fallback for `switchUser` / `llm-step`. Returns stdout/stderr/exitCode/failed count plus a `video` object when the run was recorded. `record` overrides the Test View toggle for this run only. |
+| `test_recordings_list(limit?)` | List recorded run videos in `<project>/.farnsworth/recordings/`, newest first: path, source test, size, mtime. |
+| `open_recordings_folder(path?)` | Reveal the recordings folder in Finder, or one specific `.webm`. Uses `/usr/bin/open -R` to avoid the AppleEvents TCC prompt. |
+| `set_test_recording(enabled)` | Flip the persisted default-recording toggle (`test.record`). Same state as the Record button in Test View; broadcasts `test:record:changed` so the button repaints. |
+
+**Recording (Aug 17).** Runs record to `<project>/.farnsworth/recordings/<test>_<stamp>.webm`
+with a burned-in overlay (step index/total, action, selector, elapsed clock, pass/fail).
+Precedence is per-run `record` -> `FARNSWORTH_TEST_RECORD` env -> `test.record` setting
+-> on. Boundaries: WCV previews only (a game preview must be live), Node runner path
+only, and a capture failure never fails the test. The agent tool and the Test View
+button share one implementation so they cannot drift.
+
 
 ### Memory
 
@@ -110,6 +121,8 @@ so the agent path and the UI path cannot drift.
 ### Testing (gaps)
 - `run_all_tests` — run every test in the project; return pass/fail counts
 - `get_last_test_results` — return cached stdout from the last test_run
+- `delete_recording(path)` / recordings retention — nothing prunes `.farnsworth/recordings/` today
+- Prod-mode recording — Prod is a DOM mirror of an external Chrome screencast, so it needs a separate CDP `Page.startScreencast` + ffmpeg path
 
 ### Memory (gaps)
 - `search_pkb` — full-text search the project knowledge base (FTS5 codebase index)

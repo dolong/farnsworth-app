@@ -5973,6 +5973,22 @@ pre:hover .code-copy { opacity: 1; }
   background: transparent;
   border-color: #3a3d44;
 }
+/* Record toggle — off is a hollow dot, on is a filled red dot with a soft glow
+   so the recording state reads at a glance from across the canvas. */
+.testview__btn--record { display: inline-flex; align-items: center; gap: 6px; }
+.testview__rec-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  border: 1.5px solid #8b9099; background: transparent;
+  flex: 0 0 auto;
+}
+.testview__btn--record-on {
+  border-color: #ff5c5c;
+  color: #ffd9d9;
+}
+.testview__btn--record-on .testview__rec-dot {
+  background: #ff3b3b; border-color: #ff3b3b;
+  box-shadow: 0 0 6px rgba(255,59,59,.75);
+}
 
 .testview__list {
   flex: 0 1 auto;

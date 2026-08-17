@@ -2415,6 +2415,84 @@ function canvasRecordingDirForTest(testPath) {
   return path.join(path.dirname(path.dirname(testPath)), 'recordings');
 }
 
+// <project> -> <project>/.farnsworth/recordings. Separate from the per-test
+// resolver above because the UI and the agent tools ask by workspace folder,
+// not by test file.
+function canvasRecordingsDirForFolder(folder) {
+  const testsDir = resolveTestScriptsDir(folder);
+  if (!testsDir) return null;
+  return path.join(path.dirname(testsDir), 'recordings');
+}
+
+// Precedence: an explicit per-run override wins, then the FARNSWORTH_TEST_RECORD
+// env override (either direction), then the persisted Test View toggle, which
+// defaults to on. Every caller of the recorder goes through this so the button,
+// the agent tool and the env var can never disagree.
+const TEST_RECORD_SETTING_KEY = 'test.record';
+function testRecordingEnabled(override) {
+  if (override === true || override === false) return override;
+  if (process.env.FARNSWORTH_TEST_RECORD === '0') return false;
+  if (process.env.FARNSWORTH_TEST_RECORD === '1') return true;
+  let stored = null;
+  try { stored = db.getSetting(scopedSettingKey(TEST_RECORD_SETTING_KEY)); } catch {}
+  if (stored === '0' || stored === 'false') return false;
+  return true;
+}
+
+async function listTestRecordings(folder, limit = 25) {
+  const dir = canvasRecordingsDirForFolder(folder);
+  if (!dir) return { ok: false, error: 'no_folder', message: 'No workspace folder open. Open a folder first.' };
+  let entries = [];
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch (e) {
+    if (e.code === 'ENOENT') return { ok: true, dir, recordings: [] };
+    return { ok: false, error: e.message, dir };
+  }
+  const out = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || !/\.webm$/i.test(entry.name)) continue;
+    const filePath = path.join(dir, entry.name);
+    let stat;
+    try { stat = await fs.stat(filePath); } catch { continue; }
+    out.push({
+      name: entry.name,
+      path: filePath,
+      // recordings are named <test>_<iso-stamp>.webm
+      test: entry.name.replace(/\.webm$/i, '').replace(/_\d{4}-\d{2}-\d{2}T[\d-]+$/, ''),
+      size: stat.size,
+      modified: stat.mtimeMs,
+    });
+  }
+  out.sort((a, b) => b.modified - a.modified);
+  return { ok: true, dir, recordings: out.slice(0, Math.max(1, Number(limit) || 25)) };
+}
+
+// Opens a recording (or the recordings folder) in the OS. `/usr/bin/open -R`
+// for a file so Finder reveals it without tripping the AppleEvents TCC prompt
+// that shell.showItemInFolder() raises; shell.openPath for a bare folder.
+async function openTestRecordingTarget({ folder, path: target, reveal } = {}) {
+  let dest = target && typeof target === 'string' ? target : null;
+  if (!dest) {
+    dest = canvasRecordingsDirForFolder(folder);
+    if (!dest) return { ok: false, error: 'no_folder', message: 'No workspace folder open. Open a folder first.' };
+    await fs.mkdir(dest, { recursive: true }).catch(() => {});
+  }
+  try { await fs.access(dest); } catch { return { ok: false, error: 'not_found', path: dest }; }
+  let isDir = false;
+  try { isDir = (await fs.stat(dest)).isDirectory(); } catch {}
+  if (isDir || reveal) {
+    return await new Promise((resolve) => {
+      require('child_process').execFile('/usr/bin/open', isDir ? [dest] : ['-R', dest], (err) => {
+        resolve(err ? { ok: false, error: err.message, path: dest } : { ok: true, path: dest, revealed: !isDir });
+      });
+    });
+  }
+  const err = await shell.openPath(dest);
+  if (err) return { ok: false, error: err, path: dest };
+  return { ok: true, path: dest, opened: true };
+}
+
 function describeTestStep(step) {
   if (!step || typeof step !== 'object') return '';
   const bits = [];
@@ -3938,7 +4016,7 @@ function recursivelyHasUnsupportedAction(steps, unsupportedSet) {
 // stdout, stderr} result on success, or null if the test isn't eligible
 // (unsupported action present, no canvas preview, module unavailable, or the
 // run itself threw) — null means "fall back to the Python runner below".
-async function tryNodeTestRunner(testPath) {
+async function tryNodeTestRunner(testPath, opts = {}) {
   const mod = await getNodeTestRunner();
   if (!mod) return null;
 
@@ -3963,9 +4041,10 @@ async function tryNodeTestRunner(testPath) {
 
   const wc = view.webContents;
   let attachedHere = false;
-  // Recording is on by default; FARNSWORTH_TEST_RECORD=0 opts out. A capture
-  // failure must never fail the test, so every recording call is guarded.
-  const wantVideo = process.env.FARNSWORTH_TEST_RECORD !== '0';
+  // Recording is on by default and controlled by the Test View Record toggle
+  // (or a per-run override from the agent's test_run tool). A capture failure
+  // must never fail the test, so every recording call is guarded.
+  const wantVideo = testRecordingEnabled(opts.record);
   let videoPath = null;
   try {
     if (!wc.debugger.isAttached()) {
@@ -4028,18 +4107,21 @@ async function tryNodeTestRunner(testPath) {
   }
 }
 
-ipcMain.handle('test:run', async (_event, { path: testPath }) => {
-  // test:run takes an absolute test path (not a folder) — the renderer
-  // already knows the per-project dir from the test:list response, and
-  // passes the full path through. This lets the IPC work for tests that
-  // live anywhere, not just the active project's dir.
+// Single implementation behind both the test:run IPC and the chat agent's
+// test_run tool. Before Aug 17 the agent tool spawned the Python runner
+// directly, which meant an agent-driven run silently skipped the Node runner
+// AND the video recording that hangs off it — "run this test and record it"
+// could not work from chat. One path, one behaviour.
+// opts.record: true forces recording on, false forces it off, undefined
+// follows the Test View toggle.
+async function runTestByPath(testPath, opts = {}) {
   try {
     if (!testPath || typeof testPath !== 'string') return { ok: false, error: 'missing_path' };
 
     // Try the Node-native path first (no Python/websocket-client
     // dependency, no CDP-over-WebSocket hop). Falls through to the
     // existing Python runner untouched if not eligible or if it errors.
-    const nodeResult = await tryNodeTestRunner(testPath);
+    const nodeResult = await tryNodeTestRunner(testPath, { record: opts.record });
     if (nodeResult) {
       try {
         const rc = getRelayClient();
@@ -4132,7 +4214,22 @@ ipcMain.handle('test:run', async (_event, { path: testPath }) => {
   } catch (e) {
     return { ok: false, error: e.message };
   }
-});
+}
+
+// test:run takes an absolute test path (not a folder) — the renderer already
+// knows the per-project dir from the test:list response and passes the full
+// path through, so the IPC works for tests that live anywhere.
+ipcMain.handle('test:run', async (_event, { path: testPath, record } = {}) =>
+  runTestByPath(testPath, { record }));
+
+// Recordings: list them, and open the folder (or reveal one file) in Finder.
+// The Test View Record toggle itself rides the generic setting:get/setting:set
+// IPCs under the 'test.record' key — no dedicated channel needed.
+ipcMain.handle('test:recordings:list', async (_event, { folder, limit } = {}) =>
+  listTestRecordings(folder || currentFolderSetting(), limit));
+
+ipcMain.handle('test:recordings:open', async (_event, { folder, path: target, reveal } = {}) =>
+  openTestRecordingTarget({ folder: folder || currentFolderSetting(), path: target, reveal }));
 
 // Read a test JSON's contents (used by the Test View editor when the user
 // clicks Edit on a row — load the file's text into the editor textarea so
@@ -6549,13 +6646,45 @@ const AGENT_TOOLS = [
   },
   {
     name: 'test_run',
-    description: 'Run a test against the canvas WebContentsView. Takes the test\'s ABSOLUTE file path (not a name) — get it from test_list or test_save results. Returns stdout/stderr (last 4000/2000 chars), exit code, and a `failed` count parsed from the runner output.',
+    description: 'Run a test against the canvas WebContentsView. Takes the test\'s ABSOLUTE file path (not a name) — get it from test_list or test_save results. Returns stdout/stderr (last 4000/2000 chars), exit code, a `failed` count parsed from the runner output, and — when the run was recorded — a `video` object with the .webm path, byte size and duration. Recording is on by default: report the video path back to the user when one comes back.',
     input_schema: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: 'Absolute path to the test JSON file (e.g. /Users/long/Documents/lastdraft/the-last-draft/.farnsworth/devvit-tests/play-tab.json)' }
+        path: { type: 'string', description: 'Absolute path to the test JSON file (e.g. /Users/long/Documents/lastdraft/the-last-draft/.farnsworth/devvit-tests/play-tab.json)' },
+        record: { type: 'boolean', description: 'Optional per-run override for video recording. Omit to follow the Test View Record toggle (on by default). true = record this run even if the toggle is off; false = skip recording. Recording only applies to the Node runner path (tests using switchUser or llm-step run under Python and cannot be recorded).' }
       },
       required: ['path']
+    }
+  },
+  {
+    name: 'test_recordings_list',
+    description: 'List recorded test-run videos for the active workspace, newest first. Each entry has the .webm path, the test it came from, byte size, and modification time. Recordings live at <workspace>/.farnsworth/recordings/. Use this to answer "where is the recording" or to find the video from a previous run.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        limit: { type: 'number', description: 'Max recordings to return (default 25, newest first)' }
+      }
+    }
+  },
+  {
+    name: 'open_recordings_folder',
+    description: 'Reveal the workspace recordings folder in Finder, or reveal one specific recording when given its absolute path. Use when the user asks to see, open or watch a recording.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Optional absolute path to a specific .webm recording to reveal. Omit to open the recordings folder itself.' }
+      }
+    }
+  },
+  {
+    name: 'set_test_recording',
+    description: 'Turn the default test-run video recording on or off. This is the same toggle as the Record button in Test View and applies to every later run until changed. Use for "stop recording my test runs" or "record all test runs from now on". For a single run, pass `record` to test_run instead.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        enabled: { type: 'boolean', description: 'true to record test runs by default, false to stop recording' }
+      },
+      required: ['enabled']
     }
   },
   {
@@ -7013,38 +7142,38 @@ async function executeAgentTool(name, input, folderOverride) {
   if (name === 'test_run') {
     if (!input?.path || typeof input.path !== 'string') return { ok: false, error: 'missing_path' };
     if (!fsSync.existsSync(input.path)) return { ok: false, error: 'not_found', path: input.path };
-    // Same auth injection as the test:run IPC — llm-step direct-API fast path.
-    const llmAuth = await getValidAccessToken().catch(() => null);
-    const runnerEnv = { ...process.env };
-    if (llmAuth && llmAuth.token) {
-      runnerEnv.FARNSWORTH_AUTH_TOKEN = llmAuth.token;
-      runnerEnv.FARNSWORTH_AUTH_KIND = llmAuth.kind || 'api_key';
-    }
-    const testModel = testingModelApiId();
-    if (testModel) runnerEnv.FARNSWORTH_TEST_MODEL = testModel;
-    const launch = await spawnTestRunner(input.path, runnerEnv);
-    if (launch.error) return { ok: false, error: launch.error, message: launch.message };
-    return await new Promise((resolve) => {
-      const proc = launch.proc;
-      let stdout = '';
-      let stderr = '';
-      proc.stdout.on('data', d => stdout += d.toString());
-      proc.stderr.on('data', d => stderr += d.toString());
-      proc.on('close', code => {
-        const failedMatch = stdout.match(/(\d+)\s+failed/);
-        const failed = failedMatch ? Number(failedMatch[1]) : 0;
-        resolve({
-          ok: code === 0 && failed === 0,
-          code,
-          failed,
-          stdout: stdout.slice(-4000),
-          stderr: stderr.slice(-2000),
-        });
-      });
-      proc.on('error', err => {
-        resolve({ ok: false, error: err.code || 'spawn_error', message: err.message });
-      });
+    // Shares runTestByPath with the test:run IPC so an agent-driven run gets
+    // the Node runner, the companion test:state broadcasts and the video
+    // recording. `record` is a per-run override of the Test View toggle.
+    const record = typeof input.record === 'boolean' ? input.record : undefined;
+    return await runTestByPath(input.path, { record });
+  }
+  if (name === 'test_recordings_list') {
+    return await listTestRecordings(folder, input?.limit);
+  }
+  if (name === 'open_recordings_folder') {
+    return await openTestRecordingTarget({
+      folder,
+      path: typeof input?.path === 'string' && input.path.trim() ? input.path.trim() : null,
+      reveal: true,
     });
+  }
+  if (name === 'set_test_recording') {
+    if (typeof input?.enabled !== 'boolean') {
+      return { ok: false, error: 'bad_input', message: 'enabled must be true or false' };
+    }
+    db.setSetting(scopedSettingKey(TEST_RECORD_SETTING_KEY), input.enabled ? '1' : '0');
+    // Keep the Test View button in sync with a chat-driven change.
+    for (const w of BrowserWindow.getAllWindows()) {
+      if (!w.isDestroyed()) w.webContents.send('test:record:changed', { enabled: input.enabled });
+    }
+    const envForced = process.env.FARNSWORTH_TEST_RECORD === '0' || process.env.FARNSWORTH_TEST_RECORD === '1';
+    return {
+      ok: true,
+      enabled: input.enabled,
+      effective: testRecordingEnabled(),
+      note: envForced ? 'FARNSWORTH_TEST_RECORD is set in the environment and overrides this toggle.' : undefined,
+    };
   }
   if (name === 'open_testview') {
     // Switch canvas to Test View. Auto-switches the canvas mode to live
