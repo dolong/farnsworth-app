@@ -369,6 +369,10 @@ async function runSteps(webContents, vars, steps, opts = {}) {
 export async function runTest(webContents, steps, opts = {}) {
   const timeout = opts.timeout ?? 60_000
   const vars = {}
+  // Optional observer, used by the video recorder to drive its step overlay.
+  // Never allowed to affect the run: a throwing hook is swallowed.
+  const rawOnStep = typeof opts.onStep === 'function' ? opts.onStep : null
+  const onStep = rawOnStep ? (event) => { try { rawOnStep(event) } catch {} } : () => {}
 
   // Validate debugger is attached
   if (!webContents.debugger.isAttached()) {
@@ -388,17 +392,21 @@ export async function runTest(webContents, steps, opts = {}) {
 
     const step = steps[i]
     const action = step.action
+    const total = steps.length
     if (!action) {
       errors.push(`Step ${i}: missing "action" field`)
+      onStep({ phase: 'end', index: i, total, action: '(none)', step, ok: false, error: 'missing "action" field' })
       continue
     }
 
     const handler = ACTION_MAP[action]
     if (!handler) {
       errors.push(`Step ${i}: unknown action "${action}"`)
+      onStep({ phase: 'end', index: i, total, action, step, ok: false, error: `unknown action "${action}"` })
       continue
     }
 
+    onStep({ phase: 'start', index: i, total, action, step })
     try {
       const result = await handler(webContents, vars, step)
       if (result?._screenshot) {
@@ -409,8 +417,10 @@ export async function runTest(webContents, steps, opts = {}) {
         vars.__lastEval = result._evalResult
       }
       completed++
+      onStep({ phase: 'end', index: i, total, action, step, ok: true })
     } catch (err) {
       errors.push(`Step ${i} (${action}): ${err.message}`)
+      onStep({ phase: 'end', index: i, total, action, step, ok: false, error: err.message })
       // Don't break — keep going (matching Python runner behavior)
     }
   }

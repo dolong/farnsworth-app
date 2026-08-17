@@ -91,14 +91,221 @@
     }
   }
 
+  // ─── Test-run recording (Aug 17 2026) ───────────────────────────────────
+  // The same getDisplayMedia track that feeds WebRTC is composited onto a
+  // 2D canvas together with a step overlay, and that canvas -- not the raw
+  // track -- is what MediaRecorder encodes. The overlay has to be burned in:
+  // test steps are synthetic CDP events, so a raw recording shows a game
+  // mutating with no cursor, no click, and no indication of which step is
+  // responsible.
+  let pendingRecording = null;
+  let rec = null;
+
+  const OVERLAY = {
+    title: '', index: 0, total: 0, action: '', detail: '',
+    status: 'running', error: '', startedAt: 0, finishedAt: 0,
+  };
+
+  const STATUS_COLOR = {
+    running: '#f5a524', passed: '#2fbf71', failed: '#f4405a', done: '#8b8b93',
+  };
+
+  function fmtElapsed(ms) {
+    const t = Math.max(0, ms) / 1000;
+    const m = Math.floor(t / 60);
+    return `${String(m).padStart(2, '0')}:${(t - m * 60).toFixed(1).padStart(4, '0')}`;
+  }
+
+  function fit(ctx, text, maxWidth) {
+    if (!text) return '';
+    if (ctx.measureText(text).width <= maxWidth) return text;
+    let lo = 0, hi = text.length;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (ctx.measureText(text.slice(0, mid) + '…').width <= maxWidth) lo = mid; else hi = mid - 1;
+    }
+    return text.slice(0, lo) + '…';
+  }
+
+  function drawOverlay(ctx, w, h) {
+    const scale = Math.max(0.75, Math.min(2, h / 720));
+    const barH = Math.round(62 * scale);
+    const pad = Math.round(16 * scale);
+    const y0 = h - barH;
+    const status = OVERLAY.status || 'running';
+
+    if (status === 'failed') {
+      const bw = Math.max(2, Math.round(3 * scale));
+      ctx.strokeStyle = STATUS_COLOR.failed;
+      ctx.lineWidth = bw;
+      ctx.strokeRect(bw / 2, bw / 2, w - bw, h - bw);
+    }
+
+    ctx.fillStyle = 'rgba(9,9,11,0.84)';
+    ctx.fillRect(0, y0, w, barH);
+    ctx.fillStyle = 'rgba(255,255,255,0.10)';
+    ctx.fillRect(0, y0, w, Math.max(1, Math.round(scale)));
+
+    const dotR = Math.round(5 * scale);
+    const dotX = pad + dotR;
+    const midY = y0 + barH / 2;
+    ctx.beginPath();
+    ctx.arc(dotX, midY, dotR, 0, Math.PI * 2);
+    ctx.fillStyle = STATUS_COLOR[status] || STATUS_COLOR.running;
+    ctx.fill();
+
+    // Right column: elapsed clock, and the test name above it.
+    const clockFont = Math.round(16 * scale);
+    const titleFont = Math.round(11 * scale);
+    const endedAt = OVERLAY.finishedAt || Date.now();
+    const elapsed = fmtElapsed(endedAt - (OVERLAY.startedAt || endedAt));
+    ctx.textBaseline = 'alphabetic';
+    ctx.textAlign = 'right';
+    ctx.font = `600 ${clockFont}px ui-monospace, SFMono-Regular, Menlo, monospace`;
+    ctx.fillStyle = 'rgba(255,255,255,0.92)';
+    ctx.fillText(elapsed, w - pad, midY + Math.round(6 * scale));
+    let rightEdge = w - pad - ctx.measureText(elapsed).width - Math.round(18 * scale);
+    if (OVERLAY.title) {
+      ctx.font = `500 ${titleFont}px -apple-system, system-ui, sans-serif`;
+      ctx.fillStyle = 'rgba(255,255,255,0.42)';
+      ctx.fillText(fit(ctx, OVERLAY.title, w * 0.3), w - pad, y0 - Math.round(8 * scale));
+    }
+
+    ctx.textAlign = 'left';
+    const textX = dotX + dotR + Math.round(12 * scale);
+    const maxW = Math.max(40, rightEdge - textX);
+
+    const line1Font = Math.round(15 * scale);
+    ctx.font = `600 ${line1Font}px -apple-system, system-ui, sans-serif`;
+    const counter = OVERLAY.total ? `${OVERLAY.index}/${OVERLAY.total}` : '';
+    const head = [counter, OVERLAY.action].filter(Boolean).join('  ');
+    ctx.fillStyle = 'rgba(255,255,255,0.96)';
+    ctx.fillText(fit(ctx, head, maxW), textX, midY - Math.round(3 * scale));
+
+    const line2Font = Math.round(12 * scale);
+    ctx.font = `400 ${line2Font}px ui-monospace, SFMono-Regular, Menlo, monospace`;
+    const failed = status === 'failed';
+    ctx.fillStyle = failed ? STATUS_COLOR.failed : 'rgba(255,255,255,0.50)';
+    const sub = failed ? (OVERLAY.error || 'step failed') : (OVERLAY.detail || '');
+    if (sub) ctx.fillText(fit(ctx, sub, maxW), textX, midY + Math.round(16 * scale));
+  }
+
+  async function startRecording(cfg) {
+    let stream = null;
+    try {
+      stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { frameRate: { ideal: 30, max: 30 } }, audio: false,
+      });
+    } catch (error) {
+      window.canvasCapture.recordState({ type: 'error', reason: error?.message || String(error) });
+      return;
+    }
+    try {
+      Object.assign(OVERLAY, {
+        title: '', index: 0, total: 0, action: '', detail: '',
+        status: 'running', error: '', finishedAt: 0,
+      }, cfg?.overlay || {});
+      OVERLAY.startedAt = Date.now();
+
+      const video = document.createElement('video');
+      video.srcObject = stream;
+      video.muted = true;
+      video.playsInline = true;
+      await video.play().catch(() => {});
+      for (let i = 0; i < 100 && !video.videoWidth; i++) await new Promise(r => setTimeout(r, 20));
+
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d', { alpha: false });
+      const resize = () => {
+        const w = video.videoWidth || 1280;
+        const h = video.videoHeight || 720;
+        if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+      };
+      resize();
+
+      let stopped = false;
+      const paint = () => {
+        if (stopped) return;
+        resize();
+        try { ctx.drawImage(video, 0, 0, canvas.width, canvas.height); } catch {}
+        try { drawOverlay(ctx, canvas.width, canvas.height); } catch {}
+      };
+      paint();
+
+      // requestVideoFrameCallback follows the source track. requestAnimationFrame
+      // would follow this window's paint cycle, and this window is hidden.
+      // The interval is not redundant: it keeps the clock and step text moving
+      // while the game renders no new frames.
+      let rvfcId = null;
+      const intervalId = setInterval(paint, 200);
+      if (typeof video.requestVideoFrameCallback === 'function') {
+        const tick = () => { paint(); rvfcId = video.requestVideoFrameCallback(tick); };
+        rvfcId = video.requestVideoFrameCallback(tick);
+      } else {
+        clearInterval(intervalId);
+      }
+      const fallbackId = typeof video.requestVideoFrameCallback === 'function'
+        ? intervalId : setInterval(paint, 1000 / 30);
+
+      const out = canvas.captureStream(30);
+      const mimeType = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm']
+        .find(t => MediaRecorder.isTypeSupported(t)) || '';
+      const recorder = new MediaRecorder(out, mimeType
+        ? { mimeType, videoBitsPerSecond: cfg?.bitrate || 5_000_000 } : undefined);
+
+      // Chunks must reach the file in emission order. Awaiting each invoke
+      // inside ondataavailable would let two chunks race and corrupt the webm.
+      let chain = Promise.resolve();
+      recorder.ondataavailable = (event) => {
+        if (!event.data || !event.data.size) return;
+        chain = chain.then(async () => {
+          try { await window.canvasCapture.recordChunk(await event.data.arrayBuffer()); } catch {}
+        });
+      };
+      recorder.onstop = async () => {
+        stopped = true;
+        clearInterval(fallbackId);
+        if (rvfcId != null && video.cancelVideoFrameCallback) {
+          try { video.cancelVideoFrameCallback(rvfcId); } catch {}
+        }
+        try { for (const t of stream.getTracks()) t.stop(); } catch {}
+        try { for (const t of out.getTracks()) t.stop(); } catch {}
+        try { video.srcObject = null; } catch {}
+        rec = null;
+        await chain;
+        window.canvasCapture.recordState({ type: 'stopped' });
+      };
+      recorder.start(1000);
+      rec = { stop: () => { try { if (recorder.state !== 'inactive') recorder.stop(); } catch {} } };
+      window.canvasCapture.recordState({
+        type: 'started', width: canvas.width, height: canvas.height, mimeType: recorder.mimeType,
+      });
+    } catch (error) {
+      try { for (const t of stream?.getTracks?.() || []) t.stop(); } catch {}
+      rec = null;
+      window.canvasCapture.recordState({ type: 'error', reason: error?.message || String(error) });
+    }
+  }
+
   window.__setCanvasCompanion = (companionId) => { pendingCompanionId = companionId; };
+  window.__setCanvasRecording = (cfg) => { pendingRecording = cfg || {}; };
   document.getElementById('start-capture').addEventListener('click', () => {
+    // One gesture serves one request. Recording wins when both are pending
+    // because main only ever arms one at a time.
+    if (pendingRecording) {
+      const cfg = pendingRecording;
+      pendingRecording = null;
+      startRecording(cfg);
+      return;
+    }
     const companionId = pendingCompanionId;
     pendingCompanionId = null;
     startPeer(companionId);
   });
   window.canvasCapture.onSignal(handleSignal);
   window.canvasCapture.onStop((msg) => closePeer(msg?.companionId));
+  window.canvasCapture.onOverlay((msg) => { if (msg) Object.assign(OVERLAY, msg); });
+  window.canvasCapture.onRecordStop(() => { if (rec) rec.stop(); else window.canvasCapture.recordState({ type: 'stopped' }); });
 })();
 </script>
 </body></html>

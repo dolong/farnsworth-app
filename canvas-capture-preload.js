@@ -14,4 +14,19 @@ contextBridge.exposeInMainWorld('canvasCapture', {
     ipcRenderer.on('canvas-capture:stop', wrapped);
     return () => ipcRenderer.removeListener('canvas-capture:stop', wrapped);
   },
+  // Test-run recording (Aug 17 2026). Same window, separate concern: the
+  // recorder composites the captured track with a step overlay and streams
+  // webm chunks to main, which appends them to a file.
+  recordChunk: (buf) => ipcRenderer.invoke('canvas-capture:record-chunk', buf),
+  recordState: (msg) => ipcRenderer.invoke('canvas-capture:record-state', msg),
+  onOverlay: (handler) => {
+    const wrapped = (_event, msg) => handler(msg);
+    ipcRenderer.on('canvas-capture:overlay', wrapped);
+    return () => ipcRenderer.removeListener('canvas-capture:overlay', wrapped);
+  },
+  onRecordStop: (handler) => {
+    const wrapped = (_event, msg) => handler(msg);
+    ipcRenderer.on('canvas-capture:record-stop', wrapped);
+    return () => ipcRenderer.removeListener('canvas-capture:record-stop', wrapped);
+  },
 });

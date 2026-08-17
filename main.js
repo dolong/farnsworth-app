@@ -2332,6 +2332,8 @@ const canvasWebContentsViews = new Map();
 // the active WebContentsView frame and carries signaling over the relay.
 // Post View is intentionally excluded because it needs an element crop.
 let canvasDisplayCaptureGrant = null;
+let canvasCaptureViewOverride = null;
+let canvasRecording = null;
 let canvasCaptureWindow = null;
 let canvasCaptureReady = null;
 function activeCanvasWebContentsView() {
@@ -2368,7 +2370,11 @@ function installCanvasDisplayMediaHandler() {
     const trustedRequester = requester && canvasCaptureWindow && !canvasCaptureWindow.isDestroyed() &&
       requester === canvasCaptureWindow.webContents.mainFrame;
     const trustedOrigin = trustedRequester && requester.url === canvasCaptureWindow.webContents.getURL();
-    const view = activeCanvasWebContentsView();
+    // A test recording must capture the exact view the runner drives, which is
+    // not necessarily the most recently created one.
+    const override = canvasCaptureViewOverride && !canvasCaptureViewOverride.webContents.isDestroyed()
+      ? canvasCaptureViewOverride : null;
+    const view = override || activeCanvasWebContentsView();
     if (!grant || grant.expiresAt < Date.now() || !request.userGesture || !trustedOrigin ||
         !view || view.webContents.isDestroyed()) {
       callback({});
@@ -2387,13 +2393,108 @@ async function startCanvasCapturePeer(companionId) {
   await canvasCaptureWindow.webContents.executeJavaScript(
     `window.__setCanvasCompanion(${JSON.stringify(companionId)}); true`, true,
   );
-  // Electron marks the request as user-initiated only when getDisplayMedia()
-  // runs from a trusted renderer input event. The window is fully transparent
-  // and shown inactive for this click, then hidden again immediately.
+  triggerCanvasCaptureGesture();
+}
+
+// Electron marks a getDisplayMedia() request as user-initiated only when it
+// runs from a trusted renderer input event. The window is fully transparent
+// and shown inactive for this click, then hidden again immediately.
+function triggerCanvasCaptureGesture() {
   canvasCaptureWindow.showInactive();
   canvasCaptureWindow.webContents.sendInputEvent({ type: 'mouseDown', x: 90, y: 40, button: 'left', clickCount: 1 });
   canvasCaptureWindow.webContents.sendInputEvent({ type: 'mouseUp', x: 90, y: 40, button: 'left', clickCount: 1 });
   setTimeout(() => { try { canvasCaptureWindow?.hide(); } catch {} }, 100);
+}
+
+// ─── Test-run recording (Aug 17 2026) ───────────────────────────────────────
+// Reuses the hidden capture window. The renderer composites the WCV track with
+// a step overlay and streams webm chunks here; this side only owns the file and
+// the overlay state.
+function canvasRecordingDirForTest(testPath) {
+  // <project>/.farnsworth/devvit-tests/x.json -> <project>/.farnsworth/recordings
+  return path.join(path.dirname(path.dirname(testPath)), 'recordings');
+}
+
+function describeTestStep(step) {
+  if (!step || typeof step !== 'object') return '';
+  const bits = [];
+  if (step.selector) bits.push(String(step.selector));
+  if (step.value !== undefined) bits.push(JSON.stringify(step.value));
+  if (step.expression) bits.push(String(step.expression));
+  if (step.ms !== undefined) bits.push(`${step.ms}ms`);
+  if (step.name) bits.push(String(step.name));
+  if (step.path) bits.push(String(step.path));
+  return bits.join('  ').replace(/\s+/g, ' ').slice(0, 200);
+}
+
+function updateCanvasRecordingOverlay(patch) {
+  if (!canvasRecording || !canvasCaptureWindow || canvasCaptureWindow.isDestroyed()) return;
+  try { canvasCaptureWindow.webContents.send('canvas-capture:overlay', patch); } catch {}
+}
+
+async function startCanvasTestRecording({ testPath, title, view }) {
+  if (canvasRecording) return null;
+  const target = view && !view.webContents.isDestroyed() ? view : activeCanvasWebContentsView();
+  if (!target || target.webContents.isDestroyed()) return null;
+  if (!canvasCaptureWindow || canvasCaptureWindow.isDestroyed()) {
+    createCanvasCaptureWindow();
+    installCanvasDisplayMediaHandler();
+  }
+  await canvasCaptureReady;
+
+  const dir = canvasRecordingDirForTest(testPath);
+  await fs.mkdir(dir, { recursive: true });
+  const base = path.basename(testPath).replace(/\.json$/i, '') || 'test';
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const filePath = path.join(dir, `${base}_${stamp}.webm`);
+
+  const out = fsSync.createWriteStream(filePath);
+  canvasRecording = {
+    filePath, out, bytes: 0, startedAt: Date.now(),
+    resolveStopped: null, error: null, started: false,
+  };
+  canvasCaptureViewOverride = target;
+  canvasDisplayCaptureGrant = { purpose: 'record', expiresAt: Date.now() + 10000 };
+  await canvasCaptureWindow.webContents.executeJavaScript(
+    `window.__setCanvasRecording(${JSON.stringify({
+      overlay: { title: title || base, status: 'running', index: 0, total: 0 },
+    })}); true`, true,
+  );
+  triggerCanvasCaptureGesture();
+
+  // Give the renderer a moment to actually acquire the track. A failed grant
+  // reports back as an error and must not leave a 0-byte file behind.
+  for (let i = 0; i < 60 && !canvasRecording.started && !canvasRecording.error; i++) {
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  if (canvasRecording.error || !canvasRecording.started) {
+    const reason = canvasRecording.error || 'capture-did-not-start';
+    console.warn('[test-record] capture failed to start:', reason);
+    await new Promise((resolve) => out.end(resolve));
+    try { await fs.unlink(filePath); } catch {}
+    canvasRecording = null;
+    canvasCaptureViewOverride = null;
+    return null;
+  }
+  return filePath;
+}
+
+async function stopCanvasTestRecording({ status, error, tailMs = 1200 } = {}) {
+  const rec = canvasRecording;
+  if (!rec) return null;
+  // Hold the final frame briefly so the end state is actually watchable.
+  updateCanvasRecordingOverlay({
+    status: status || 'done', error: error || '', finishedAt: Date.now(),
+  });
+  await new Promise((r) => setTimeout(r, tailMs));
+
+  const stopped = new Promise((resolve) => { rec.resolveStopped = resolve; });
+  try { canvasCaptureWindow?.webContents?.send('canvas-capture:record-stop', {}); } catch {}
+  await Promise.race([stopped, new Promise((r) => setTimeout(r, 10000))]);
+  await new Promise((resolve) => rec.out.end(resolve));
+  canvasRecording = null;
+  canvasCaptureViewOverride = null;
+  return { path: rec.filePath, bytes: rec.bytes, durationMs: Date.now() - rec.startedAt };
 }
 const _CANVAS_IFRAME_RECT_JS =
   '(function(){var f=document.querySelector("iframe[src*=localhost]")' +
@@ -3862,24 +3963,65 @@ async function tryNodeTestRunner(testPath) {
 
   const wc = view.webContents;
   let attachedHere = false;
+  // Recording is on by default; FARNSWORTH_TEST_RECORD=0 opts out. A capture
+  // failure must never fail the test, so every recording call is guarded.
+  const wantVideo = process.env.FARNSWORTH_TEST_RECORD !== '0';
+  let videoPath = null;
   try {
     if (!wc.debugger.isAttached()) {
       wc.debugger.attach('1.1');
       attachedHere = true;
     }
-    const result = await mod.runTest(wc, steps, { timeout: 60000 });
+    if (wantVideo) {
+      try {
+        videoPath = await startCanvasTestRecording({
+          testPath, title: path.basename(testPath), view,
+        });
+      } catch (e) {
+        console.warn('[test-record] could not start:', e.message);
+        videoPath = null;
+      }
+    }
+    const result = await mod.runTest(wc, steps, {
+      timeout: 60000,
+      onStep: videoPath ? (ev) => {
+        if (ev.phase === 'start') {
+          updateCanvasRecordingOverlay({
+            index: ev.index + 1, total: ev.total, action: ev.action,
+            detail: describeTestStep(ev.step), status: 'running', error: '',
+          });
+        } else if (!ev.ok) {
+          updateCanvasRecordingOverlay({ status: 'failed', error: ev.error || 'step failed' });
+        }
+      } : undefined,
+    });
+    let video = null;
+    if (videoPath) {
+      video = await stopCanvasTestRecording({
+        status: result.ok ? 'passed' : 'failed',
+        error: result.errors[0] || '',
+      }).catch((e) => { console.warn('[test-record] stop failed:', e.message); return null; });
+      videoPath = null;
+    }
     const lines = result.errors.map((e) => `[error] ${e}`);
+    if (video?.path) lines.push(`[video] ${video.path}`);
     return {
       ok: result.ok,
       code: result.ok ? 0 : 1,
       failed: result.errors.length,
       stdout: [`[test-runner:node] ${result.steps}/${result.total} steps completed`, ...lines].join('\n').slice(-4000),
       stderr: '',
+      video: video || null,
     };
   } catch (e) {
     console.warn('[test-runner] Node path threw, falling back to Python:', e.message);
     return null;
   } finally {
+    // A throw between start and stop would otherwise strand the recorder and
+    // leave the next run unable to start one.
+    if (videoPath) {
+      try { await stopCanvasTestRecording({ status: 'failed', error: 'runner aborted' }); } catch {}
+    }
     if (attachedHere) {
       try { wc.debugger.detach(); } catch {}
     }
@@ -9298,6 +9440,30 @@ ipcMain.handle('relay:send', async (_event, msg) => {
   const rc = getRelayClient();
   return rc.send(msg);
 });
+ipcMain.handle('canvas-capture:record-chunk', async (_event, buf) => {
+  const rec = canvasRecording;
+  if (!rec || !buf) return false;
+  const chunk = Buffer.from(buf instanceof ArrayBuffer ? new Uint8Array(buf) : buf);
+  rec.bytes += chunk.length;
+  await new Promise((resolve, reject) => rec.out.write(chunk, (e) => (e ? reject(e) : resolve())));
+  return true;
+});
+
+ipcMain.handle('canvas-capture:record-state', async (_event, msg) => {
+  const rec = canvasRecording;
+  if (!rec || !msg) return false;
+  if (msg.type === 'started') {
+    rec.started = true;
+    rec.width = msg.width; rec.height = msg.height; rec.mimeType = msg.mimeType;
+  } else if (msg.type === 'error') {
+    rec.error = msg.reason || 'capture-failed';
+    rec.resolveStopped?.();
+  } else if (msg.type === 'stopped') {
+    rec.resolveStopped?.();
+  }
+  return true;
+});
+
 ipcMain.handle('canvas-capture:send', async (event, msg) => {
   if (!canvasCaptureWindow || canvasCaptureWindow.isDestroyed() || event.sender !== canvasCaptureWindow.webContents) {
     return false;
