@@ -68,6 +68,9 @@ const SUB = IS_DEFAULT_INSTANCE
   : `farnsworth:${os.hostname()}-${MACHINE_ID_HASH}:${INSTANCE_NAME}`;
 
 const RECONNECT_BASE_MS = 1000;
+// A socket must stay open this long before we trust it enough to clear the
+// backoff. See the 'open' handler.
+const STABLE_RESET_MS = 15000;
 const RECONNECT_MAX_MS = 30000;
 
 class RelayClient {
@@ -81,6 +84,7 @@ class RelayClient {
     this.ws = null;
     this.reconnectAttempt = 0;
     this.reconnectTimer = null;
+    this.stableTimer = null;
     this.stopped = false;
     this.handlers = new Map(); // type → [fn]
     this.statusListeners = new Set();
@@ -176,7 +180,17 @@ class RelayClient {
 
     ws.on('open', () => {
       console.log(`[relay-client] connected as sub=${this.sub} instance=${this.instanceName}`);
-      this.reconnectAttempt = 0;
+      // Do NOT clear the backoff here. The relay evicts any existing socket
+      // that presents the same instance id, so two processes sharing one sub
+      // (a second app on the machine, or an old build left running) open and
+      // close each other about once a second -- forever -- because every
+      // 'open' resets the counter back to a 1s delay. Clear it only once the
+      // socket has proven it can stay up.
+      if (this.stableTimer) clearTimeout(this.stableTimer);
+      this.stableTimer = setTimeout(() => {
+        this.stableTimer = null;
+        this.reconnectAttempt = 0;
+      }, STABLE_RESET_MS);
       this._setStatus('connected');
     });
 
@@ -207,6 +221,7 @@ class RelayClient {
         return;
       }
       console.log(`[relay-client] disconnected (code=${code} reason=${reason || ''})`);
+      if (this.stableTimer) { clearTimeout(this.stableTimer); this.stableTimer = null; }
       this.ws = null;
       this._setStatus('disconnected');
       this._scheduleReconnect();
