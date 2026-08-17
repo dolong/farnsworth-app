@@ -7540,16 +7540,14 @@ body.density-compact .msg__body { font-size: 12.5px; }
    sidebar), so the game frame now centres in the full canvas width instead of
    being pushed left by a 50%-wide list. */
 .testview { justify-content: center; position: relative; }
-.testview__tools {
-  position: absolute; top: 12px; right: 14px; z-index: 4;
-  display: flex; gap: 6px;
-  padding: 5px; border-radius: 9px;
-  background: rgba(14,16,19,.82);
-  border: 1px solid var(--border-default);
-  backdrop-filter: blur(8px);
-  opacity: .38; transition: opacity 140ms ease;
+/* Test View controls live in the canvas header toolbar (see mountTestViewTools).
+   They are a plain inline group there: no absolute positioning, no scrim, no
+   hover-fade, because they no longer sit on top of the game. */
+.canvas__toolbar-actions .testview__tools {
+  display: flex; align-items: center; gap: 6px;
+  margin-right: 10px;
 }
-.testview:hover .testview__tools, .testview__tools:focus-within { opacity: 1; }
+.canvas__toolbar-actions .testview__tools .testview__btn { flex: 0 0 auto; }
 
 /* Profiles section — sits above Scripts because the profile decides WHO a Prod
    script runs as. Moved out of the Prod canvas Aug 13. */

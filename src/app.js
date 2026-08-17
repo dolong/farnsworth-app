@@ -2160,6 +2160,10 @@ function renderCanvas() {
     }
   }
 
+  // Test View's header controls are mounted by renderTestView; every other
+  // canvas mode/preview has to drop them.
+  if (!(state.canvasMode === 'live' && state.preview === 'testview')) removeTestViewTools();
+
   // update overlay bar visibility
   const sizeToggles = $('#canvas-size-toggles');
   if (sizeToggles) sizeToggles.style.display = (state.canvasMode === 'live' || state.canvasMode === 'prod') ? 'flex' : 'none';
@@ -4499,7 +4503,7 @@ function renderTestView() {
   // worse editor than the Monaco instance sitting one canvas mode away.
   // Test View keeps only what is genuinely Test-View-specific: the game frame
   // itself, which now gets the full canvas width, and Reset Game.
-  const tools = el('div', { class: 'testview__tools' });
+  const tools = el('div', { class: 'testview__tools', id: 'testview-tools' });
   tools.innerHTML = `
     <button class="testview__btn testview__btn--record" id="testview-record" title="Record test runs to video with a burned-in step overlay">
       <span class="testview__rec-dot"></span><span class="testview__rec-label">Record</span>
@@ -4508,7 +4512,7 @@ function renderTestView() {
     <button class="testview__btn testview__btn--primary" id="testview-reset-game" title="Reload the game WebContentsView to a fresh instance">Reset Game</button>
     <button class="testview__btn testview__btn--ghost" id="testview-open-scripts" title="Open the Scripts panel in the sidebar">Scripts…</button>
   `;
-  wrap.appendChild(tools);
+  mountTestViewTools(tools);
 
   requestAnimationFrame(() => {
     tools.querySelector('#testview-reset-game')?.addEventListener('click', () => resetTestViewGame(wrap));
@@ -4549,6 +4553,27 @@ function renderTestView() {
   });
 
   return wrap;
+}
+
+// Test View's Record / Recordings / Reset Game / Scripts buttons are canvas
+// CHROME, not artboard content. They used to float absolutely over the top-right
+// of the artboard, which put them straight on top of the game's own top-right UI
+// (the mobile icon row) — and adding Record + Recordings widened the group to
+// 357px, well past the ~255px of dead space beside a 390px phone frame. The
+// canvas header toolbar sits outside .canvas__stage, so nothing mounted there
+// can ever cover the preview at any zoom or resolution preset.
+function mountTestViewTools(tools) {
+  const host = document.querySelector('.canvas__toolbar-actions');
+  if (!host) return;
+  removeTestViewTools();
+  host.insertBefore(tools, host.firstChild);
+}
+
+// renderCanvas() rebuilds the stage but not the header, so the header group has
+// to be removed explicitly when the canvas leaves Test View or the buttons would
+// linger over Post View, Code mode and Prod.
+function removeTestViewTools() {
+  document.getElementById('testview-tools')?.remove();
 }
 
 // Record-toggle button paint. Kept out of renderTestView so the chat-driven
@@ -4851,14 +4876,14 @@ function renderScriptsPanel() {
       </div>
       <button class="scripts__btn scripts__btn--ghost scripts__appview" id="scripts-app-open" ${isProd ? '' : 'hidden'} title="Click the post into its interactive app view (required before running)">Open app view</button>
     </div>
-    <div class="scripts__profiles" id="scripts-profiles">
+    <div class="scripts__profiles" id="scripts-profiles" ${isProd ? '' : 'hidden'}>
       <div class="scripts__subhead">
         <span class="scripts__subtitle">Profiles</span>
         <button class="scripts__btn scripts__btn--ghost scripts__btn--mini" id="scripts-profile-new" title="Create a production profile">+</button>
       </div>
       <div class="scripts__profile-list" id="scripts-profile-list"><div class="scripts__empty scripts__empty--tight">Loading profiles…</div></div>
     </div>
-    <div class="scripts__subhead scripts__subhead--list"><span class="scripts__subtitle">Scripts</span></div>
+    <div class="scripts__subhead scripts__subhead--list" id="scripts-list-subhead" ${isProd ? '' : 'hidden'}><span class="scripts__subtitle">Scripts</span></div>
     <div class="scripts__list" id="scripts-list"><div class="scripts__empty">Loading scripts…</div></div>
     <div class="scripts__output" id="scripts-output" hidden></div>
   `;
@@ -4893,7 +4918,10 @@ function renderScriptsPanel() {
   }
 
   loadScriptsPanel(wrap);
-  loadScriptsProfiles(wrap);
+  // Profiles decide WHO a Prod script runs as. Test View runs against the local
+  // emulator, where a profile means nothing, so the section is Prod-only —
+  // loading it here too would show a stale list the moment it unhides.
+  if (isProd) loadScriptsProfiles(wrap);
   return wrap;
 }
 
@@ -5047,6 +5075,19 @@ function syncScriptsTarget() {
   if (hint) hint.textContent = isProd ? 'runs on your live account' : 'runs in Test View';
   const appOpen = document.getElementById('scripts-app-open');
   if (appOpen) appOpen.hidden = !isProd;
+  // Profiles are Prod-only. Switching INTO Prod is also the right moment to
+  // fetch them, since renderScriptsPanel skips the load while local.
+  const profiles = document.getElementById('scripts-profiles');
+  const listSubhead = document.getElementById('scripts-list-subhead');
+  if (listSubhead) listSubhead.hidden = !isProd;
+  if (profiles) {
+    const wasHidden = profiles.hidden;
+    profiles.hidden = !isProd;
+    if (isProd && wasHidden) {
+      const panel = profiles.closest('.scripts');
+      if (panel) loadScriptsProfiles(panel);
+    }
+  }
 }
 
 async function loadScriptsPanel(wrap) {
