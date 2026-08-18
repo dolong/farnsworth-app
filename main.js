@@ -2599,6 +2599,55 @@ let prodCanvasActive = false;
 let prodCdpSeq = 0;
 const prodCdpPending = new Map();
 
+// Where the installed Google Chrome lives. agent-browser downloads its own
+// Chrome for Testing and launches that unless told otherwise, and CfT shows an
+// "only for automated testing" banner while being a build no ordinary visitor
+// runs. A session should use the browser the operator actually has.
+function prodChromePath() {
+  if (process.env.CHROME_PATH && fsSync.existsSync(process.env.CHROME_PATH)) return process.env.CHROME_PATH;
+  const candidates = [
+    '/Applications/Google Chrome.app',
+    `${os.homedir()}/Applications/Google Chrome.app`,
+    '/Applications/Chromium.app',
+    '/Applications/Google Chrome Canary.app',
+  ];
+  for (const c of candidates) {
+    try { if (fsSync.existsSync(c)) return c; } catch {}
+  }
+  return null;
+}
+
+// The binary inside the .app bundle. prodChromePath() returns the bundle, which
+// is what a dependency check wants; a launcher needs the executable.
+function prodChromeExecutable() {
+  const bundle = prodChromePath();
+  if (!bundle) return null;
+  if (!bundle.endsWith('.app')) return bundle;
+  const name = path.basename(bundle, '.app');
+  const exe = path.join(bundle, 'Contents', 'MacOS', name);
+  try { return fsSync.existsSync(exe) ? exe : null; } catch { return null; }
+}
+
+// Which Chrome a session runs on. Default is the installed browser; 'bundled'
+// keeps agent-browser's own build for anyone who needs a session pinned to it.
+// Farnsworth has no Production settings page, so this is read from settings
+// rather than offered as a picker, and falls back to the installed Chrome.
+// If no Chrome is installed, the returned args are empty and agent-browser
+// keeps its existing behaviour rather than failing to launch.
+function prodBrowserChoice() {
+  try {
+    const raw = db.getSetting('prod');
+    const cfg = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (cfg?.browser === 'bundled') return 'bundled';
+  } catch {}
+  return 'installed';
+}
+function prodExecutableArgs() {
+  if (prodBrowserChoice() === 'bundled') return [];
+  const exe = prodChromeExecutable();
+  return exe ? ['--executable-path', exe] : [];
+}
+
 function prodAgentBrowserBin() {
   // Explicit override is authoritative. This gives packaged verification a
   // deterministic unavailable-browser path instead of silently trying a
@@ -2697,6 +2746,9 @@ function prodStatus(extra = {}) {
     title: prodSession.title || null,
     viewport: prodSession.viewport || null,
     webdriver: prodSession.webdriver,
+    // The browser build that actually answered CDP, not the one we asked for.
+    browserBuild: prodSession.browserBuild || null,
+    browserWarning: prodSession.browserWarning || null,
     headed: true,
     engine: 'agent-browser',
     frame: latestProdFrame ? { width: latestProdFrame.width, height: latestProdFrame.height, ts: latestProdFrame.ts } : null,
@@ -2781,6 +2833,15 @@ async function prodAttachCdp(browserWsUrl) {
   ws.on('close', () => {
     if (prodSession) { prodSession.error = 'CDP connection closed'; prodSession.state = 'error'; prodEmitStatus(); }
   });
+  // Which browser build actually answered. The launch flag says what we asked
+  // for; this says what we got. Detection alone never proves which binary ran.
+  try {
+    const v = await prodCdpCall('Browser.getVersion', {}, null, 8000);
+    if (prodSession) {
+      prodSession.browserBuild = v?.product || null;      // e.g. "Chrome/151.0.7922.138"
+      prodSession.browserUA = v?.userAgent || null;
+    }
+  } catch {}
   const targets = await prodCdpCall('Target.getTargets');
   const pages = (targets.targetInfos || []).filter((t) => t.type === 'page');
   const page = pages.find((t) => t.url && t.url !== 'about:blank' && !/^chrome:\/\//i.test(t.url)) || pages[0];
@@ -2922,7 +2983,7 @@ async function startProdSession(event, { profileId, url } = {}) {
   prodEmitStatus();
   try {
     const identityArgs = profile.mode === 'state' ? ['--state', profile.statePath] : ['--profile', profile.profilePath];
-    const openArgs = ['--session', sessionName, ...identityArgs, '--headed', '--args', '--disable-blink-features=AutomationControlled', 'open', targetUrl, '--json'];
+    const openArgs = ['--session', sessionName, ...identityArgs, ...prodExecutableArgs(), '--headed', '--args', '--disable-blink-features=AutomationControlled', 'open', targetUrl, '--json'];
     const opened = prodParseJsonOutput(await prodExec(openArgs, 60000));
     if (opened.success === false) throw new Error(opened.error || 'browser launch failed');
     prodSession.state = 'connecting'; prodEmitStatus();
@@ -2931,6 +2992,17 @@ async function startProdSession(event, { profileId, url } = {}) {
     if (!browserWsUrl) throw new Error('agent-browser did not expose a CDP endpoint');
     await prodAttachCdp(browserWsUrl);
     prodSession.state = 'ready';
+    // A profile that suddenly presents a different Chrome build has changed its
+    // fingerprint. Record it and say so once, rather than letting it happen
+    // silently.
+    if (prodSession?.browserBuild) {
+      const before = profile.lastBrowserBuild || null;
+      if (before && before !== prodSession.browserBuild) {
+        prodSession.browserWarning = `This profile last ran on ${before} and is now on ${prodSession.browserBuild}.`;
+        console.warn(`[prod] browser build changed for ${profile.id}: ${before} -> ${prodSession.browserBuild}`);
+      }
+      profile.lastBrowserBuild = prodSession.browserBuild;
+    }
     profile.lastUsedAt = new Date().toISOString(); prodWriteRegistry(registry);
     return { ok: true, status: prodEmitStatus(), profile: prodPublicProfile(profile) };
   } catch (e) {
