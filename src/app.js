@@ -1199,6 +1199,15 @@ function renderMessage(m) {
     // (after chips). Vellum-style chat layout -- no plain text at the
     // top above the code executions. white-space: pre-wrap preserves
     // newlines (the prior plain text rendering collapsed them).
+    // Reasoning-model thinking, rendered in the same small italic style as a
+    // preamble and always above it. Without this the chat sits silent for the
+    // whole reasoning phase and then snaps to an answer.
+    if (m.reasoningText && m.reasoningText.trim()) {
+      const reasoning = el('div', { class: 'msg__text msg__text--thinking' });
+      reasoning.innerHTML = renderText(m.reasoningText);
+      attachCodeCopyButtons(reasoning);
+      body.appendChild(reasoning);
+    }
     if (!tl && m.preambleText && m.preambleText.trim()) {
       const thinking = el('div', { class: 'msg__text msg__text--thinking' });
       thinking.innerHTML = renderText(m.preambleText);
@@ -12816,6 +12825,15 @@ async function sendChatMessage(opts) {
           model: modelToApiId(state.settings?.defaultModel),
           tools,
         }, (chunk) => {
+          if (chunk.type === 'reasoning_delta') {
+            // Reasoning-model chain of thought (OpenAI-compatible endpoints).
+            // Kept in its OWN field, never in preambleText: the tool-free
+            // promote step below moves preambleText into responseText, which
+            // would publish the model's private reasoning as its answer.
+            agentMsg.reasoningText = (agentMsg.reasoningText || '') + (chunk.text || '');
+            updateAgentMsg({ reasoningText: agentMsg.reasoningText });
+            return;
+          }
           if (chunk.type === 'text_delta') {
             const deltaText = chunk.text || '';
             // Jul 13 ~18:50 ET: split text into preamble (before any tool_use)
@@ -13123,6 +13141,19 @@ async function sendChatMessage(opts) {
           }
         } else if (tu.name === 'memory_recall') {
           resultContent = toolRes.result || 'No memory matches.';
+        } else if (tu.name.startsWith('prod_')) {
+          // The Prod handlers answer with structured payloads -- { status },
+          // { profiles }, { result } -- and carry no `message` on success, so
+          // the generic fallback below collapsed every one of them to a bare
+          // "OK". The agent was driving the real browser blind: it could see
+          // that prod_status succeeded but not the URL, title, egress IP or
+          // profile it returned. Serialize the payload instead. `base64` is
+          // stripped because screenshot blobs would swamp the context (the
+          // chip already carries the image for the operator).
+          const { ok, base64, ...payload } = toolRes;
+          resultContent = Object.keys(payload).length
+            ? JSON.stringify(payload, null, 2)
+            : 'OK';
         } else {
           resultContent = toolRes.message || 'OK';
         }

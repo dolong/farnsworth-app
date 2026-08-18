@@ -7386,8 +7386,30 @@ function mapOpenAIFinish(fr) {
   return fr || 'end_turn';
 }
 
+// Models on OpenAI-compatible endpoints that have told us, in their own words,
+// that they cannot accept images. Keyed by `${baseURL}::${model}` and learned at
+// runtime from the API's own 400, so no per-model capability table has to be
+// maintained by hand. Session-scoped on purpose: a provider adding vision to a
+// model id should not require restarting the app forever.
+const VISION_UNSUPPORTED = new Set();
+const visionKey = (base, model) => `${base}::${model}`;
+
+// True when the endpoint rejected the request specifically because it carried
+// images. Providers word this differently, so match on intent rather than an
+// exact string; the fallback is simply that we don't learn, not that we break.
+function isVisionRejection(status, parsed, rawText) {
+  if (status !== 400) return false;
+  const msg = String(parsed?.error?.message || rawText || '').toLowerCase();
+  return msg.includes('image') && (msg.includes('not support') || msg.includes('unsupported') || msg.includes('cannot'));
+}
+
 // Anthropic-shaped messages / content blocks -> OpenAI chat messages.
-function toOpenAIMessages(messages, system) {
+//
+// `allowImages` controls what happens to image blocks returned by a TOOL (i.e.
+// take_canvas_screenshot). When false, the image is replaced by an explicit
+// note telling the model it is blind -- never dropped in silence. See the
+// tool_result branch below for why that distinction is load-bearing.
+function toOpenAIMessages(messages, system, allowImages = true) {
   const out = [];
   if (system) out.push({ role: 'system', content: system });
   for (const m of messages) {
@@ -7409,7 +7431,44 @@ function toOpenAIMessages(messages, system) {
           const txt = typeof c === 'string' ? c
             : Array.isArray(c) ? c.filter(x => x && x.type === 'text').map(x => x.text).join('\n')
             : JSON.stringify(c);
-          toolMsgs.push({ role: 'tool', tool_call_id: b.tool_use_id, content: txt || '' });
+          // Images returned BY A TOOL (take_canvas_screenshot) used to be
+          // filtered out here and never mentioned again. The screenshot was
+          // captured, written to /tmp, and its pixels silently discarded before
+          // the request was built -- so the model received only
+          // "Screenshot: /tmp/x.png (1200x1172)", reasonably assumed it could
+          // see, and then drove the real browser by guesswork. Blind is
+          // survivable; blind and unaware of it is not.
+          //
+          // The OpenAI wire format forbids image parts inside a `tool` message
+          // (its content must be a string), so a vision-capable model gets the
+          // pixels in a follow-up user message instead -- the standard shape.
+          const imgs = Array.isArray(c) ? c.filter(x => x && x.type === 'image' && x.source) : [];
+          if (imgs.length && allowImages) {
+            toolMsgs.push({
+              role: 'tool',
+              tool_call_id: b.tool_use_id,
+              content: (txt ? txt + '\n' : '') + `[${imgs.length} image${imgs.length === 1 ? '' : 's'} attached in the following message]`,
+            });
+            toolMsgs.push({
+              role: 'user',
+              content: imgs.map(im => {
+                const mt = im.source.media_type || 'image/png';
+                const url = im.source.type === 'url' ? im.source.url : `data:${mt};base64,${im.source.data || ''}`;
+                return { type: 'image_url', image_url: { url } };
+              }),
+            });
+          } else if (imgs.length) {
+            toolMsgs.push({
+              role: 'tool',
+              tool_call_id: b.tool_use_id,
+              content: (txt ? txt + '\n' : '')
+                + '[The image was captured and saved, but THIS MODEL CANNOT RECEIVE IMAGES, so you cannot see it. '
+                + 'Do not describe, guess at, or reason about the page contents from this screenshot. '
+                + 'Use text-based signals instead (prod_status gives the live URL and title), or tell the user you cannot see the screen and ask them what is displayed.]',
+            });
+          } else {
+            toolMsgs.push({ role: 'tool', tool_call_id: b.tool_use_id, content: txt || '' });
+          }
         }
       }
       // OpenAI needs tool responses as their own messages, before user text.
@@ -7460,24 +7519,47 @@ async function openAISend(opts) {
   const messages = Array.isArray(opts.messages) ? opts.messages : [];
   const system = typeof opts.system === 'string' ? opts.system : null;
   const maxTokens = Number.isFinite(opts.maxTokens) ? opts.maxTokens : 16384;
-  const body = { model, messages: toOpenAIMessages(messages, system), max_completion_tokens: maxTokens };
+  const vkey = visionKey(base, model);
   const tools = toOpenAITools(opts.tools);
-  if (tools) { body.tools = tools; if (isReasoningModel(model)) body.reasoning_effort = 'none'; }
+  const buildBody = (allowImages) => {
+    const b = { model, messages: toOpenAIMessages(messages, system, allowImages), max_completion_tokens: maxTokens };
+    if (tools) { b.tools = tools; if (isReasoningModel(model)) b.reasoning_effort = 'none'; }
+    return b;
+  };
+  const post = (allowImages) => fetch(`${base}/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` },
+    body: JSON.stringify(buildBody(allowImages)),
+  });
   try {
-    const res = await fetch(`${base}/chat/completions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` },
-      body: JSON.stringify(body),
-    });
+    let allowImages = !VISION_UNSUPPORTED.has(vkey);
+    let res = await post(allowImages);
     if (!res.ok) {
       const errBody = await res.text();
       let parsed = null; try { parsed = JSON.parse(errBody); } catch {}
-      return { ok: false, status: res.status, error: parsed?.error?.type || 'api_error', message: parsed?.error?.message || errBody.slice(0, 500) };
+      // The model just told us it is text-only. Remember that, and retry once
+      // with the screenshot replaced by an explicit "you cannot see" note --
+      // one dead turn per model per session instead of every turn.
+      if (allowImages && isVisionRejection(res.status, parsed, errBody)) {
+        VISION_UNSUPPORTED.add(vkey);
+        console.log(`[inference] ${model} rejected image input -- treating as text-only for this session`);
+        res = await post(false);
+        if (!res.ok) {
+          const e2 = await res.text();
+          let p2 = null; try { p2 = JSON.parse(e2); } catch {}
+          return { ok: false, status: res.status, error: p2?.error?.type || 'api_error', message: p2?.error?.message || e2.slice(0, 500) };
+        }
+      } else {
+        return { ok: false, status: res.status, error: parsed?.error?.type || 'api_error', message: parsed?.error?.message || errBody.slice(0, 500) };
+      }
     }
     const data = await res.json();
     const choice = data.choices?.[0] || {};
     const msg = choice.message || {};
     const text = typeof msg.content === 'string' ? msg.content : '';
+    // Same reasoning-model contract as the streaming path: carry it alongside
+    // the answer, never merged into it.
+    const reasoning = typeof msg.reasoning_content === 'string' ? msg.reasoning_content : '';
     const blocks = [];
     if (text) blocks.push({ type: 'text', text });
     const toolUses = [];
@@ -7486,7 +7568,7 @@ async function openAISend(opts) {
       blocks.push({ type: 'tool_use', id: tc.id, name: tc.function?.name, input });
       toolUses.push({ id: tc.id, name: tc.function?.name, input });
     }
-    return { ok: true, text, content: blocks, toolUses, model: data.model, usage: mapOpenAIUsage(data.usage), stopReason: mapOpenAIFinish(choice.finish_reason) };
+    return { ok: true, text, reasoning, content: blocks, toolUses, model: data.model, usage: mapOpenAIUsage(data.usage), stopReason: mapOpenAIFinish(choice.finish_reason) };
   } catch (e) {
     return { ok: false, error: 'network', message: e.message };
   }
@@ -7504,21 +7586,44 @@ async function openAIStream(opts, send, abortSignal) {
   const messages = Array.isArray(opts.messages) ? opts.messages : [];
   const system = typeof opts.system === 'string' ? opts.system : null;
   const maxTokens = Number.isFinite(opts.maxTokens) ? opts.maxTokens : 16384;
-  const body = { model, messages: toOpenAIMessages(messages, system), max_completion_tokens: maxTokens, stream: true, stream_options: { include_usage: true } };
+  const vkey = visionKey(base, model);
   const tools = toOpenAITools(opts.tools);
-  if (tools) { body.tools = tools; if (isReasoningModel(model)) body.reasoning_effort = 'none'; }
+  const buildBody = (allowImages) => {
+    const b = { model, messages: toOpenAIMessages(messages, system, allowImages), max_completion_tokens: maxTokens, stream: true, stream_options: { include_usage: true } };
+    if (tools) { b.tools = tools; if (isReasoningModel(model)) b.reasoning_effort = 'none'; }
+    return b;
+  };
+  const post = (allowImages) => fetch(`${base}/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}`, 'Accept': 'text/event-stream' },
+    body: JSON.stringify(buildBody(allowImages)),
+    signal: abortSignal,
+  });
   try {
-    const res = await fetch(`${base}/chat/completions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}`, 'Accept': 'text/event-stream' },
-      body: JSON.stringify(body),
-      signal: abortSignal,
-    });
+    let allowImages = !VISION_UNSUPPORTED.has(vkey);
+    let res = await post(allowImages);
     if (!res.ok) {
       const errBody = await res.text();
       let parsed = null; try { parsed = JSON.parse(errBody); } catch {}
-      send({ type: 'error', error: parsed?.error?.type || 'api_error', message: parsed?.error?.message || errBody.slice(0, 500), status: res.status });
-      return { ok: false };
+      // Same one-shot learning as the blocking path. Retried BEFORE
+      // message_start is emitted, so the renderer never sees a half turn.
+      let failText = errBody, failParsed = parsed, failStatus = res.status;
+      if (allowImages && isVisionRejection(res.status, parsed, errBody)) {
+        VISION_UNSUPPORTED.add(vkey);
+        console.log(`[inference] ${model} rejected image input -- treating as text-only for this session`);
+        res = await post(false);
+        if (!res.ok) {
+          // A fresh Response: its body is unread, so read it here. Reusing the
+          // first errBody would report the vision 400 instead of the real one.
+          failText = await res.text();
+          failParsed = null; try { failParsed = JSON.parse(failText); } catch {}
+          failStatus = res.status;
+        }
+      }
+      if (!res.ok) {
+        send({ type: 'error', error: failParsed?.error?.type || 'api_error', message: failParsed?.error?.message || failText.slice(0, 500), status: failStatus });
+        return { ok: false };
+      }
     }
     send({ type: 'message_start', message: { role: 'assistant', model } });
     const reader = res.body.getReader();
@@ -7547,6 +7652,18 @@ async function openAIStream(opts, send, abortSignal) {
         const choice = parsed.choices?.[0];
         if (!choice) continue;
         const delta = choice.delta || {};
+        // Reasoning models on OpenAI-compatible endpoints (DeepSeek V4 Pro via
+        // Fireworks, and friends) stream their chain of thought as
+        // `reasoning_content` deltas and send NO `content` until the reasoning
+        // finishes. Dropping them left the chat frozen for many seconds with no
+        // sign of life, then a sudden answer. Re-emit as Anthropic-shaped
+        // thinking so the renderer can show it the way it already shows
+        // adaptive thinking. Reasoning is NEVER folded into fullText -- it is
+        // not the answer and must not be echoed back as assistant content.
+        const reasoning = delta.reasoning_content;
+        if (typeof reasoning === 'string' && reasoning.length) {
+          send({ type: 'reasoning_delta', text: reasoning });
+        }
         if (typeof delta.content === 'string' && delta.content.length) {
           if (!textStarted) { textStarted = true; textIndex = nextIndex++; send({ type: 'block_start', index: textIndex, block: { type: 'text', text: '' } }); }
           fullText += delta.content;
