@@ -364,6 +364,27 @@ function init(userDataPath, electronSafeStorage) {
   // is unavailable (e.g. macOS where onnxruntime BFCArena crashes
   // prevent embeddings from loading).
   db.exec(CODEBASE_SCHEMA);
+  // One-time repair for the postings the old deleteCodeFtsRows leaked (see its
+  // comment). A contentless FTS5 table cannot be scanned or 'rebuild'-ed, and
+  // the original text of an already-deleted chunk is gone, so the only way to
+  // reach a truthful index is to drop the table and repopulate it from
+  // memory_code_chunks -- which is the actual source of truth for chunk text.
+  // Cheap: it only rewrites postings for chunks that still exist.
+  try {
+    if (getSetting('memoryCodeFtsRebuiltAt') == null) {
+      const n = db.prepare('SELECT COUNT(*) AS c FROM memory_code_chunks').get()?.c || 0;
+      db.exec('DROP TABLE IF EXISTS memory_code_fts');
+      db.exec(CODEBASE_SCHEMA);
+      db.prepare(`
+        INSERT INTO memory_code_fts(rowid, chunk_text)
+        SELECT id, chunk_text FROM memory_code_chunks
+      `).run();
+      setSetting('memoryCodeFtsRebuiltAt', new Date().toISOString());
+      console.log('[db] memory_code_fts rebuilt from', n, 'chunks (stale-posting repair)');
+    }
+  } catch (e) {
+    console.warn('[db] memory_code_fts repair failed:', e.message);
+  }
   // Try loading sqlite-vec (Tier 2 vector search). Failure is non-fatal
   // — FTS5-based recall continues to work without it.
   const vecPath = path.join(__dirname, 'native', 'vec0.dylib');
@@ -1140,7 +1161,14 @@ function memoryArchiveList({ day = null, kind = null, limit = 100 } = {}) {
 // LIKE-tokenized search when sqlite-vec isn't available OR the embed
 // worker isn't ready. Always returns the same shape — renderer code
 // can treat it uniformly.
-async function memoryRecall(query, limit = 8) {
+// workspacePath scopes the Tier 2 code lane to one project. Code chunks are
+// inherently project-scoped -- a chunk from another repo is never a relevant
+// answer here -- but this argument was missing until Aug 18, 2026, so recall
+// searched every workspace ever indexed and could surface a foreign project's
+// source (and, before the watcher exclusion, the proxy inventory) into a model
+// prompt. When no workspace is given the code lane is skipped entirely rather
+// than run unscoped: no open project means no project code to recall.
+async function memoryRecall(query, limit = 8, workspacePath = null) {
   if (!db || !query) return { essentials: [], concepts: [], code: [], buffer: [], sections: [] };
 
   const tokens = String(query)
@@ -1212,7 +1240,9 @@ async function memoryRecall(query, limit = 8) {
           distance: h.distance,
           source: 'vec',
         }));
-        const codeHits = memoryCodeVecSearch(queryVec, limit * 2);
+        const codeHits = workspacePath
+          ? memoryCodeVecSearch(queryVec, limit * 2, workspacePath)
+          : [];
         vecCode = codeHits.map(h => ({
           workspace_path: h.workspace_path,
           file_path: h.file_path,
@@ -1225,7 +1255,9 @@ async function memoryRecall(query, limit = 8) {
     } else if (!embeddingsAvailable) {
       // FTS5-only Tier 2: pull code chunks via keyword search instead of
       // trying to spawn the embed worker (which would crash onnxruntime).
-      const codeHits = memoryCodeFtsSearch(String(query), limit * 2);
+      const codeHits = workspacePath
+        ? memoryCodeFtsSearch(String(query), limit * 2, workspacePath)
+        : [];
       vecCode = codeHits.map(h => ({
         workspace_path: h.workspace_path,
         file_path: h.file_path,
@@ -1817,13 +1849,20 @@ async function backfillConceptEmbeddings() {
 // search results. Contentless FTS5's only supported delete is the special
 // 'delete' command row, and it must be issued per-rowid (no batch form).
 // Fixed Aug 3 2026 — see farnsworth-tier2-fts5-delete-bug.
+// Aug 18 2026 follow-up: the Aug 3 fix used the right mechanism but passed an
+// EMPTY string as the text. A contentless table stores no copy of the row, so
+// the 'delete' command can only find the postings to remove if it is handed the
+// ORIGINAL column values back. With '' it removed nothing and failed silently,
+// so every term of every deleted or re-indexed chunk stayed searchable forever
+// -- including chunks whose source file was removed on purpose. Pass the real
+// chunk_text, and delete FTS rows BEFORE the chunk rows they read from.
 function deleteCodeFtsRows(workspacePath, filePath) {
   const rows = db.prepare(
-    'SELECT id FROM memory_code_chunks WHERE workspace_path = ? AND file_path = ?'
+    'SELECT id, chunk_text FROM memory_code_chunks WHERE workspace_path = ? AND file_path = ?'
   ).all(workspacePath, filePath);
   if (rows.length === 0) return 0;
   const del = db.prepare("INSERT INTO memory_code_fts(memory_code_fts, rowid, chunk_text) VALUES('delete', ?, ?)");
-  for (const { id } of rows) del.run(id, '');
+  for (const { id, chunk_text } of rows) del.run(id, chunk_text == null ? '' : chunk_text);
   return rows.length;
 }
 

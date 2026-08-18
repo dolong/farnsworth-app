@@ -4927,8 +4927,10 @@ setInterval(maybeRetrospectives, 30 * 60 * 1000);
 setTimeout(maybeRetrospectives, 150 * 1000);
 
 ipcMain.handle('memory:bootstrap', async () => db.memoryBootstrap());
-ipcMain.handle('memory:recall', async (_event, query, limit) => {
-  const res = await db.memoryRecall(query, limit);
+ipcMain.handle('memory:recall', async (_event, query, limit, workspacePath) => {
+  // Scope the code lane to the open project. Callers may pass a path
+  // explicitly; otherwise the app's active folder is the right boundary.
+  const res = await db.memoryRecall(query, limit, workspacePath || currentFolderSetting());
   // Stage 3: retrieval re-rank. A model orders (and prunes) the concept +
   // section candidates. Essentials / code / buffer keep their FTS order.
   // On any failure the raw FTS5-ordered result goes back unchanged.
@@ -6874,12 +6876,14 @@ function globToRegex(glob) {
 }
 
 async function executeAgentTool(name, input, folderOverride) {
-  // memory_recall works without a workspace folder — it searches the
-  // assistant's own store, not the project.
+  // memory_recall works without a workspace folder: the fact lanes
+  // (essentials, concepts, sections, buffer, conversations) are the
+  // assistant's own global store. The code lane is project-scoped and is
+  // skipped when no folder is open.
   if (name === 'memory_recall') {
     const q = String(input?.query || '').trim();
     if (!q) return { ok: false, error: 'bad_input', message: 'query required' };
-    const res = await db.memoryRecall(q, 8);
+    const res = await db.memoryRecall(q, 8, folderOverride || currentFolderSetting());
     const fmt = [];
     if (res.essentials?.length) fmt.push('essentials:\n' + res.essentials.map(e => `- ${e.key}: ${e.value}`).join('\n'));
     if (res.concepts?.length) fmt.push('concepts:\n' + res.concepts.map(c => `- ${c.slug}: ${String(c.lead || c.title || '').slice(0, 200)}`).join('\n'));

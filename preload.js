@@ -416,7 +416,7 @@ contextBridge.exposeInMainWorld('farnsworth', {
   // consolidate → flip buffer rows to consolidated
   // archive/buffer → read daily log + buffer (debugging + future community)
   memoryBootstrap: () => ipcRenderer.invoke('memory:bootstrap'),
-  memoryRecall: (query, limit) => ipcRenderer.invoke('memory:recall', query, limit),
+  memoryRecall: (query, limit, workspacePath) => ipcRenderer.invoke('memory:recall', query, limit, workspacePath),
   memoryRemember: (content, opts) => ipcRenderer.invoke('memory:remember', content, opts),
   memoryGet: (slug) => ipcRenderer.invoke('memory:get', slug),
   memorySet: (concept) => ipcRenderer.invoke('memory:set', concept),
