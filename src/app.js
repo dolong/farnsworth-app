@@ -753,6 +753,12 @@ function estimateMessageTokens(msg) {
     return c.reduce((sum, block) => {
       if (block?.type === 'text') return sum + estimateTokens(block.text);
       if (block?.type === 'image') return sum + 1200; // flat per-image estimate
+      // Tool traces are part of cross-turn history now (see
+      // agentMsgToApiMessages) and are frequently the largest thing in a
+      // turn, so they have to be counted or compaction never fires on a
+      // tool-heavy conversation.
+      if (block?.type === 'tool_use') return sum + estimateTokens(JSON.stringify(block.input || {})) + 8;
+      if (block?.type === 'tool_result') return sum + estimateMessageTokens({ content: block.content });
       return sum;
     }, 0);
   }
@@ -769,9 +775,18 @@ function buildTranscriptForSummary(messages) {
   return messages.map(m => {
     const who = m.role === 'assistant' ? 'Assistant' : 'User';
     const c = m.content;
+    // Tool calls are named in the recap. A summary that says only what the
+    // assistant *said* teaches the compacted model the same bad lesson the
+    // old history rebuild did: that answers arrive without tools.
     const text = typeof c === 'string'
       ? c
-      : (Array.isArray(c) ? c.filter(b => b?.type === 'text').map(b => b.text).join('\n') : '');
+      : (Array.isArray(c)
+          ? c.map(b => {
+              if (b?.type === 'text') return b.text;
+              if (b?.type === 'tool_use') return `[called ${b.name}]`;
+              return '';
+            }).filter(Boolean).join('\n')
+          : '');
     return `${who}: ${text.slice(0, 2000)}`;
   }).join('\n\n');
 }
@@ -818,18 +833,166 @@ function mergeSummaryIntoHistory(summaryText, recentMsgs) {
   return [{ ...first, content: mergedContent }, ...recentMsgs.slice(1)];
 }
 
+// ============================================================
+// TOOL TRACE PRESERVATION ACROSS TURNS (Aug 17 2026)
+//
+// getCompactedAgentHistory used to rebuild every prior turn as
+// `{ role, content: m.text }` -- the assistant's final prose, nothing else.
+// Every tool_use and tool_result block from earlier turns was dropped. The
+// agent loop keeps proper blocks WITHIN a turn (see the history.push calls
+// in sendChatMessage), but the moment the user sent another message the
+// entire tool trace collapsed to one paragraph.
+//
+// The model then read a transcript of itself confidently answering "the URL
+// is X" having apparently never called a tool, and copied that pattern: it
+// stopped emitting tool calls and started writing plausible tool results as
+// prose. Kimi K3 narrated a `prod_stop()` result, quoted an invented error
+// ("Session with given id not found") and reported a full status block on
+// turns with zero actual tool calls, while the browser stayed running.
+// Reproduced 3/3 on a fresh chat; the tell was input tokens SHRINKING
+// (6845 -> 5455) as the conversation grew.
+//
+// It also meant screenshots never survived the turn they were taken in, so
+// "take a screenshot and check" spread across two messages never had a
+// picture attached -- the v0.2.18 image repair only ever worked in-turn.
+// ============================================================
+
+// Re-attaching every historical screenshot would put megabytes of base64 in
+// every request. Only the freshest one is re-sent; older ones keep their
+// text result and say plainly that the pixels are gone, so the model asks
+// for a new screenshot instead of describing a stale one from memory.
+const HISTORY_IMAGE_KEEP_LAST = 1;
+
+// run_command repoints its timeline entry at the terminal chip, which
+// carries only display fields. The tool-bearing chip is the superseded one
+// sitting immediately before it.
+function chipForTimelineEntry(chips, chipIndex) {
+  const chip = chips[chipIndex];
+  if (chip && chip.name) return chip;
+  const prev = chipIndex > 0 ? chips[chipIndex - 1] : null;
+  if (prev && prev.name && prev._superseded) return prev;
+  return null;
+}
+
+// Which screenshot chips still get their pixels re-sent: the last N across
+// the whole prior history. Returns a Set of chip object references.
+function pickHistoryImageChips(allPriorMsgs, keepLast) {
+  const keep = new Set();
+  for (let i = allPriorMsgs.length - 1; i >= 0 && keep.size < keepLast; i--) {
+    const chips = allPriorMsgs[i]?.chips;
+    if (!Array.isArray(chips)) continue;
+    for (let j = chips.length - 1; j >= 0 && keep.size < keepLast; j--) {
+      if (chips[j]?.screenshotBase64) keep.add(chips[j]);
+    }
+  }
+  return keep;
+}
+
+// Rebuilds one stored agent message into the API messages it originally
+// produced: assistant(text + tool_use...) followed by user(tool_result...),
+// one pair per round, in the order the timeline recorded them.
+function agentMsgToApiMessages(m, keepImageChips) {
+  const chips = Array.isArray(m.chips) ? m.chips : [];
+  const timeline = Array.isArray(m.timeline) ? m.timeline : [];
+  const hasTools = timeline.some(e => e.type === 'chip' && chipForTimelineEntry(chips, e.chipIndex));
+  if (!hasTools) return [{ role: 'assistant', content: m.text || '' }];
+
+  const out = [];
+  let pendingText = '';
+  let uses = [];
+  let results = [];
+  let n = 0;
+  const flushRound = () => {
+    if (!uses.length) return;
+    const content = [];
+    if (pendingText.trim()) content.push({ type: 'text', text: pendingText });
+    out.push({ role: 'assistant', content: [...content, ...uses] });
+    // tool_result blocks must lead their user message, which they do here
+    // because nothing else is ever put in it.
+    out.push({ role: 'user', content: results });
+    pendingText = ''; uses = []; results = [];
+  };
+
+  for (const e of timeline) {
+    if (e?.type === 'text') {
+      if (uses.length) flushRound();
+      pendingText += e.text || '';
+      continue;
+    }
+    if (e?.type !== 'chip') continue;
+    const chip = chipForTimelineEntry(chips, e.chipIndex);
+    if (!chip) continue;
+    const id = `${m.id || 'msg'}-hist-${n++}`;
+    uses.push({ type: 'tool_use', id, name: chip.name, input: chip.input || {} });
+    let rc = typeof chip.output === 'string'
+      ? chip.output
+      : (chip.output == null ? 'OK' : JSON.stringify(chip.output));
+    if (chip.screenshotBase64) {
+      if (keepImageChips.has(chip)) {
+        rc = [
+          { type: 'text', text: rc || 'Screenshot captured.' },
+          { type: 'image', source: { type: 'base64', media_type: 'image/png', data: chip.screenshotBase64 } },
+        ];
+      } else {
+        rc = (rc || 'Screenshot captured.')
+          + '\n[The image from this earlier step is not re-attached. Take a new screenshot if you need to see the screen as it is now — do not describe this one from memory.]';
+      }
+    }
+    results.push({ type: 'tool_result', tool_use_id: id, content: capToolResultContent(rc, chip.name) });
+  }
+  flushRound();
+  if (pendingText.trim()) {
+    out.push({ role: 'assistant', content: pendingText });
+  } else if (out.length && out[out.length - 1].role === 'user') {
+    // A turn stopped mid-tool ends on its tool_result, which would put two
+    // user messages back to back once the next real message follows.
+    out.push({ role: 'assistant', content: m.text || '[This turn was interrupted before I replied.]' });
+  }
+  return out;
+}
+
+// Last line of defence for strict user/assistant alternation. Adjacent
+// same-role messages are merged rather than dropped; tool_result blocks stay
+// at the front of the merged user message, which is what the API requires.
+function coalesceRoles(messages) {
+  const out = [];
+  for (const m of messages) {
+    const prev = out[out.length - 1];
+    if (!prev || prev.role !== m.role) { out.push({ ...m }); continue; }
+    const asBlocks = (c) => (Array.isArray(c) ? c : [{ type: 'text', text: String(c ?? '') }]);
+    const merged = [...asBlocks(prev.content), ...asBlocks(m.content)];
+    prev.content = [
+      ...merged.filter(b => b.type === 'tool_result'),
+      ...merged.filter(b => b.type !== 'tool_result'),
+    ];
+  }
+  return out;
+}
+
+function mapPriorMsgs(msgs, keepImageChips) {
+  return coalesceRoles(msgs.flatMap(m => (
+    m.role === 'agent'
+      ? agentMsgToApiMessages(m, keepImageChips)
+      : [{ role: 'user', content: m.text }]
+  )));
+}
+
 // Main entry point -- replaces the old blind `.slice(-20)` truncation in
 // sendChatMessage. Returns a role/content-mapped array ready to spread into
 // the API `messages` array (same shape the old `prior` produced).
 async function getCompactedAgentHistory(allPriorMsgs, convId) {
-  const mapped = allPriorMsgs.map(m => ({ role: m.role === 'agent' ? 'assistant' : 'user', content: m.text }));
+  const keepImageChips = pickHistoryImageChips(allPriorMsgs, HISTORY_IMAGE_KEEP_LAST);
+  const mapped = mapPriorMsgs(allPriorMsgs, keepImageChips);
   const threshold = state.settings?.chat?.compactThreshold || COMPACTION_DEFAULT_THRESHOLD;
   if (estimateMessagesTokens(mapped) < threshold) {
     return mapped; // small enough -- send everything, no truncation, no compaction
   }
 
-  const recent = mapped.slice(-COMPACTION_KEEP_LAST);
-  const compactable = mapped.slice(0, -COMPACTION_KEEP_LAST);
+  // Split on SOURCE messages, not on the flattened API messages: keep-last
+  // is a count of conversational turns, and slicing the flattened array
+  // could cut a round in half and orphan a tool_result from its tool_use.
+  const recent = mapPriorMsgs(allPriorMsgs.slice(-COMPACTION_KEEP_LAST), keepImageChips);
+  const compactable = mapPriorMsgs(allPriorMsgs.slice(0, -COMPACTION_KEEP_LAST), keepImageChips);
   if (!compactable.length) return mapped; // conversation IS the keep-last window
 
   const cached = _compactionCache.get(convId);

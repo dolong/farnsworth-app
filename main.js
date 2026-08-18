@@ -2752,6 +2752,30 @@ async function prodAttachCdp(browserWsUrl) {
         prodBroadcast('prod:frame', { data, width, height, metadata: latestProdFrame.metadata, ts: latestProdFrame.ts });
       }
       try { prodCdpCall('Page.screencastFrameAck', { sessionId: msg.params.sessionId }, prodSession.pageSessionId, 5000).catch(() => {}); } catch {}
+      return;
+    }
+    if (msg.method === 'Target.targetCreated') {
+      const info = msg.params?.targetInfo;
+      if (!info) return;
+      const isNew = !prodKnownTargetIds.has(info.targetId);
+      prodKnownTargetIds.add(info.targetId);
+      if (isNew) prodAdoptTarget(info);
+      return;
+    }
+    if (msg.method === 'Target.targetInfoChanged') {
+      const info = msg.params?.targetInfo;
+      if (info && prodSession && info.targetId === prodSession.pageTargetId) {
+        prodSession.url = info.url || prodSession.url;
+        prodSession.title = info.title || prodSession.title;
+        prodEmitStatus();
+      }
+      return;
+    }
+    if (msg.method === 'Target.targetDestroyed') {
+      const gone = msg.params?.targetId;
+      prodKnownTargetIds.delete(gone);
+      prodInternalTargetIds.delete(gone);
+      if (prodSession && gone === prodSession.pageTargetId) prodRebindAfterTargetGone();
     }
   });
   ws.on('close', () => {
@@ -2759,25 +2783,99 @@ async function prodAttachCdp(browserWsUrl) {
   });
   const targets = await prodCdpCall('Target.getTargets');
   const pages = (targets.targetInfos || []).filter((t) => t.type === 'page');
-  const page = pages.find((t) => /reddit\.com/i.test(t.url || '')) || pages.find((t) => t.url && t.url !== 'about:blank') || pages[0];
+  const page = pages.find((t) => t.url && t.url !== 'about:blank' && !/^chrome:\/\//i.test(t.url)) || pages[0];
   if (!page) throw new Error('No Chrome page target found');
-  const attached = await prodCdpCall('Target.attachToTarget', { targetId: page.targetId, flatten: true });
-  prodSession.pageTargetId = page.targetId;
+  // Everything already open at attach time is "known". Enabling discovery
+  // replays a targetCreated for each of them, and adopting those would yank
+  // the view onto a background tab the moment the session starts.
+  prodKnownTargetIds.clear();
+  for (const t of targets.targetInfos || []) prodKnownTargetIds.add(t.targetId);
+  await prodBindPageTarget(page.targetId, { url: page.url, title: page.title });
+  // Without target discovery the session stays welded to whichever tab
+  // existed at launch. A link with target="_blank" then opens a real second
+  // tab that the operator can see, while the screencast, screenshots and
+  // prod_input all keep hitting the original -- which reads exactly like
+  // "it clicks links and opens tabs but the browser never moves".
+  await prodCdpCall('Target.setDiscoverTargets', { discover: true }).catch(() => {});
+}
+
+// Internal throwaway tabs (the egress echo probe) must never steal the view.
+// Registering the id after Target.createTarget returns is too late: the
+// targetCreated event races ahead of the response, so the session adopted the
+// probe tab, detached the screencast from the real page mid-launch, and hung
+// the start flow. The counter is raised BEFORE the tab is created.
+const prodInternalTargetIds = new Set();
+let prodInternalTargetPending = 0;
+// Targets that already existed when discovery was switched on.
+const prodKnownTargetIds = new Set();
+
+// Attach to a page target and make it the one the session shows and drives.
+// Safe to call repeatedly: it tears the screencast off the previous target
+// first so two tabs can't both stream frames.
+async function prodBindPageTarget(targetId, hint = {}) {
+  if (!prodSession) return;
+  const prevSession = prodSession.pageSessionId;
+  if (prevSession && prodSession.pageTargetId !== targetId) {
+    await prodCdpCall('Page.stopScreencast', {}, prevSession, 5000).catch(() => {});
+    await prodCdpCall('Target.detachFromTarget', { sessionId: prevSession }, null, 5000).catch(() => {});
+  }
+  const attached = await prodCdpCall('Target.attachToTarget', { targetId, flatten: true });
+  prodSession.pageTargetId = targetId;
   prodSession.pageSessionId = attached.sessionId;
   await prodCdpCall('Page.enable', {}, attached.sessionId);
   await prodCdpCall('Runtime.enable', {}, attached.sessionId);
   const evalResult = await prodCdpCall('Runtime.evaluate', {
     expression: 'JSON.stringify({url:location.href,title:document.title,webdriver:navigator.webdriver,viewport:{width:innerWidth,height:innerHeight,devicePixelRatio:devicePixelRatio}})',
     returnByValue: true,
-  }, attached.sessionId);
+  }, attached.sessionId).catch(() => ({}));
   try {
     const health = JSON.parse(evalResult.result?.value || '{}');
-    prodSession.url = health.url || page.url;
-    prodSession.title = health.title || page.title;
-    prodSession.webdriver = health.webdriver;
-    prodSession.viewport = health.viewport || null;
-  } catch { prodSession.url = page.url; prodSession.title = page.title; }
+    prodSession.url = health.url || hint.url || null;
+    prodSession.title = health.title || hint.title || null;
+    if (health.webdriver !== undefined) prodSession.webdriver = health.webdriver;
+    if (health.viewport) prodSession.viewport = health.viewport;
+  } catch { prodSession.url = hint.url || null; prodSession.title = hint.title || null; }
   await prodCdpCall('Page.startScreencast', { format: 'jpeg', quality: 72, maxWidth: 1440, maxHeight: 1200, everyNthFrame: 1 }, attached.sessionId);
+  prodEmitStatus();
+}
+
+// Chrome foregrounds a newly opened tab, so the session follows it. Anything
+// we opened ourselves, and anything that is not a page, is ignored.
+async function prodAdoptTarget(info) {
+  if (!prodSession || !info || info.type !== 'page') return;
+  if (prodInternalTargetIds.has(info.targetId)) return;
+  if (prodSession.pageTargetId === info.targetId) return;
+  // Anything the app opened for its own purposes is claimed here rather than
+  // followed. Citadel also matched its egress-probe URL at this point; that
+  // clause is dropped because Farnsworth has no proxy module, and a bare
+  // reference to a never-declared identifier throws a ReferenceError that
+  // would silently kill the rest of this function.
+  if (prodInternalTargetPending > 0) {
+    prodInternalTargetIds.add(info.targetId);
+    return;
+  }
+  try {
+    await prodBindPageTarget(info.targetId, { url: info.url, title: info.title });
+    console.log('[prod] followed new tab:', info.url || info.targetId);
+  } catch (e) {
+    console.warn('[prod] could not follow new tab:', e.message);
+  }
+}
+
+// When the tab we were driving closes, fall back to whatever page is left
+// rather than streaming a dead session.
+async function prodRebindAfterTargetGone() {
+  if (!prodSession) return;
+  try {
+    const { targetInfos = [] } = await prodCdpCall('Target.getTargets');
+    const pages = targetInfos.filter((t) => t.type === 'page' && !prodInternalTargetIds.has(t.targetId));
+    const next = pages.find((t) => t.url && t.url !== 'about:blank') || pages[0];
+    if (!next) { prodSession.url = null; prodSession.title = null; prodEmitStatus(); return; }
+    prodSession.pageSessionId = null; // the old session is already gone
+    await prodBindPageTarget(next.targetId, { url: next.url, title: next.title });
+  } catch (e) {
+    console.warn('[prod] rebind after tab close failed:', e.message);
+  }
 }
 async function stopProdSession(reason = 'stop') {
   const current = prodSession;
