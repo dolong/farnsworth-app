@@ -364,7 +364,9 @@ button { font-family: inherit; cursor: pointer; }
   display: flex; flex-direction: column;
   /* Jul 19: shrinkable + clip so chat thread can scroll even when the panel is narrow. */
   min-width: 0;
-  overflow: hidden;}
+  overflow: hidden;
+  /* Aug 20: anchors the pane-wide drag-and-drop overlay (.chat--dragover). */
+  position: relative;}
 
 .terminal {
   flex: 1; min-height: 0;
@@ -1270,7 +1272,31 @@ pre:hover .code-copy { opacity: 1; }
   display: flex; gap: 8px; padding: 8px 14px;
   border-top: 1px solid #232428;
   flex: 0 0 auto;
+  position: relative; /* anchors the floating "Jump to latest" pill (Aug 20) */
 }
+/* Jump to latest (Aug 20 2026). Sits directly above the CTA row, i.e. floating
+   over the bottom edge of the thread, and rides composer growth for free
+   because the CTA row is in normal flow. Hidden while the thread is stuck to
+   the bottom. */
+.chat__jump {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex; align-items: center; gap: 6px;
+  padding: 5px 12px;
+  border: 1px solid #3a3d44;
+  border-radius: 999px;
+  background: #1f2023;
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 12px; font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 4px 14px rgba(0,0,0,.35);
+  z-index: 5;
+}
+.chat__jump:hover { background: #2b2d31; border-color: var(--accent-blurple); }
+.chat__jump[hidden] { display: none; }
 
 .chat__input-wrap {
   flex: 0 0 auto;
@@ -1383,9 +1409,44 @@ pre:hover .code-copy { opacity: 1; }
   flex: 0 0 32px;
   overflow: hidden;
 }
-/* Drag-over highlight on the input wrap (Jul 16 ~23:55 ET). Activates
-   while a file is being dragged over the chat input area — gives a
-   blue border + subtle background tint so the drop target is obvious. */
+/* Drag-over highlight on the WHOLE chat pane (Aug 20 2026, widened from the
+   composer-only version of Jul 16). The entire pane — thread included — is the
+   drop target, so the affordance has to cover the pane: an inset dashed
+   blurple frame plus a centred "Drop to attach" label. pointer-events:none on
+   both pseudo-elements keeps the drag events flowing to the pane itself. */
+.chat--dragover::before {
+  content: '';
+  position: absolute;
+  inset: 6px;
+  pointer-events: none;
+  border: 2px dashed var(--accent-blurple);
+  border-radius: 12px;
+  background: rgba(88,101,242,0.07);
+  z-index: 40;
+}
+/* Centred label. Rendered as a solid pill rather than bare text because it
+   floats over message bubbles — plain text was unreadable against them. */
+.chat--dragover::after {
+  content: 'Drop to attach';
+  position: absolute;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  padding: 10px 20px;
+  border-radius: 999px;
+  border: 1px solid var(--accent-blurple);
+  background: #1f2023;
+  box-shadow: 0 6px 22px rgba(0,0,0,.5);
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: .2px;
+  color: var(--text-primary);
+  white-space: nowrap;
+  z-index: 41;
+}
+
+/* Legacy composer-only drag highlight (Jul 16 ~23:55 ET). Superseded by the
+   pane-wide affordance above; kept for the input-wrap fallback path. */
 .chat__input-wrap--dragover .chat__input {
   border-color: var(--accent-blurple);
   box-shadow: 0 0 0 2px rgba(88,101,242,0.25), 0 4px 14px rgba(0,0,0,.2);

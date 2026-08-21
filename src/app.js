@@ -597,16 +597,80 @@ function fileIcon(type) {
 // ============================================================================
 // CHAT THREAD
 // ============================================================================
+//
+// AUTOSCROLL — sticky bottom (Aug 20 2026).
+//
+// renderChat() used to slam scrollTop to scrollHeight on every re-render. A
+// streaming turn re-renders constantly (every thinking note, every tool chip),
+// so scrolling up to re-read the previous reply while the agent worked was
+// impossible — the view yanked back to the bottom within a beat. Long reported
+// exactly that.
+//
+// The thread now FOLLOWS the bottom only while the user is already parked
+// there. Scrolling up detaches; scrolling back within CHAT_STICK_PX of the
+// bottom re-attaches. While detached, a "Jump to latest" pill appears and the
+// prior scroll offset is preserved across re-renders (content grows at the
+// bottom, so the offset keeps the reader's place).
+//
+// The scroll listener is idempotent with the programmatic restore below: after
+// a render we set scrollTop to either the bottom (sticky) or the previous
+// offset (detached), and the async scroll event that follows recomputes the
+// same state it already had. So no suppression flag is needed.
+const CHAT_STICK_PX = 60;
+let chatStickToBottom = true;
+
+function chatThreadAtBottom(thread) {
+  if (!thread) return true;
+  return (thread.scrollHeight - thread.scrollTop - thread.clientHeight) <= CHAT_STICK_PX;
+}
+
+function updateChatJumpBtn() {
+  const btn = document.getElementById('chat-jump');
+  if (!btn) return;
+  btn.hidden = chatStickToBottom;
+}
+
+// Re-attach and ride the bottom. Called when the user sends a message and when
+// the jump pill is clicked — both are explicit "take me to the latest" intents.
+function chatScrollToBottom() {
+  const thread = document.getElementById('chat-thread');
+  chatStickToBottom = true;
+  if (thread) thread.scrollTop = thread.scrollHeight;
+  updateChatJumpBtn();
+}
+
+function initChatScrollTracking() {
+  const thread = document.getElementById('chat-thread');
+  if (!thread || thread.dataset.stickyInit === '1') return;
+  thread.dataset.stickyInit = '1';
+  thread.addEventListener('scroll', () => {
+    chatStickToBottom = chatThreadAtBottom(thread);
+    updateChatJumpBtn();
+  }, { passive: true });
+  document.getElementById('chat-jump')?.addEventListener('click', () => {
+    chatScrollToBottom();
+  });
+  updateChatJumpBtn();
+}
+
 function renderChat() {
   const thread = $('#chat-thread');
+  initChatScrollTracking();
+  // Capture BEFORE the wipe — innerHTML='' resets scrollTop to 0.
+  const wasSticky = chatStickToBottom;
+  const prevTop = thread.scrollTop;
   thread.innerHTML = '';
   state.chatMessages.forEach(m => thread.appendChild(renderMessage(m)));
   // Keep the composer button's Send/Stop glyph in sync with the in-flight
   // turn — guards against a stale Stop glyph after a reload or a render that
   // happens outside the turn lifecycle.
   updateChatSendButton();
-  // Auto-scroll to bottom
-  thread.scrollTop = thread.scrollHeight;
+  // Follow the bottom only if the reader was already there; otherwise hold
+  // their place.
+  if (wasSticky) thread.scrollTop = thread.scrollHeight;
+  else thread.scrollTop = prevTop;
+  chatStickToBottom = wasSticky;
+  updateChatJumpBtn();
   // Persist the active conversation (debounced) so the dropdown always reflects
   // the current state and a hard refresh doesn't lose work-in-progress.
   scheduleChatHistorySave();
@@ -1119,6 +1183,7 @@ async function startNewConversation() {
     { id: 'welcome-' + Date.now(), role: 'agent', text: 'New chat — what do you want to build?', verified: true },
   ];
   renderChat();
+  chatScrollToBottom();
   await refreshChatHistoryList();
   toggleChatHistory(false);
   // Jul 6 ~09:00 ET — refresh the chat header so the new conv title appears.
@@ -1144,6 +1209,9 @@ async function switchConversation(id) {
   await persistChatActiveId(conv.id);
   state.chatMessages = Array.isArray(conv.messages) ? conv.messages : [];
   renderChat();
+  // Opening a conversation always lands at its latest message, regardless of
+  // where the reader was parked in the previous one (Aug 20).
+  chatScrollToBottom();
   await refreshChatHistoryList();
   toggleChatHistory(false);
   // Jul 6 ~09:00 ET — refresh the chat header subline so the new conv title appears.
@@ -1773,8 +1841,10 @@ function animateFinalVerdict(msgId) {
           const msgRect = msgEl.getBoundingClientRect();
           const threadRect = thread.getBoundingClientRect();
           // Message is in/near the viewport — scroll thread to bottom so
-          // the growing message stays anchored.
-          if (msgRect.top < threadRect.bottom && msgRect.bottom > threadRect.top) {
+          // the growing message stays anchored. Aug 20: also requires the
+          // reader to still be parked at the bottom, so a typewriter pass
+          // can't yank someone who has scrolled up to re-read.
+          if (chatStickToBottom && msgRect.top < threadRect.bottom && msgRect.bottom > threadRect.top) {
             thread.scrollTop = thread.scrollHeight;
           }
         }
@@ -11802,34 +11872,89 @@ function wire() {
     // us an absolute path on disk directly. We suppress the default
     // browser drop behavior so the browser doesn't navigate to the
     // file URL on a missed drop.
+    // Aug 20 2026: the drop zone is the WHOLE chat pane, not just the
+    // composer. Long reported drag-and-drop looked broken because he dropped
+    // screenshots onto the message thread — the obvious target — where the old
+    // handler only swallowed the event to stop a file:// navigation. Same fix
+    // pass: dropped IMAGE files now become real image attachments (multimodal
+    // blocks the model can actually see) instead of path-only file references,
+    // matching what clipboard paste already did.
     const inputWrap = chatInput.closest('.chat__input-wrap');
     const chatPane = chatInput.closest('.chat');
-    if (inputWrap) {
+    const dropZone = chatPane || inputWrap;
+    if (dropZone) {
       let dragCounter = 0;
-      const showDragOver = () => { inputWrap.classList.add('chat__input-wrap--dragover'); };
-      const hideDragOver = () => { inputWrap.classList.remove('chat__input-wrap--dragover'); };
-      inputWrap.addEventListener('dragenter', (ev) => {
-        if (!ev.dataTransfer || !ev.dataTransfer.types.includes('Files')) return;
+      const showDragOver = () => { dropZone.classList.add('chat--dragover'); };
+      const hideDragOver = () => { dropZone.classList.remove('chat--dragover'); };
+      const hasFiles = (ev) => !!(ev.dataTransfer && Array.from(ev.dataTransfer.types || []).includes('Files'));
+      const isImageDrop = (f) => (f.type || '').startsWith('image/')
+        || /\.(png|jpe?g|gif|webp|bmp)$/i.test(f.name || '');
+
+      // Read a dropped image off disk as a data URL so it travels as an
+      // Anthropic image block. FileReader works directly on the dropped File —
+      // no IPC round trip needed.
+      const readImageDataUrl = (file) => new Promise((resolve) => {
+        try {
+          const fr = new FileReader();
+          fr.onload = () => resolve(typeof fr.result === 'string' ? fr.result : null);
+          fr.onerror = () => resolve(null);
+          fr.readAsDataURL(file);
+        } catch { resolve(null); }
+      });
+
+      dropZone.addEventListener('dragenter', (ev) => {
+        if (!hasFiles(ev)) return;
         ev.preventDefault();
         dragCounter++;
         showDragOver();
       });
-      inputWrap.addEventListener('dragover', (ev) => {
-        if (!ev.dataTransfer || !ev.dataTransfer.types.includes('Files')) return;
+      dropZone.addEventListener('dragover', (ev) => {
+        if (!hasFiles(ev)) return;
         ev.preventDefault();
         ev.dataTransfer.dropEffect = 'copy';
+        // Assert the affordance on every dragover rather than trusting the
+        // enter/leave counter. A drag that starts outside the window can land
+        // its first event on a deep child and skip dragenter, and fast drags
+        // over nested children can drift the counter — either way the overlay
+        // must be lit while a file is genuinely hovering. classList.add is
+        // idempotent, so this is free.
+        if (dragCounter === 0) dragCounter = 1;
+        showDragOver();
       });
-      inputWrap.addEventListener('dragleave', (ev) => {
-        if (!ev.dataTransfer || !ev.dataTransfer.types.includes('Files')) return;
+      dropZone.addEventListener('dragleave', (ev) => {
+        if (!hasFiles(ev)) return;
         dragCounter--;
         if (dragCounter <= 0) { dragCounter = 0; hideDragOver(); }
       });
-      inputWrap.addEventListener('drop', async (ev) => {
+      dropZone.addEventListener('drop', async (ev) => {
         dragCounter = 0;
         hideDragOver();
-        if (!ev.dataTransfer || !ev.dataTransfer.files || !ev.dataTransfer.files.length) return;
+        if (!hasFiles(ev)) return;
+        // Always swallow the drop so a miss never navigates the renderer to a
+        // file:// URL, even when the payload carries nothing usable.
         ev.preventDefault();
-        for (const f of ev.dataTransfer.files) {
+        const files = ev.dataTransfer.files;
+        if (!files || !files.length) return;
+        for (const f of files) {
+          if (isImageDrop(f)) {
+            const dataUrl = await readImageDataUrl(f);
+            if (dataUrl) {
+              const img = new Image();
+              await new Promise((res) => { img.onload = res; img.onerror = res; img.src = dataUrl; });
+              state.chatAttachments.push({
+                id: 'att-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6),
+                type: 'image',
+                dataUrl,
+                mime: f.type || 'image/png',
+                width: img.naturalWidth || 0,
+                height: img.naturalHeight || 0,
+                sizeBytes: f.size || 0,
+              });
+              renderChatAttachments();
+              continue;
+            }
+            // Fall through to a path reference if the read failed.
+          }
           if (!f.path) continue;
           addFileAttachment({
             filePath: f.path,
@@ -11839,16 +11964,6 @@ function wire() {
           });
         }
       });
-      // Catch a missed drop on the rest of the chat pane and swallow
-      // it so the browser doesn't navigate to a file:// URL.
-      if (chatPane) {
-        chatPane.addEventListener('dragover', (ev) => {
-          if (ev.dataTransfer && ev.dataTransfer.types.includes('Files')) ev.preventDefault();
-        });
-        chatPane.addEventListener('drop', (ev) => {
-          if (ev.dataTransfer && ev.dataTransfer.types.includes('Files')) ev.preventDefault();
-        });
-      }
     }
   }
 
@@ -12628,6 +12743,9 @@ async function sendChatMessage(opts) {
   state.chatMessages.push({ id: agentMsgId, role: 'agent', working: true, workingLabel: 'Thinking' });
   if (!synthetic && input) input.value = '';
   renderChat();
+  // Sending is an explicit "show me the latest" — re-attach to the bottom even
+  // if the reader had scrolled up before hitting send (Aug 20).
+  chatScrollToBottom();
 
   // Memory preamble — Tier 3 (Jul 12 2026). Stages 4+5: the router picks
   // which concept articles matter for THIS message (cheap model, every

@@ -146,6 +146,13 @@
           <div class="chat__thread" id="chat-thread"><!-- messages rendered by app.js --></div>
 
           <div class="chat__ctas">
+            <!-- Jump to latest (Aug 20 2026) — appears only while the reader has
+                 scrolled up off the bottom; anchored above this row so it floats
+                 over the end of the thread and tracks composer growth. -->
+            <button class="chat__jump" id="chat-jump" hidden>
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M19 12l-7 7-7-7"/></svg>
+              Jump to latest
+            </button>
             <button class="btn btn--ghost btn--sm" id="btn-new-chat">
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
               New chat
