@@ -1272,31 +1272,13 @@ pre:hover .code-copy { opacity: 1; }
   display: flex; gap: 8px; padding: 8px 14px;
   border-top: 1px solid #232428;
   flex: 0 0 auto;
-  position: relative; /* anchors the floating "Jump to latest" pill (Aug 20) */
 }
-/* Jump to latest (Aug 20 2026). Sits directly above the CTA row, i.e. floating
-   over the bottom edge of the thread, and rides composer growth for free
-   because the CTA row is in normal flow. Hidden while the thread is stuck to
-   the bottom. */
-.chat__jump {
-  position: absolute;
-  bottom: calc(100% + 8px);
-  left: 50%;
-  transform: translateX(-50%);
-  display: flex; align-items: center; gap: 6px;
-  padding: 5px 12px;
-  border: 1px solid #3a3d44;
-  border-radius: 999px;
-  background: #1f2023;
-  color: var(--text-primary);
-  font-family: inherit;
-  font-size: 12px; font-weight: 600;
-  cursor: pointer;
-  box-shadow: 0 4px 14px rgba(0,0,0,.35);
-  z-index: 5;
-}
-.chat__jump:hover { background: #2b2d31; border-color: var(--accent-blurple); }
-.chat__jump[hidden] { display: none; }
+/* Autoscroll toggle in the chat header (Aug 21 2026). Default (on) hides the
+   slash and renders like any other header icon button. Off shows the slash and
+   dims, so the state is readable at a glance without opening a tooltip. */
+.chat__autoscroll .chat__autoscroll-slash { display: none; }
+.chat__autoscroll--off .chat__autoscroll-slash { display: inline; }
+.chat__autoscroll--off { color: var(--text-muted, #80848e); opacity: .75; }
 
 .chat__input-wrap {
   flex: 0 0 auto;

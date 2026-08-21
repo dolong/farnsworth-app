@@ -121,6 +121,15 @@
               </div>
             </div>
             <div class="chat__header-actions">
+              <!-- Autoscroll toggle (Aug 21 2026). Persisted as 'chat.autoscroll';
+                   default on. Off means the thread never moves on its own while
+                   the agent streams. The slashed arrow shows the off state. -->
+              <button class="iconbtn iconbtn--sm chat__autoscroll" id="chat-autoscroll" aria-pressed="true" title="Autoscroll on">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 4v13"/><path d="M18 11l-6 6-6-6"/>
+                  <path class="chat__autoscroll-slash" d="M4 4l16 16"/>
+                </svg>
+              </button>
               <div class="chathistory" id="chat-history-wrap">
                 <button class="iconbtn iconbtn--sm" id="chat-history-toggle" title="Chat history" aria-haspopup="true" aria-expanded="false">
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.4 8.4 0 0 1-8.5 8.5 8.5 8.5 0 0 1-3.6-.8L3 21l1.8-5.9A8.5 8.5 0 1 1 21 11.5z"/><path d="M12 8.5v5M9.5 11h5"/></svg>
@@ -146,13 +155,6 @@
           <div class="chat__thread" id="chat-thread"><!-- messages rendered by app.js --></div>
 
           <div class="chat__ctas">
-            <!-- Jump to latest (Aug 20 2026) — appears only while the reader has
-                 scrolled up off the bottom; anchored above this row so it floats
-                 over the end of the thread and tracks composer growth. -->
-            <button class="chat__jump" id="chat-jump" hidden>
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M19 12l-7 7-7-7"/></svg>
-              Jump to latest
-            </button>
             <button class="btn btn--ghost btn--sm" id="btn-new-chat">
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
               New chat

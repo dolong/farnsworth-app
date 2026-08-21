@@ -598,66 +598,72 @@ function fileIcon(type) {
 // CHAT THREAD
 // ============================================================================
 //
-// AUTOSCROLL — sticky bottom (Aug 20 2026).
+// AUTOSCROLL — user-controlled toggle (Aug 21 2026).
 //
-// renderChat() used to slam scrollTop to scrollHeight on every re-render. A
-// streaming turn re-renders constantly (every thinking note, every tool chip),
-// so scrolling up to re-read the previous reply while the agent worked was
-// impossible — the view yanked back to the bottom within a beat. Long reported
-// exactly that.
+// History: renderChat() originally slammed scrollTop to scrollHeight on every
+// re-render, and a streaming turn re-renders on every thinking note — so
+// scrolling up to re-read the previous reply was impossible. The first attempt
+// (v0.1.37) inferred intent with a sticky-bottom heuristic. Long asked for an
+// explicit switch instead, so the heuristic is gone.
 //
-// The thread now FOLLOWS the bottom only while the user is already parked
-// there. Scrolling up detaches; scrolling back within CHAT_STICK_PX of the
-// bottom re-attaches. While detached, a "Jump to latest" pill appears and the
-// prior scroll offset is preserved across re-renders (content grows at the
-// bottom, so the offset keeps the reader's place).
+// Default is ON, which is exactly the original behavior: every render rides the
+// bottom. Turning it OFF stops all automatic scrolling — the thread simply
+// stays where the reader put it.
 //
-// The scroll listener is idempotent with the programmatic restore below: after
-// a render we set scrollTop to either the bottom (sticky) or the previous
-// offset (detached), and the async scroll event that follows recomputes the
-// same state it already had. So no suppression flag is needed.
-const CHAT_STICK_PX = 60;
-let chatStickToBottom = true;
+// The one thing that must survive in both modes: `innerHTML = ''` resets
+// scrollTop to 0, so a re-render with autoscroll off would slam the reader to
+// the TOP of the thread, which is worse than the bug being fixed. So we always
+// capture the offset before the wipe and restore it after. That is position
+// PRESERVATION, not autoscroll — it keeps the view still rather than moving it.
+//
+// Explicit user actions (sending, switching conversations, starting a new chat)
+// still jump to the latest message regardless of the toggle. The toggle governs
+// automatic scrolling during a turn, which is the thing that was interrupting
+// reading.
+//
+// Persisted under the flat setting key 'chat.autoscroll' ('1' / '0'), matching
+// the 'test.record' pattern. An absent row means ON.
+let chatAutoScroll = true;
 
-function chatThreadAtBottom(thread) {
-  if (!thread) return true;
-  return (thread.scrollHeight - thread.scrollTop - thread.clientHeight) <= CHAT_STICK_PX;
-}
-
-function updateChatJumpBtn() {
-  const btn = document.getElementById('chat-jump');
+function paintChatAutoScrollButton(btn, on) {
   if (!btn) return;
-  btn.hidden = chatStickToBottom;
+  btn.classList.toggle('chat__autoscroll--off', !on);
+  btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+  btn.title = on
+    ? 'Autoscroll on — following new messages (click to stop the chat scrolling while you read)'
+    : 'Autoscroll off — the view stays where you put it (click to follow new messages again)';
 }
 
-// Re-attach and ride the bottom. Called when the user sends a message and when
-// the jump pill is clicked — both are explicit "take me to the latest" intents.
+// Jump to the newest message and, if the reader had turned autoscroll off,
+// leave that preference alone — this is a one-shot move, not a mode change.
 function chatScrollToBottom() {
   const thread = document.getElementById('chat-thread');
-  chatStickToBottom = true;
   if (thread) thread.scrollTop = thread.scrollHeight;
-  updateChatJumpBtn();
 }
 
-function initChatScrollTracking() {
-  const thread = document.getElementById('chat-thread');
-  if (!thread || thread.dataset.stickyInit === '1') return;
-  thread.dataset.stickyInit = '1';
-  thread.addEventListener('scroll', () => {
-    chatStickToBottom = chatThreadAtBottom(thread);
-    updateChatJumpBtn();
-  }, { passive: true });
-  document.getElementById('chat-jump')?.addEventListener('click', () => {
-    chatScrollToBottom();
+function initChatAutoScrollToggle() {
+  const btn = document.getElementById('chat-autoscroll');
+  if (!btn || btn.dataset.wired === '1') return;
+  btn.dataset.wired = '1';
+  paintChatAutoScrollButton(btn, chatAutoScroll);
+  window.farnsworth?.getSetting?.('chat.autoscroll').then((v) => {
+    chatAutoScroll = !(v === '0' || v === 'false');
+    paintChatAutoScrollButton(btn, chatAutoScroll);
+    // Turning it back on should immediately catch up to the latest.
+    if (chatAutoScroll) chatScrollToBottom();
+  }).catch(() => {});
+  btn.addEventListener('click', async () => {
+    chatAutoScroll = !chatAutoScroll;
+    paintChatAutoScrollButton(btn, chatAutoScroll);
+    if (chatAutoScroll) chatScrollToBottom();
+    try { await window.farnsworth?.setSetting?.('chat.autoscroll', chatAutoScroll ? '1' : '0'); } catch {}
   });
-  updateChatJumpBtn();
 }
 
 function renderChat() {
   const thread = $('#chat-thread');
-  initChatScrollTracking();
+  initChatAutoScrollToggle();
   // Capture BEFORE the wipe — innerHTML='' resets scrollTop to 0.
-  const wasSticky = chatStickToBottom;
   const prevTop = thread.scrollTop;
   thread.innerHTML = '';
   state.chatMessages.forEach(m => thread.appendChild(renderMessage(m)));
@@ -665,12 +671,8 @@ function renderChat() {
   // turn — guards against a stale Stop glyph after a reload or a render that
   // happens outside the turn lifecycle.
   updateChatSendButton();
-  // Follow the bottom only if the reader was already there; otherwise hold
-  // their place.
-  if (wasSticky) thread.scrollTop = thread.scrollHeight;
+  if (chatAutoScroll) thread.scrollTop = thread.scrollHeight;
   else thread.scrollTop = prevTop;
-  chatStickToBottom = wasSticky;
-  updateChatJumpBtn();
   // Persist the active conversation (debounced) so the dropdown always reflects
   // the current state and a hard refresh doesn't lose work-in-progress.
   scheduleChatHistorySave();
@@ -1841,10 +1843,10 @@ function animateFinalVerdict(msgId) {
           const msgRect = msgEl.getBoundingClientRect();
           const threadRect = thread.getBoundingClientRect();
           // Message is in/near the viewport — scroll thread to bottom so
-          // the growing message stays anchored. Aug 20: also requires the
-          // reader to still be parked at the bottom, so a typewriter pass
-          // can't yank someone who has scrolled up to re-read.
-          if (chatStickToBottom && msgRect.top < threadRect.bottom && msgRect.bottom > threadRect.top) {
+          // the growing message stays anchored. Aug 21: gated on the
+          // autoscroll toggle, so a typewriter pass can't move the view
+          // when the reader has turned autoscroll off.
+          if (chatAutoScroll && msgRect.top < threadRect.bottom && msgRect.bottom > threadRect.top) {
             thread.scrollTop = thread.scrollHeight;
           }
         }
