@@ -15663,6 +15663,37 @@ async function openFileByPath(filePath) {
   await openFileInEditor(filePath, content);
 }
 
+// Is the USER actively typing somewhere right now?
+//
+// The agent moves the UI around while it works -- every successful write_file
+// auto-switches the canvas to code mode and opens the file in Monaco (see the
+// tool loop), and each of those opens ends in monacoEditor.focus(). That yanked
+// the caret out of whatever the user was typing in, which in practice is the
+// chat composer, mid-sentence, once per file the agent touched. Long reported
+// it Aug 24 2026: "very annoying to be deselected from the input box".
+//
+// The rule: programmatic focus may only move the caret when the user is not
+// already typing somewhere else. A genuine user gesture -- clicking an editor
+// tab, opening a file from the Files panel, Cmd+Shift+T -- leaves
+// activeElement on a button or the body, so those paths still focus Monaco
+// exactly like before. Only background/agent-driven opens are held back.
+function userIsTypingElsewhere() {
+  const ae = document.activeElement;
+  if (!ae || ae === document.body) return false;
+  // Focus moving WITHIN the editor is not a steal.
+  if (typeof ae.closest === 'function' && ae.closest('.monaco-editor')) return false;
+  if (ae.isContentEditable === true) return true;
+  const tag = ae.tagName;
+  if (tag !== 'INPUT' && tag !== 'TEXTAREA') return false;
+  // Buttons/checkboxes aren't text entry -- stealing from those is harmless.
+  if (tag === 'INPUT') {
+    const type = (ae.getAttribute('type') || 'text').toLowerCase();
+    const TEXTY = ['text', 'search', 'url', 'email', 'password', 'number', 'tel'];
+    if (!TEXTY.includes(type)) return false;
+  }
+  return true;
+}
+
 function focusActiveFile() {
   if (!monacoEditor || activeFileIdx < 0) return;
   const file = openFiles[activeFileIdx];
@@ -15684,7 +15715,9 @@ function focusActiveFile() {
   applyCanvasFileChrome({ name: file.name, relPath, ext });
   updateTabUI();
   syncExtBanner();
-  monacoEditor.focus();
+  // Never pull the caret away from a user who is mid-keystroke. See
+  // userIsTypingElsewhere() above.
+  if (!userIsTypingElsewhere()) monacoEditor.focus();
 }
 
 function updateTabUI() {
