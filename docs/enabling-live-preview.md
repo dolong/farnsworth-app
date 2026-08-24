@@ -67,6 +67,17 @@ The project chooses the components. Post commonly renders an inline/splash creat
 
 Post View is not routed by `devvit.json`, and Farnsworth does not load `dist/client` directly. Production files are references for intended behavior, not the local router.
 
+### Production parity is required
+
+The harness routes the preview. It must not own the application. Every surface must render a component imported from the project's real production entrypoints, and game code belongs under `src/`, not under the harness directory.
+
+A harness that defines its own copy of a surface will drift, and the drift is silent: the preview looks finished while `devvit.json` still builds `dist/client` from untouched template files, so the deployed post shows the stock template. Preview correctness is not shipment evidence.
+
+Two rules keep the two in sync:
+
+- If making the preview correct required no edit under `src/`, nothing has shipped.
+- Verify by building. After `npm run build`, a string unique to the app must appear in `dist/client`. If it does not, Reddit will not render it.
+
 ## Devvit identity and emulator contract
 
 Farnsworth already has a persistent Redis and Reddit emulator. The selected identity is not a query parameter and not project-local browser state.
@@ -120,7 +131,11 @@ Farnsworth passes the results as `FARNSWORTH_PORT_VITE` and `FARNSWORTH_PORT_SER
    - client entrypoints and every `@devvit/web/client` import.
    - server entries and API routes.
    - existing Vite configs, local launchers, and environment loading.
-2. Preserve production behavior. Add a separate development harness rather than changing production entrypoints.
+2. Decide which case you are in, because the entrypoint rule differs.
+   - **Inherited and already working:** preserve production behavior. Add a separate development harness rather than rewriting working production entrypoints.
+   - **Greenfield, or a template being built out:** the harness is where the app is authored, so the production entrypoints are the deliverable. Build features in the components that `splash.tsx`, `game.tsx`, or their equivalents actually render, and let the harness import those entrypoints. Never let the harness accumulate a private implementation of a surface.
+
+   In both cases the harness routes and never re-implements. See "Production parity is required".
 3. Add `.farnsworth/config.json` with the correct `appType` and project-specific Post/Live chrome where relevant.
 4. Add the `farnsworth:<appType>` script and launcher.
 5. Add a Vite harness whose router handles Post, Mobile, and Desktop.
@@ -141,6 +156,8 @@ Do not copy a template blindly. Adapt component imports, shim exports, server en
 5. Wrong project appears: inspect metadata `repoRoot`, URL, PID, and port collision.
 6. Local API is 5xx or refused: call `devvit_emulator_status`, inspect the server log, and restore the server-runner.
 7. Production Reddit is broken too: only then investigate production entrypoints and `devvit.json`.
+
+This order assumes the preview is failing. It does not apply when the preview looks correct and only the deployed post is wrong. That is the parity failure above: check first whether the harness renders the real entrypoints and whether `dist/client` contains the app's own code.
 
 ## Project-local documentation
 
