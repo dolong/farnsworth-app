@@ -115,16 +115,32 @@ def find_target(port=CDP_PORT, prefer_url='localhost:5174', quiet=False):
     bv = next((t for t in targets if t.get('type') == 'page' and prefer_url in t.get('url', '')), None)
     if bv:
         return bv
+    # NEVER fall back to one of Farnsworth's OWN pages. A test evals arbitrary
+    # JS into whatever target this returns, so handing back the IDE shell means
+    # the test runs against the IDE itself — and a step like
+    # `location.href = '/?view=desktop'` then navigates the whole app away and
+    # leaves the user staring at a black window.
+    #
+    # This used to be guarded by `len(page_targets) == 1`, which was wrong: the
+    # WebRTC canvas-capture page is also a `page` target, so as soon as it
+    # exists the count is 2, the guard goes quiet, and page_targets[0] is the
+    # shell. Exclude Farnsworth's own surfaces by URL instead of by counting.
+    OWN_PAGES = ('index.html', 'canvas-capture.html')
+    def is_own_page(t):
+        url = t.get('url', '')
+        return url.startswith('file://') and any(p in url for p in OWN_PAGES)
+
     page_targets = [t for t in targets if t.get('type') == 'page']
+    game_targets = [t for t in page_targets if not is_own_page(t)]
     if quiet:
-        return None
-    if len(page_targets) == 1 and 'index.html' in page_targets[0].get('url', ''):
+        return game_targets[0] if game_targets else None
+    if not game_targets:
         print(f'ERROR: No WebContentsView target found at port {port}.')
-        print(f'  Only the Farnsworth main renderer is active (file://...index.html).')
+        print(f'  Only Farnsworth\'s own pages are active (file://...index.html).')
         print(f'  Switch the canvas to App Mobile / App Desktop / App Fullscreen')
         print(f'  to create a WebContentsView, then re-run.')
         return None
-    return page_targets[0] if page_targets else None
+    return game_targets[0]
 
 class Tester:
     def __init__(self, ws):
