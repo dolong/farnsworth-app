@@ -12047,10 +12047,14 @@ function wire() {
       dropZone.addEventListener('drop', async (ev) => {
         dragCounter = 0;
         hideDragOver();
-        if (!hasFiles(ev)) return;
-        // Always swallow the drop so a miss never navigates the renderer to a
-        // file:// URL, even when the payload carries nothing usable.
+        // Swallow the drop FIRST, unconditionally. This used to sit after an
+        // `if (!hasFiles(ev)) return;` early-out, which meant the comment below
+        // was a lie for every non-file payload: dropping a link, a URL, or a
+        // dragged selection fell through to Chromium's default action, which
+        // NAVIGATES the window to the dropped target and destroys the IDE
+        // (Aug 23, 2026 — Long's window went black on file:///?view=desktop).
         ev.preventDefault();
+        if (!hasFiles(ev)) return;
         const files = ev.dataTransfer.files;
         if (!files || !files.length) return;
         for (const f of files) {

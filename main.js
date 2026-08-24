@@ -956,6 +956,41 @@ function createWindow({ fresh = false } = {}) {
   });
 
   // ------------------------------------------------------------
+  // Never let the IDE shell navigate away from itself (Aug 23, 2026)
+  // ------------------------------------------------------------
+  // Long's window went black: the renderer had navigated to
+  // `file:///?view=desktop`. Navigation history showed
+  //   [0] reload  file://.../app.asar/index.html
+  //   [1] link    file:///?view=desktop
+  // A stray relative URL ("/?view=desktop", i.e. a preview URL whose dev-server
+  // base was empty) resolved against the file:// origin and REPLACED the whole
+  // application. There is no back button in a frameless IDE, so the app is
+  // simply dead until something reloads index.html from outside.
+  //
+  // setWindowOpenHandler only covers window.open / target=_blank. It does not
+  // cover top-level navigation from a link activation or an unhandled drop.
+  // This is the backstop: the shell webContents may reload itself and nothing
+  // else. Canvas previews are separate WebContentsViews with their own
+  // webContents, so they still navigate freely — this only pins the shell.
+  const shellPath = path.join(__dirname, 'index.html');
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    let target;
+    try { target = new URL(url); } catch { event.preventDefault(); return; }
+    // Allow re-loading the shell itself (incl. ?fresh=1 and CDP reloads).
+    if (target.protocol === 'file:') {
+      try {
+        if (decodeURIComponent(target.pathname) === shellPath) return;
+      } catch { /* fall through to block */ }
+    }
+    event.preventDefault();
+    console.warn('[nav guard] blocked top-level navigation to', url);
+    // A real outbound link the user meant to follow still works — in a browser.
+    if (target.protocol === 'http:' || target.protocol === 'https:') {
+      openExternalSafe(url);
+    }
+  });
+
+  // ------------------------------------------------------------
   // Close handler (Jun 28 ~16:12 ET)
   // ------------------------------------------------------------
   // Long hit the X (top-right traffic-light close button), the window
