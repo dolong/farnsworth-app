@@ -1210,6 +1210,18 @@ async function switchConversation(id) {
   state.chatActiveId = conv.id;
   await persistChatActiveId(conv.id);
   state.chatMessages = Array.isArray(conv.messages) ? conv.messages : [];
+  // A renderer turn cannot survive a conversation reload. Normalize any
+  // persisted spinner from an interrupted/older session so it cannot make
+  // Companion report a false busy state forever.
+  if (!isChatTurnActive()) {
+    for (const m of state.chatMessages) {
+      if (m?.working) {
+        m.working = false;
+        m.workingLabel = '';
+        m.stopped = true;
+      }
+    }
+  }
   renderChat();
   // Opening a conversation always lands at its latest message, regardless of
   // where the reader was parked in the previous one (Aug 20).
@@ -2833,9 +2845,12 @@ function sendChatHistorySnapshot() {
       .map(m => companionMessageView(m, { includeWorking: true }))
       .filter(Boolean)
       .slice(-100);
-    // Tell the companion whether a turn is still running, so it can keep its
-    // spinner up on a mid-task join instead of hard-clearing it. (Aug 7 2026)
-    const inFlight = (state.chatMessages || []).find(m => m.working && m.role === 'agent');
+    // Runtime turn ownership is the source of truth. Persisted `working` flags
+    // can survive an interrupted renderer and must never resurrect a fake
+    // in-flight turn in Companion.
+    const inFlight = activeChatTurn
+      ? (state.chatMessages || []).find(m => m.id === activeChatTurn.agentMsgId && m.role === 'agent')
+      : null;
     sendChatEventToCompanions('chat:history', {
       conversationId: state.chatActiveId || null,
       title: currentConvTitle() || 'New conversation',
@@ -2870,7 +2885,7 @@ function wireRelay() {
       // reply. (Jul 15 2026, companion chat sync)
       const text = String(payload.text || '').trim();
       if (!text) return;
-      const busy = (state.chatMessages || []).some(m => m.working);
+      const busy = isChatTurnActive();
       if (busy) {
         sendChatEventToCompanions('error', {
           message: 'Agent is busy with another message — try again in a moment.',
@@ -2955,11 +2970,10 @@ function wireRelay() {
         window.farnsworth?.setSetting?.('model', args.alias);
         renderSettings?.();
       } else if (name === 'stopInference') {
-        // Companion v0.4 Stop button (Jul 13). The chat panel listens for
-        // 'chat:stopInference' IPC events; this is the in-renderer path
-        // for the same intent (when no companion is connected).
-        const stopBtn = document.querySelector('[data-action="stop-inference"]');
-        if (stopBtn) stopBtn.click();
+        // Companion Stop must use the same cancellation authority as the local
+        // composer. The old path clicked a selector that does not exist, so it
+        // only changed Companion's optimistic UI and never stopped the desktop.
+        stopChatTurn();
       } else if (name === 'setEmulatorUser' && args.user) {
         // Companion v0.4 Preview sheet cogwheel user picker (Jul 13).
         // Resolves the username to an ID via the devvit:list-users IPC,
@@ -12981,7 +12995,7 @@ async function sendChatMessage(opts) {
 
   // Claim the in-flight slot before the loop starts. Cleared in `finally`,
   // which every exit path below routes through.
-  activeChatTurn = { agentMsgId, requestId: null, cancelled: false };
+  activeChatTurn = { agentMsgId, conversationId: state.chatActiveId, requestId: null, cancelled: false };
   const turn = activeChatTurn;
   updateChatSendButton();
 
@@ -13504,6 +13518,17 @@ async function sendChatMessage(opts) {
     // exit path (success, error, cancel, early return) or the composer stays
     // locked in Stop state and no further message can be sent.
     if (activeChatTurn === turn) activeChatTurn = null;
+    // Message state is turn-private and must be cleaned independently of slot
+    // ownership. stopChatTurn() releases the slot immediately, so gating this
+    // on activeChatTurn identity would skip the exact interrupted path that can
+    // otherwise leave a persisted spinner behind.
+    const finalIdx = state.chatMessages.findIndex(m => m.id === turn.agentMsgId);
+    if (finalIdx >= 0 && state.chatMessages[finalIdx]?.working) {
+      state.chatMessages[finalIdx].working = false;
+      state.chatMessages[finalIdx].workingLabel = '';
+      renderChat();
+      if (state.chatActiveId === turn.conversationId) scheduleChatHistorySave();
+    }
     updateChatSendButton();
     // Memory: archive the completed turn (user msg + final agent reply).
     // Goes to the immutable daily log; doesn't auto-add to the concept
@@ -16088,6 +16113,15 @@ async function init() {
         if (conv) {
           state.chatActiveId = conv.id;
           state.chatMessages = Array.isArray(conv.messages) ? conv.messages : [];
+          // No chat turn survives renderer startup. Persisted `working` flags
+          // are stale UI state, not proof that an agent is still running.
+          for (const m of state.chatMessages) {
+            if (m?.working) {
+              m.working = false;
+              m.workingLabel = '';
+              m.stopped = true;
+            }
+          }
           activeRestored = true;
         }
       }
