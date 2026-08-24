@@ -2391,13 +2391,10 @@ function renderCanvas() {
   // paint. Same compositing-layer fix as the cogwheel popover (Jul 10 ~11:52).
   // Test View is the opposite: the game WebContentsView IS the canvas, so
   // we must show it (not hide).
-  if (state.canvasMode === 'live' && state.preview === 'post') {
-    hideAllCanvasViews?.();
-  } else if (state.canvasMode === 'live') {
-    showAllCanvasViews?.();
-  } else {
-    hideAllCanvasViews?.();
-  }
+  // Single authority — same branch as before, but it will NOT show the views
+  // when an overlay is open. Before this, any re-render while Cmd+Shift+F (or
+  // any other modal) was up put the game canvas straight back on top of it.
+  syncCanvasViewVisibility?.();
 
   if (state.canvasMode === 'live') {
     stage.appendChild(renderLivePreview());
@@ -3794,25 +3791,130 @@ async function openDevvitConfig() {
   }, 0);
 }
 
+// ---------------------------------------------------------------------------
+// Canvas view visibility authority (Aug 23, 2026)
+//
+// A WebContentsView is a separate Electron composited layer painted ABOVE the
+// DOM. CSS z-index cannot reach it, so every full-screen overlay has to hide
+// the views at the main-process level while it is on screen.
+//
+// This was wired per-overlay and it was whack-a-mole: the Devvit cogwheel
+// popover (Jul 10), the reload orphan (Jul 11), Settings (Jul 12), and then
+// Cmd+Shift+F search (Aug 23) — which was never wired at all, so the game
+// canvas painted straight through the results list. Worse, renderCanvas()
+// unconditionally re-showed the views on any re-render, yanking them back on
+// top of an overlay that was already open (which is why the test-creator panel
+// needed its own bespoke MutationObserver to keep re-hiding them).
+//
+// One authority instead of N call sites:
+//   - desired visibility = (canvas wants views) AND (no blocking overlay open)
+//   - showAllCanvasViews() is a REQUEST, not a command — an open overlay wins
+//   - a MutationObserver re-syncs, so a NEW overlay needs no wiring at all and
+//     views created while an overlay is open are born hidden
+const CANVAS_BLOCKING_OVERLAYS = [
+  '.settings-overlay',
+  '.usage-overlay',
+  '.command-palette',
+  '.search-overlay',
+  '.file-finder-overlay',
+  '.diff-overlay',
+  '.terminal-modal',
+  '.devvit-config-popover',
+  '.devvit-user-menu',
+  '#test-creator',
+];
+const CANVAS_BLOCKING_SELECTOR = CANVAS_BLOCKING_OVERLAYS.join(',');
+
+function isOverlayOnScreen(node) {
+  if (!node || !node.isConnected || node.hidden) return false;
+  const cs = window.getComputedStyle(node);
+  if (cs.display === 'none' || cs.visibility === 'hidden') return false;
+  return node.getClientRects().length > 0;
+}
+
+function anyCanvasBlockingOverlayOpen() {
+  for (const node of document.querySelectorAll(CANVAS_BLOCKING_SELECTOR)) {
+    if (isOverlayOnScreen(node)) return true;
+  }
+  return false;
+}
+
+// Mirrors the branch renderCanvas() used to inline. Test View and the app
+// previews ARE the WebContentsView, so they want it visible; Post View is a
+// DOM mock that must not have the game painted over it, and every non-live
+// canvas mode (code, prod, storybook) has no business showing a view.
+function canvasWantsViewsVisible() {
+  return state.canvasMode === 'live' && state.preview !== 'post';
+}
+
+// viewId -> last visibility we actually pushed to main. Keyed per view rather
+// than a single global boolean so a view created LATER (renderCanvas tears down
+// and re-creates placeholders with fresh ids) is not mistaken for one we have
+// already handled — that's the case the bespoke observer existed to catch.
+const canvasViewVisibilityApplied = new Map();
+
+function applyCanvasViewVisibility(visible) {
+  if (!window.farnsworth?.canvasSetVisible) return;
+  const live = new Set();
+  document.querySelectorAll('[data-canvas-view-id]').forEach((el) => {
+    const viewId = el.dataset.canvasViewId;
+    if (!viewId) return;
+    live.add(viewId);
+    if (canvasViewVisibilityApplied.get(viewId) === visible) return; // no-op
+    canvasViewVisibilityApplied.set(viewId, visible);
+    window.farnsworth.canvasSetVisible(viewId, visible);
+  });
+  // Drop torn-down views so the map can't grow without bound.
+  for (const viewId of canvasViewVisibilityApplied.keys()) {
+    if (!live.has(viewId)) canvasViewVisibilityApplied.delete(viewId);
+  }
+}
+
 // Hide every canvas WebContentsView so overlays (cogwheel popover, modals)
 // don't get visually covered by the iframe behind them.
 function hideAllCanvasViews() {
-  document.querySelectorAll('[data-canvas-view-id]').forEach((el) => {
-    const viewId = el.dataset.canvasViewId;
-    if (viewId && window.farnsworth?.canvasSetVisible) {
-      window.farnsworth.canvasSetVisible(viewId, false);
-    }
-  });
+  applyCanvasViewVisibility(false);
 }
 
-// Restore visibility of every canvas WebContentsView (called from every
-// close path of openDevvitConfig).
+// Restore visibility of every canvas WebContentsView. Deliberately refuses
+// while an overlay is up: callers ask, the overlay state decides. This is what
+// makes every pre-existing call site (devvit config close, preview switches,
+// companion commands) overlay-safe without touching any of them.
 function showAllCanvasViews() {
-  document.querySelectorAll('[data-canvas-view-id]').forEach((el) => {
-    const viewId = el.dataset.canvasViewId;
-    if (viewId && window.farnsworth?.canvasSetVisible) {
-      window.farnsworth.canvasSetVisible(viewId, true);
-    }
+  if (anyCanvasBlockingOverlayOpen()) return;
+  applyCanvasViewVisibility(true);
+}
+
+// The single reconciliation step. Cheap enough to call on every DOM mutation.
+function syncCanvasViewVisibility() {
+  if (anyCanvasBlockingOverlayOpen()) applyCanvasViewVisibility(false);
+  else if (canvasWantsViewsVisible()) applyCanvasViewVisibility(true);
+  else applyCanvasViewVisibility(false);
+}
+
+// Watch the DOM so an overlay that does no wiring whatsoever still works, and
+// so views created while an overlay is open start hidden. rAF-coalesced: at
+// most one reconciliation per frame no matter how much the DOM churns.
+let canvasVisibilitySyncQueued = false;
+function installCanvasVisibilityObserver() {
+  if (!window.MutationObserver || !document.body) return;
+  const queue = () => {
+    if (canvasVisibilitySyncQueued) return;
+    canvasVisibilitySyncQueued = true;
+    requestAnimationFrame(() => {
+      canvasVisibilitySyncQueued = false;
+      try { syncCanvasViewVisibility(); } catch {}
+    });
+  };
+  new MutationObserver(queue).observe(document.body, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    // data-canvas-view-id matters as much as the overlay attributes: the
+    // placeholder is appended FIRST and stamped with its viewId only after
+    // main.js has created the view. Without watching the stamp, a view born
+    // while an overlay is open is never reconciled and paints over it.
+    attributeFilter: ['style', 'class', 'hidden', 'data-canvas-view-id'],
   });
 }
 
@@ -15909,6 +16011,9 @@ function initLeftPanelResize() {
 }
 
 async function init() {
+  // Before anything renders: keeps WebContentsViews under every DOM overlay
+  // without each overlay having to know WebContentsViews exist.
+  installCanvasVisibilityObserver();
   await loadSettings();
   // Appearance -> CSS vars/body class; canvas network policy -> main
   // (main defaults to allowed, so only an explicit OFF needs pushing).
