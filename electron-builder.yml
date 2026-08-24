@@ -33,6 +33,9 @@ files:
   - canvas-capture.html
   - canvas-capture-preload.js
   - src/**/*
+  # App-owned architecture guide read by farnsworth_project_guide(). The
+  # explicit files list excludes everything not named here.
+  - docs/enabling-live-preview.md
   # devvit-emulator/loader.mjs is injected into the user's dev-server
   # subprocess via NODE_OPTIONS --import. Also absent from packaged builds,
   # so the emulator silently no-op'd (main.js guards on existsSync).

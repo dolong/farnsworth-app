@@ -7085,6 +7085,11 @@ const AGENT_TOOLS = [
     description: "Inspect the open project's Farnsworth Devvit runtime: Vite preview, emulator-backed server-runner, selected emulator identity, server probe, and bounded server-log tail. Call this FIRST for local /api/trpc 502, 503, 504, ECONNREFUSED, failed saves, or missing identity. A dead server-runner is not evidence that Farnsworth lacks Redis, Reddit, or user emulation.",
     input_schema: { type: 'object', properties: {} }
   },
+  {
+    name: 'farnsworth_project_guide',
+    description: "Read Farnsworth's own project-integration architecture guide. Call this BEFORE adapting a greenfield or inherited repository, adding or repairing Go Live, or deciding which parts belong to Farnsworth versus project code. This guide ships with Farnsworth and is authoritative over optional project-local FARNSWORTH.md files. It works without an open workspace.",
+    input_schema: { type: 'object', properties: {} }
+  },
   // ─── Prod tools (Aug 13) ───────────────────────────────────────────────
   // These drive the REAL signed-in Reddit session in a headed Chrome, not
   // the local emulator. Actions here are visible to Reddit and permanent.
@@ -7169,6 +7174,26 @@ function globToRegex(glob) {
 }
 
 async function executeAgentTool(name, input, folderOverride) {
+  // Farnsworth's architecture contract belongs to the app, not to whichever
+  // project happens to be open. Keep this above the workspace-folder gate so
+  // the agent can learn how to adapt a greenfield or inherited repository
+  // before one is integrated or even opened. Electron's fs layer can read the
+  // Markdown from app.asar in packaged builds.
+  if (name === 'farnsworth_project_guide') {
+    const guidePath = path.join(__dirname, 'docs', 'enabling-live-preview.md');
+    try {
+      const content = await fs.readFile(guidePath, 'utf8');
+      return { ok: true, source: 'farnsworth', path: guidePath, content };
+    } catch (e) {
+      return {
+        ok: false,
+        error: 'guide_unavailable',
+        message: `Farnsworth's packaged project guide could not be read: ${e.message || e}`,
+        path: guidePath,
+      };
+    }
+  }
+
   // memory_recall works without a workspace folder: the fact lanes
   // (essentials, concepts, sections, buffer, conversations) are the
   // assistant's own global store. The code lane is project-scoped and is

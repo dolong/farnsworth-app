@@ -1,12 +1,12 @@
 # AGENT-TOOLS.md
 
-Living spec for the Farnsworth chat agent tool design space.  
-**Source of truth for what exists**: `AGENT_TOOLS` array in `main.js` + `executeAgentTool` handler.  
+Living spec for the Farnsworth chat agent tool design space.
+**Source of truth for what exists**: `AGENT_TOOLS` array in `main.js` + `executeAgentTool` handler.
 **Source of truth for what the model knows**: system prompt `app.js` § "Chat agent tools".
 
 ---
 
-## Current tools (28)
+## Current tools (29)
 
 ### File system
 
@@ -32,6 +32,7 @@ Living spec for the Farnsworth chat agent tool design space.
 | `set_preview(preview)` | Within Live, switch surface: `"post"` / `"mobile"` / `"desktop"` / `"fullscreen"` / `"testview"`. Auto-switches to live. |
 | `switch_devvit_user(username)` | Switch active emulator user (restarts dev server). Returns available list on miss. |
 | `devvit_emulator_status()` | Inspect Vite, the emulator-backed server-runner, selected identity, backend probe, and bounded server-log tail. First diagnostic for local `/api/trpc` 5xx/`ECONNREFUSED`, failed saves, or missing identity. |
+| `farnsworth_project_guide()` | Read Farnsworth's app-owned architecture and adaptation guide. Available without a workspace; call before integrating a greenfield or inherited repository. |
 
 ### Prod (real Reddit)
 
@@ -177,8 +178,9 @@ executeAgentTool(name)
   → app.js renderer listener → state mutation + re-render
 ```
 
-`run_command` uses `child_process.spawn` in the main process directly (no renderer needed).  
-`memory_recall` calls `db.memoryRecall()` directly in main (no IPC).  
+`run_command` uses `child_process.spawn` in the main process directly (no renderer needed).
+`memory_recall` calls `db.memoryRecall()` directly in main (no IPC).
+`farnsworth_project_guide` reads the app-owned `docs/enabling-live-preview.md` above the workspace gate, including from `app.asar` in packaged builds.
 `ui_show` is intercepted renderer-side in `sendChatMessage()` before the tool loop (no `executeAgentTool` call).
 
 ---
@@ -187,5 +189,5 @@ executeAgentTool(name)
 
 - `DEVVIT-TESTS.md` — test JSON format spec (the agent reads this before authoring a test)
 - `app/docs/tests.md` — full test system wiki (published at https://farnsworth-docs.vercel.app)
-- `app/docs/enabling-live-preview.md` — **how to wire a Devvit project for Live Preview.** Read this whenever "Go Live" fails with "no farnsworth:devvit script in package.json" (or the project has no `dev-tools/` / `vite.devtools.config.ts` / `.farnsworth/config.json`). Self-contained: full file contents to add to any Devvit app.
+- `app/docs/enabling-live-preview.md` — **Farnsworth's canonical project-integration architecture guide.** It covers ownership, canvas routes, injected identity, emulator/server-runner, metadata, port authority, and greenfield/inherited adaptation. The agent reads it through `farnsworth_project_guide()`; project-local `FARNSWORTH.md` files are optional context, not authority.
 - `UI-SURFACES.md` — `ui_show` surface type schemas (TBD — lives in system prompt for now)

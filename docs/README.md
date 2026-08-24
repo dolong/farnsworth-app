@@ -10,6 +10,7 @@ Wiki-style docs for the Farnsworth IDE. One page per system.
 |---|---|
 | [tests.md](tests.md) | How tests work: the JSON test system, Test View, the CDP runner, chat agent authoring, format reference, best practices, internals |
 | [ipc-surface.md](ipc-surface.md) | Full inventory of the 121 renderer→main IPC methods exposed on `window.farnsworth`, organized by category. Auto-generated 1:1 from `preload.js` — keep in sync when methods are added. |
+| [enabling-live-preview.md](enabling-live-preview.md) | Canonical, template-independent architecture and adaptation contract for making greenfield or inherited projects work in Farnsworth. Readable by the chat agent through `farnsworth_project_guide()`. |
 
 ## Related docs at the app root
 
