@@ -1184,31 +1184,52 @@ function killTrackedDevServers(reason) {
   spawnedDevServers.clear();
 }
 
-ipcMain.handle('dev:farnsworth:get', async (_event, appType = 'devvit', repoRoot) => {
-  const fs = require('fs');
-  const path = require('path');
+async function getFarnsworthDevStatus(appType = 'devvit', repoRoot, { detailed = false } = {}) {
   const type = (typeof appType === 'string' && appType) ? appType : 'devvit';
-  const metaPath = path.join(require('os').homedir(), '.cache', `farnsworth-${type}.json`);
+  const cacheDir = path.join(os.homedir(), '.cache');
+  const metaPath = path.join(cacheDir, `farnsworth-${type}.json`);
+  const result = { available: false, type, metaPath };
+  let meta = null;
   try {
-    const raw = await fs.promises.readFile(metaPath, 'utf8');
-    const meta = JSON.parse(raw);
-    if (!meta || !meta.pid || !meta.url) return { available: false, type };
-    // Validate the cached dev server belongs to the current workspace.
-    // Long Jul 9 ~15:05 ET — without this, opening a different workspace
-    // (e.g. Farnsworth itself) would still load the iframe pointed at
-    // lastdraft's last session's dev server, which auto-plays bgMusic and
-    // wedges Cmd+Q. If the cache's repoRoot doesn't match the active
-    // workspace, treat as not-available (the dev server belongs to a
-    // different project — likely orphaned after a folder switch).
-    if (repoRoot && typeof repoRoot === 'string' && meta.repoRoot && meta.repoRoot !== repoRoot) {
-      return { available: false, type, reason: 'wrong_workspace', cachedRepoRoot: meta.repoRoot };
-    }
-    try { process.kill(meta.pid, 0); }
-    catch { return { available: false, type, url: meta.url, pid: meta.pid, dead: true }; }
-    // serverPid + serverUrl added Jul 10 when the Farnsworth-side
-    // server-runner spawned alongside Vite (emulator-backed tRPC + Hono
-    // on port 3000). Older meta files without these fields are valid —
-    // renderer should treat undefined as "not available".
+    meta = JSON.parse(await fs.readFile(metaPath, 'utf8'));
+  } catch (e) {
+    if (!detailed) return { available: false, type };
+    result.error = 'meta_unavailable';
+    result.message = `No readable ${type} dev-server metadata at ${metaPath}.`;
+    result.diagnosis = 'Go Live has not produced runtime metadata for this project.';
+    return result;
+  }
+  if (!meta || !meta.pid || !meta.url) {
+    if (!detailed) return { available: false, type };
+    result.error = 'invalid_meta';
+    result.message = `The ${type} metadata is missing its Vite pid or URL.`;
+    result.meta = meta;
+    return result;
+  }
+  result.url = meta.url;
+  result.pid = meta.pid;
+  result.startedAt = meta.startedAt || null;
+  result.repoRoot = meta.repoRoot || null;
+  result.serverPid = meta.serverPid || null;
+  result.serverUrl = meta.serverUrl || null;
+  result.serverLog = meta.serverLog || null;
+  if (repoRoot && typeof repoRoot === 'string' && meta.repoRoot && meta.repoRoot !== repoRoot) {
+    if (!detailed) return { available: false, type, reason: 'wrong_workspace', cachedRepoRoot: meta.repoRoot };
+    result.reason = 'wrong_workspace';
+    result.cachedRepoRoot = meta.repoRoot;
+    result.diagnosis = 'The cached dev server belongs to a different workspace.';
+    return result;
+  }
+  try { process.kill(meta.pid, 0); result.viteAlive = true; }
+  catch {
+    if (!detailed) return { available: false, type, url: meta.url, pid: meta.pid, dead: true };
+    result.dead = true;
+    result.viteAlive = false;
+    result.diagnosis = 'The Vite preview process recorded in metadata is no longer alive.';
+    return result;
+  }
+  result.available = true;
+  if (!detailed) {
     return {
       available: true,
       type,
@@ -1218,10 +1239,72 @@ ipcMain.handle('dev:farnsworth:get', async (_event, appType = 'devvit', repoRoot
       serverPid: meta.serverPid || null,
       serverUrl: meta.serverUrl || null,
     };
-  } catch {
-    return { available: false, type };
   }
-});
+
+  const workspace = (typeof repoRoot === 'string' && repoRoot) ? repoRoot : meta.repoRoot;
+  if (workspace) {
+    const repoHash = Buffer.from(workspace).toString('hex').slice(0, 16);
+    result.configPath = path.join(cacheDir, `farnsworth-devvit-${repoHash}.json`);
+    try {
+      const cfg = JSON.parse(await fs.readFile(result.configPath, 'utf8'));
+      result.identity = {
+        username: cfg.currentUsername || null,
+        subreddit: cfg.currentSubredditName || null,
+      };
+    } catch {
+      const settings = db.devvitGetProjectSettings(workspace) || {};
+      result.identity = {
+        username: settings.current_username || null,
+        subreddit: settings.current_subreddit_name || null,
+      };
+    }
+    result.projectHasServer = fsSync.existsSync(path.join(workspace, 'src', 'server'));
+  }
+
+  result.serverProcessAlive = false;
+  if (result.serverPid) {
+    try { process.kill(result.serverPid, 0); result.serverProcessAlive = true; } catch {}
+  }
+  result.serverAlive = result.serverProcessAlive;
+  if (result.serverUrl) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 2500);
+      try {
+        const response = await fetch(result.serverUrl, { signal: controller.signal });
+        result.serverProbe = { ok: true, status: response.status };
+        result.serverAlive = true;
+      } finally {
+        clearTimeout(timer);
+      }
+    } catch (e) {
+      const probeError = e?.name === 'AbortError' ? 'timeout' : String(e?.message || e);
+      result.serverProbe = { ok: false, error: probeError };
+      result.serverAlive = false;
+      if (probeError === 'timeout') result.error = 'server_runner_timeout';
+    }
+  }
+  if (result.serverLog) {
+    try {
+      const text = await fs.readFile(result.serverLog, 'utf8');
+      result.serverLogTail = text.split(/\r?\n/).slice(-40).join('\n').slice(-4096);
+    } catch (e) {
+      result.serverLogError = String(e?.message || e);
+    }
+  }
+  if (result.viteAlive && !result.serverAlive) {
+    if (!result.error) result.error = 'server_runner_unavailable';
+    result.diagnosis = result.projectHasServer
+      ? `${result.error === 'server_runner_timeout' ? 'The emulator-backed server-runner process exists but its HTTP endpoint timed out.' : 'Vite is alive, but the emulator-backed server-runner is absent or unreachable.'} /api/trpc 502 or ECONNREFUSED is a local runtime health failure, not evidence that Farnsworth lacks Redis, Reddit, or user emulation. Read serverLogTail, then restart through Farnsworth Go Live before changing client identity code.`
+      : 'Vite is alive and no emulator server is reachable. This workspace does not expose src/server, so confirm whether a backend is expected before adding a fallback.';
+  } else if (result.serverAlive) {
+    result.diagnosis = 'The emulator-backed server-runner is reachable.';
+  }
+  return result;
+}
+
+ipcMain.handle('dev:farnsworth:get', async (_event, appType = 'devvit', repoRoot) =>
+  getFarnsworthDevStatus(appType, repoRoot));
 
 // Boot the farnsworth dev server for a workspace by running its
 // `npm run farnsworth:<appType>` script (which lives in the app's template
@@ -6997,6 +7080,11 @@ const AGENT_TOOLS = [
       required: ['username']
     }
   },
+  {
+    name: 'devvit_emulator_status',
+    description: "Inspect the open project's Farnsworth Devvit runtime: Vite preview, emulator-backed server-runner, selected emulator identity, server probe, and bounded server-log tail. Call this FIRST for local /api/trpc 502, 503, 504, ECONNREFUSED, failed saves, or missing identity. A dead server-runner is not evidence that Farnsworth lacks Redis, Reddit, or user emulation.",
+    input_schema: { type: 'object', properties: {} }
+  },
   // ─── Prod tools (Aug 13) ───────────────────────────────────────────────
   // These drive the REAL signed-in Reddit session in a headed Chrome, not
   // the local emulator. Actions here are visible to Reddit and permanent.
@@ -7413,6 +7501,10 @@ async function executeAgentTool(name, input, folderOverride) {
     // Reuse the existing canvas:setPreview channel (also auto-switches to live).
     target.webContents.send('canvas:setPreview', { preview });
     return { ok: true, preview };
+  }
+  if (name === 'devvit_emulator_status') {
+    const status = await getFarnsworthDevStatus('devvit', folder, { detailed: true });
+    return { ok: true, ...status };
   }
   if (name === 'switch_devvit_user') {
     const raw = String(input?.username || '').trim().replace(/^u\//i, '');
