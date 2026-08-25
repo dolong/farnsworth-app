@@ -8808,10 +8808,9 @@ app.whenReady().then(async () => {
   // working locally, the relay just won't be in the picture.
   try {
     const relayClient = getRelayClient();
-    relayClient.start();
 
-    // Hydrate the device token from the Keychain when the environment did not
-    // supply one.
+    // Hydrate the device token from the Keychain BEFORE the first connect when
+    // the environment did not supply one.
     //
     // RELAY_DEVICE_TOKEN is injected by the /Applications wrapper script,
     // which is only one of several ways this app starts: a dev-tree launch, a
@@ -8822,18 +8821,35 @@ app.whenReady().then(async () => {
     //
     // Settings -> Account reads the Keychain directly, so without this the UI
     // would report "Paired" while the live relay socket was anything but.
-    if (!process.env.RELAY_DEVICE_TOKEN) {
-      devicePairing.readStoredToken()
-        .then(({ token, locked }) => {
+    // Connecting first and applying the token afterwards produced a real 401
+    // on every launch outside that wrapper: the socket opened unpaired, the
+    // relay rejected it, and the paired identity only arrived on the 1s
+    // retry. Gate the first connect on the Keychain read instead. The race
+    // guard means a wedged Keychain delays the relay by 5s rather than
+    // disabling it, and start() still runs on both success and failure.
+    if (process.env.RELAY_DEVICE_TOKEN) {
+      relayClient.start();
+    } else {
+      const KEYCHAIN_READ_BUDGET_MS = 5000;
+      Promise.race([
+        devicePairing.readStoredToken(),
+        new Promise((resolve) => setTimeout(() => resolve({ token: null, timedOut: true }), KEYCHAIN_READ_BUDGET_MS)),
+      ])
+        .then(({ token, locked, timedOut }) => {
+          if (timedOut) {
+            console.warn('[relay] Keychain read exceeded budget; starting unpaired');
+            return;
+          }
           if (locked) {
             console.warn('[relay] Keychain locked; staying unpaired until unlock');
             return;
           }
           if (!token) return;
-          relayClient.applyDeviceToken(token);
+          relayClient.hydrateDeviceToken(token);
           console.log('[relay] device token hydrated from Keychain');
         })
-        .catch((e) => console.warn('[relay] Keychain token read failed:', e.message));
+        .catch((e) => console.warn('[relay] Keychain token read failed:', e.message))
+        .finally(() => relayClient.start());
     }
     // Forward ALL incoming relay messages to the renderer over IPC (wildcard).
     // Previously this registered four specific types (chat / command /

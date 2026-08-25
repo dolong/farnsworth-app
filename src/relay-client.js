@@ -135,6 +135,26 @@ class RelayClient {
     return true;
   }
 
+  /**
+   * Set the device token BEFORE the first connect, without opening a socket.
+   *
+   * The boot path reads the token from the Keychain asynchronously, so it
+   * cannot use applyDeviceToken(): that method connects immediately (this.
+   * stopped is false from construction), and the subsequent start() would
+   * open a second socket. Without a pre-start setter, boot connected
+   * unpaired, took a 401, and only reached the paired identity on the 1s
+   * retry -- a spurious error line in every launch outside the /Applications
+   * wrapper, which is the only launcher that injects RELAY_DEVICE_TOKEN.
+   *
+   * Returns true if the token changed.
+   */
+  hydrateDeviceToken(token) {
+    const next = token || null;
+    if (next === this.deviceToken) return false;
+    this.deviceToken = next;
+    return true;
+  }
+
   start() {
     if (process.env.RELAY_DISABLED === '1') {
       console.log('[relay-client] RELAY_DISABLED=1, skipping');
