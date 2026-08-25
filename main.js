@@ -1306,6 +1306,66 @@ async function getFarnsworthDevStatus(appType = 'devvit', repoRoot, { detailed =
 ipcMain.handle('dev:farnsworth:get', async (_event, appType = 'devvit', repoRoot) =>
   getFarnsworthDevStatus(appType, repoRoot));
 
+// ---- Devvit emulator admin bridge (Post View mock posts + comments) ----
+// Post View needs to read the emulator's mock post feed and submit comments.
+// Both go through the server-runner's admin listener rather than the JSON
+// state file, because that file is a debounced projection of the runner's
+// in-memory maps: an out-of-band write would be silently overwritten by the
+// next flush. The admin port is derived from the recorded serverPort, so no
+// template script has to publish it.
+async function resolveEmulatorAdminBase() {
+  const cacheDir = path.join(os.homedir(), '.cache');
+  const metaPath = path.join(cacheDir, 'farnsworth-devvit.json');
+  let meta = null;
+  try { meta = JSON.parse(await fs.readFile(metaPath, 'utf8')); } catch {}
+  if (!meta) return { ok: false, error: 'no_dev_metadata' };
+  const serverPort = Number(meta.serverPort || 3000);
+  const adminPort = Number(process.env.DEVVIT_EMULATOR_ADMIN_PORT || serverPort + 100);
+  return { ok: true, base: `http://127.0.0.1:${adminPort}`, adminPort, serverPort, repoRoot: meta.repoRoot || null };
+}
+
+async function emulatorAdminRequest(route, { method = 'GET', body = null, timeoutMs = 3000 } = {}) {
+  const resolved = await resolveEmulatorAdminBase();
+  if (!resolved.ok) return resolved;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(`${resolved.base}${route}`, {
+      method,
+      signal: controller.signal,
+      headers: body ? { 'content-type': 'application/json' } : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const text = await res.text();
+    let json = null;
+    try { json = text ? JSON.parse(text) : null; } catch {}
+    if (!json) return { ok: false, error: 'bad_admin_response', status: res.status, adminPort: resolved.adminPort };
+    return { ...json, status: res.status, adminPort: resolved.adminPort };
+  } catch (e) {
+    // ECONNREFUSED here means the running dev server predates the admin
+    // surface, or the project's server never started. Both are recoverable
+    // by a Go Live restart, so say so instead of failing anonymously.
+    const err = e?.name === 'AbortError' ? 'timeout' : String(e?.message || e);
+    return {
+      ok: false,
+      error: 'admin_unreachable',
+      detail: err,
+      adminPort: resolved.adminPort,
+      hint: 'Restart Go Live so the dev server exposes the emulator admin surface.',
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+ipcMain.handle('devvit:emulatorState', async () => emulatorAdminRequest('/emulator/state'));
+
+ipcMain.handle('devvit:emulatorSubmitPost', async (_event, payload = {}) =>
+  emulatorAdminRequest('/emulator/post', { method: 'POST', body: payload, timeoutMs: 5000 }));
+
+ipcMain.handle('devvit:emulatorSubmitComment', async (_event, payload = {}) =>
+  emulatorAdminRequest('/emulator/comment', { method: 'POST', body: payload, timeoutMs: 5000 }));
+
 // Boot the farnsworth dev server for a workspace by running its
 // `npm run farnsworth:<appType>` script (which lives in the app's template
 // repo). The script kills any stale instance, boots vite in the background,

@@ -69,6 +69,7 @@ export class RedisClientEmulator {
     this._store = sharedStore || new Map();
     this._persistPath = persistPath;
     this._persistTimer = null;
+    this._dirty = false;
     this._globalInstance = null;
     this._persistHooked = false;
 
@@ -101,12 +102,17 @@ export class RedisClientEmulator {
 
   _schedulePersist() {
     if (!this._persistPath) return;
+    this._dirty = true;
     if (this._persistTimer) clearTimeout(this._persistTimer);
     this._persistTimer = setTimeout(() => this._flushNow(), 50);
   }
 
+  // See RedditAPIClientEmulator._flushNow: an instance that never mutated its
+  // slot must not write it back, because a second emulator instance in the
+  // same Go Live may own the newer data.
   _flushNow() {
     if (!this._persistPath) return;
+    if (!this._dirty) return;
     this._persistTimer = null;
     try {
       let file = {};
@@ -122,6 +128,7 @@ export class RedisClientEmulator {
       file[this._prefix] = slot;
       mkdirSync(dirname(this._persistPath), { recursive: true });
       writeFileSync(this._persistPath, JSON.stringify(file, null, 2));
+      this._dirty = false;
     } catch (e) {
       console.error('[redis-emulator] persist failed:', e.message);
     }

@@ -66,6 +66,23 @@ const state = {
   // point at the dev server URL. { available: false } when the meta
   // file is missing or the PID is dead.
   farnsworthDev: { available: false },
+  // Devvit emulator Reddit store, surfaced in Post View (Aug 25). `posts` and
+  // `comments` mirror the running server-runner's live maps; they are never
+  // authored here, only read back after a mutation the runner performed.
+  // activePostId selects which mock post the embed + comments belong to.
+  emulatorFeed: {
+    loading: false,
+    loadedAt: null,
+    error: null,
+    hint: null,
+    posts: [],
+    comments: [],
+    currentUsername: null,
+    activePostId: null,
+    busy: false,
+    draft: '',
+    refocusComposer: false,
+  },
   farnsworthBooting: false,
   // 'installing' while Go Live's dependency preflight runs npm install,
   // 'starting' once the dev server script is actually spawning.
@@ -4543,6 +4560,160 @@ function startArtboardResize(e, wrap, corner, sizeLabel) {
   document.addEventListener('mouseup', onUp);
 }
 
+// ---- Devvit emulator Reddit store bridge (Post View) --------------------
+// Post View reads its mock post feed and posts comments through the running
+// server-runner's admin surface. The JSON state file is deliberately not the
+// read or write path: it is a debounced projection of the runner's in-memory
+// maps, so writing to it directly would be clobbered by the next flush.
+
+function emulatorFeedRerender() {
+  // Only Post View consumes this state, so avoid rebuilding the canvas when
+  // the user has already moved to another preview.
+  if (state.canvasMode === 'live' && state.preview === 'post') renderCanvas();
+}
+
+async function loadEmulatorFeed({ force = false } = {}) {
+  const f = state.emulatorFeed;
+  if (f.loading) return;
+  if (f.loadedAt && !force) return;
+  f.loading = true;
+  try {
+    if (!window.farnsworth?.devvitEmulatorState) throw new Error('bridge_unavailable');
+    const res = await window.farnsworth.devvitEmulatorState();
+    f.loadedAt = Date.now();
+    if (res && res.ok) {
+      f.posts = Array.isArray(res.posts) ? res.posts.slice() : [];
+      f.comments = Array.isArray(res.comments) ? res.comments.slice() : [];
+      f.currentUsername = res.currentUsername || null;
+      f.error = null;
+      f.hint = null;
+      // Drop a stale selection (e.g. after the emulator state was cleared).
+      if (f.activePostId && !f.posts.some((p) => p.id === f.activePostId)) f.activePostId = null;
+    } else {
+      f.posts = [];
+      f.comments = [];
+      f.error = (res && (res.error || res.detail)) || 'unknown_error';
+      f.hint = (res && res.hint) || null;
+    }
+  } catch (e) {
+    f.loadedAt = Date.now();
+    f.error = String((e && e.message) || e);
+  } finally {
+    f.loading = false;
+    emulatorFeedRerender();
+  }
+}
+
+// Reddit-style coarse age for a comment. Emulator timestamps are epoch
+// seconds, matching the real Devvit Post/Comment shape.
+function relativeCommentTime(createdUtc) {
+  if (!createdUtc) return 'just now';
+  const secs = Math.max(0, Math.floor(Date.now() / 1000) - createdUtc);
+  if (secs < 60) return 'just now';
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
+
+function emulatorCommentsFor(postId) {
+  if (!postId) return [];
+  return state.emulatorFeed.comments
+    .filter((c) => c.linkId === postId || c.parentId === postId)
+    .sort((a, b) => (a.createdUtc || 0) - (b.createdUtc || 0));
+}
+
+function emulatorActivePost() {
+  const f = state.emulatorFeed;
+  if (!f.posts.length) return null;
+  if (f.activePostId) {
+    const found = f.posts.find((p) => p.id === f.activePostId);
+    if (found) return found;
+  }
+  return f.posts.slice().sort((a, b) => (b.createdUtc || 0) - (a.createdUtc || 0))[0];
+}
+
+async function createMockPost(title, body) {
+  const f = state.emulatorFeed;
+  if (f.busy) return null;
+  f.busy = true;
+  emulatorFeedRerender();
+  try {
+    const res = await window.farnsworth.devvitEmulatorSubmitPost({ title, body });
+    if (res && res.ok) {
+      f.activePostId = res.id || null;
+      await loadEmulatorFeed({ force: true });
+      return res.id || null;
+    }
+    f.error = (res && (res.error || res.detail)) || 'submit_failed';
+    f.hint = (res && res.hint) || null;
+    return null;
+  } finally {
+    f.busy = false;
+    emulatorFeedRerender();
+  }
+}
+
+// Comment posting must work even before any mock post exists, which is the
+// common case: nothing in the pipeline had ever called submitPost, so the
+// emulator's post map starts empty. Rather than disable the composer, seed a
+// post from the Live config so the comment has a real t3_* parent.
+async function ensureActiveMockPost() {
+  const existing = emulatorActivePost();
+  if (existing) return existing.id;
+  const lc = state.liveConfig || {};
+  const projectLabel = (lc.projectName && lc.projectName.trim())
+    || (state.folder ? state.folder.split('/').pop() : '')
+    || 'Untitled post';
+  const title = (lc.postName && lc.postName.trim()) || projectLabel;
+  return await createMockPost(title, '');
+}
+
+async function submitPostViewComment(text) {
+  const f = state.emulatorFeed;
+  const body = (text || '').trim();
+  if (!body || f.busy) return false;
+  f.busy = true;
+  emulatorFeedRerender();
+  let postId = null;
+  try {
+    // ensureActiveMockPost toggles busy itself when it has to seed, so clear
+    // the flag around that call rather than deadlocking against it.
+    f.busy = false;
+    postId = await ensureActiveMockPost();
+    f.busy = true;
+    if (!postId) {
+      f.error = f.error || 'no_post_to_comment_on';
+      return false;
+    }
+    const res = await window.farnsworth.devvitEmulatorSubmitComment({ postId, text: body });
+    if (res && res.ok) {
+      f.error = null;
+      f.hint = null;
+      f.busy = false;
+      // Clear the draft here, not in the caller: the finally-block re-render
+      // fires before a caller's .then(), so a late clear left the posted text
+      // sitting in the composer until the next unrelated render.
+      f.draft = '';
+      await loadEmulatorFeed({ force: true });
+      // Set the refocus flag AFTER the refresh: loadEmulatorFeed re-renders on
+      // completion, and the outer finally re-renders again. Flagging earlier
+      // meant the inner render consumed it and the outer render then replaced
+      // the textarea that had just been focused.
+      f.refocusComposer = true;
+      return true;
+    }
+    f.error = (res && (res.error || res.detail)) || 'comment_failed';
+    f.hint = (res && res.hint) || null;
+    return false;
+  } finally {
+    f.busy = false;
+    emulatorFeedRerender();
+  }
+}
+
 function renderPostView() {
   // Live Post View needs both a subreddit name and a post name to be
   // meaningfully populated. Folders without a `.farnsworth/config.json`
@@ -4587,6 +4758,14 @@ function renderPostView() {
     }, 0);
     return wrap;
   }
+  // Read the emulator's Reddit store once per session; the load callback
+  // re-renders Post View when the data lands. Deferred so the first paint is
+  // never blocked on an IPC round trip.
+  if (!state.emulatorFeed.loadedAt && !state.emulatorFeed.loading) {
+    setTimeout(() => loadEmulatorFeed(), 0);
+  }
+  const activeMock = emulatorActivePost();
+
   const root = el('div', { class: 'post-view' });
 
   // Aug 4: derive the Reddit chrome from the open project instead of falling
@@ -4606,6 +4785,14 @@ function renderPostView() {
   const titleLabel = (lc.postName && lc.postName.trim())
     || projectLabel
     || 'Untitled post';
+  // Once a mock post exists in the emulator, IT is the post being previewed —
+  // its title and author win over the Live config, which only ever described
+  // a single hypothetical post.
+  const asUser = (n) => 'u/' + String(n || '').replace(/^u\//, '');
+  const cardTitle = (activeMock && activeMock.title) ? activeMock.title : titleLabel;
+  const cardAuthor = (activeMock && activeMock.authorName) ? asUser(activeMock.authorName) : authorLabel;
+  const cardScore = activeMock ? (activeMock.score ?? 1) : 1;
+  const cardAge = activeMock ? relativeCommentTime(activeMock.createdUtc) : '19m ago';
 
   // Top nav bar — Reddit header (hamburger + reddit wordmark + search)
   // Hamburger has a small red notification dot in its top-right corner
@@ -4644,10 +4831,10 @@ function renderPostView() {
         <span class="post-view__credit-avatar"><img src="assets/reddit/community-icon.png" alt="${subLabel}"/></span>
         <span class="post-view__credit-sub-name">${subLabel}</span>
         <span class="post-view__credit-sub-dot">·</span>
-        <span class="post-view__credit-sub-time">19m ago</span>
+        <span class="post-view__credit-sub-time">${cardAge}</span>
       </div>
       <div style="font-size:11px;color:#818384;display:flex;align-items:center;gap:4px;">
-        <span style="color:#d7dadc;font-weight:500;">${authorLabel}</span>
+        <span style="color:#d7dadc;font-weight:500;">${cardAuthor}</span>
       </div>
     </div>
     <div class="post-view__credit-more"><svg viewBox="0 0 20 20" fill="currentColor"><circle cx="5" cy="10" r="1.4"/><circle cx="10" cy="10" r="1.4"/><circle cx="15" cy="10" r="1.4"/></svg></div>
@@ -4658,7 +4845,7 @@ function renderPostView() {
   // to the hardcoded mock post. (Long Jul 3 ~13:19 ET — "the post name
   // from the config should replace the hardcoded title here.")
   const title = el('h1', { class: 'post-view__title' });
-  title.textContent = titleLabel;
+  title.textContent = cardTitle;
   content.appendChild(title);
 
 
@@ -4678,7 +4865,10 @@ function renderPostView() {
   if (state.farnsworthDev?.available) {
     embed.appendChild(el('iframe', {
       class: 'post-view__embed-iframe',
-      src: state.farnsworthDev.url + '/?view=post',
+      // postId lets a project's harness render the specific mock post the
+      // IDE has selected. Harmless for templates that ignore the param.
+      src: state.farnsworthDev.url + '/?view=post'
+        + (activeMock ? '&postId=' + encodeURIComponent(activeMock.id) : ''),
       title: 'Live Reddit post preview',
     }));
   }
@@ -4689,7 +4879,7 @@ function renderPostView() {
   actions.innerHTML = `
     <button class="post-view__pill post-view__pill--vote">
       <span class="vote-arrow is-up is-active"><svg viewBox="0 0 20 20" fill="currentColor"><path d="M10 4l-6 6h4v6h4v-6h4z"/></svg></span>
-      <span class="vote-count">1</span>
+      <span class="vote-count">${cardScore}</span>
       <span class="vote-arrow is-down"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 16l-6-6h4V4h4v6h4z"/></svg></span>
     </button>
     <button class="post-view__pill">
@@ -4717,17 +4907,137 @@ function renderPostView() {
   post.appendChild(content);
   feed.appendChild(post);
 
-  // Comments section
+  // Comments section — real, backed by the Devvit emulator's Reddit store.
+  // Aug 25: this used to be a static innerHTML blob with no handlers, so Post
+  // View looked interactive but nothing could be posted. Comment submission now
+  // goes through the running server-runner's live RedditAPIClientEmulator, the
+  // same store a project's own `reddit.submitComment()` writes to.
+  const f = state.emulatorFeed;
   const comments = el('div', { class: 'post-view__comments' });
-  comments.innerHTML = `
-    <div class="post-view__comments-header">Join the conversation</div>
-    <div class="post-view__comments-empty">
+  const commentList = emulatorCommentsFor(activeMock ? activeMock.id : null);
+
+  comments.appendChild(el('div', { class: 'post-view__comments-header' },
+    commentList.length
+      ? `${commentList.length} comment${commentList.length === 1 ? '' : 's'}`
+      : 'Join the conversation'));
+
+  // Composer. Draft text lives in state, not the DOM: a live agent turn or a
+  // feed refresh rebuilds this subtree, and a DOM-local value would vanish
+  // mid-sentence.
+  const composer = el('div', { class: 'post-view__composer' });
+  const input = el('textarea', {
+    class: 'post-view__composer-input',
+    placeholder: 'Add a comment',
+    rows: '2',
+    oninput: (e) => { f.draft = e.target.value; },
+    onkeydown: (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+        e.preventDefault();
+        const val = f.draft || '';
+        if (val.trim()) submitPostViewComment(val);
+      }
+    },
+  });
+  input.value = f.draft || '';
+  const sendBtn = el('button', {
+    class: 'post-view__composer-btn',
+    disabled: f.busy || !(f.draft || '').trim() ? '' : null,
+    onclick: () => {
+      const val = f.draft || '';
+      if (!val.trim()) return;
+      submitPostViewComment(val);
+    },
+  }, f.busy ? 'Posting…' : 'Comment');
+  const composerRow = el('div', { class: 'post-view__composer-row' });
+  composerRow.appendChild(el('span', { class: 'post-view__composer-as' },
+    f.currentUsername ? asUser(f.currentUsername) : cardAuthor));
+  composerRow.appendChild(sendBtn);
+  composer.appendChild(input);
+  composer.appendChild(composerRow);
+  comments.appendChild(composer);
+  // Return the caret to the composer after a successful post, but only then:
+  // an unconditional focus call here would steal the caret out of the chat
+  // composer on every feed refresh (the Aug 24 focus-theft lesson).
+  if (f.refocusComposer) {
+    f.refocusComposer = false;
+    setTimeout(() => { try { input.focus(); } catch {} }, 0);
+  }
+
+  if (f.error) {
+    const errText = f.error === 'admin_unreachable'
+      ? (f.hint || 'The dev server is running without the emulator admin surface. Restart Go Live.')
+      : (f.error === 'no_dev_metadata'
+        ? 'No dev server is running. Hit Go Live to start the emulator, then comment.'
+        : `Comment store unavailable (${f.error}).`);
+    comments.appendChild(el('div', { class: 'post-view__comments-error' }, errText));
+  }
+
+  if (!commentList.length) {
+    const empty = el('div', { class: 'post-view__comments-empty' });
+    empty.innerHTML = `
       <div class="post-view__comments-snoo"><img src="src/assets/reddit/snoo-wave.png" alt="Snoo"/></div>
       <div class="post-view__comments-empty-title">Be the first to comment</div>
       <div class="post-view__comments-empty-text">Nobody's responded to this post yet. Add your thoughts and start the conversation.</div>
-    </div>
-  `;
+    `;
+    comments.appendChild(empty);
+  } else {
+    const list = el('div', { class: 'post-view__comment-list' });
+    commentList.forEach((c) => {
+      const row = el('div', { class: 'post-view__comment' });
+      const head = el('div', { class: 'post-view__comment-head' });
+      head.appendChild(el('span', { class: 'post-view__comment-author' }, asUser(c.authorName)));
+      head.appendChild(el('span', { class: 'post-view__comment-dot' }, '·'));
+      head.appendChild(el('span', { class: 'post-view__comment-time' }, relativeCommentTime(c.createdUtc)));
+      row.appendChild(head);
+      // textContent, never innerHTML: comment bodies are user and game input.
+      row.appendChild(el('div', { class: 'post-view__comment-body' }, c.body || ''));
+      list.appendChild(row);
+    });
+    comments.appendChild(list);
+  }
   feed.appendChild(comments);
+
+  // Other mock posts in the emulator's store. Clicking one makes it the
+  // previewed post, which is the navigation Post View never had: the feed used
+  // to contain exactly one hardcoded card.
+  const others = f.posts
+    .filter((p) => !activeMock || p.id !== activeMock.id)
+    .sort((a, b) => (b.createdUtc || 0) - (a.createdUtc || 0));
+  const more = el('div', { class: 'post-view__more' });
+  const moreHead = el('div', { class: 'post-view__more-head' });
+  moreHead.appendChild(el('span', {}, others.length ? 'More posts' : 'Mock posts'));
+  moreHead.appendChild(el('button', {
+    class: 'post-view__more-new',
+    disabled: f.busy ? '' : null,
+    onclick: async () => {
+      // Strip any trailing "#N" from the source label so a config postName of
+      // "Katsu Curry Run #1" yields "Katsu Curry Run #2", not "... #1 #2".
+      const label = ((lc.postName && lc.postName.trim()) || projectLabel || 'Mock post')
+        .replace(/\s*#\d+\s*$/, '');
+      const n = f.posts.length + 1;
+      await createMockPost(`${label} #${n}`, '');
+    },
+  }, f.busy ? 'Working…' : '+ New mock post'));
+  more.appendChild(moreHead);
+  others.forEach((p) => {
+    const card = el('div', {
+      class: 'post-view__mock-card',
+      onclick: () => { f.activePostId = p.id; emulatorFeedRerender(); },
+    });
+    const meta = el('div', { class: 'post-view__mock-meta' });
+    meta.appendChild(el('span', {}, subLabel));
+    meta.appendChild(el('span', { class: 'post-view__comment-dot' }, '·'));
+    meta.appendChild(el('span', {}, asUser(p.authorName)));
+    card.appendChild(meta);
+    card.appendChild(el('div', { class: 'post-view__mock-title' }, p.title || '(untitled)'));
+    const foot = el('div', { class: 'post-view__mock-foot' });
+    foot.appendChild(el('span', {}, `${p.score ?? 1} upvote${(p.score ?? 1) === 1 ? '' : 's'}`));
+    const n = emulatorCommentsFor(p.id).length;
+    foot.appendChild(el('span', {}, `${n} comment${n === 1 ? '' : 's'}`));
+    card.appendChild(foot);
+    more.appendChild(card);
+  });
+  feed.appendChild(more);
 
   // Aug 4: the "u/ShrekisSexy" next-post teaser was removed at Long's request.
   // It was hardcoded Sword & Supper filler ("5 end-game builds without legacy

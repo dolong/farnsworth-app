@@ -2387,6 +2387,145 @@ pre:hover .code-copy { opacity: 1; }
   line-height: 1.4;
 }
 
+/* Comment composer + rendered comments (Aug 25). Backed by the Devvit
+   emulator's Reddit store, so these are real submissions, not chrome. */
+.post-view__composer {
+  display: flex; flex-direction: column; gap: 6px;
+  margin: 6px 0 10px;
+}
+.post-view__composer-input {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  min-height: 38px;
+  padding: 8px 10px;
+  border-radius: 18px;
+  border: 1px solid #343536;
+  background: rgb(26, 26, 27);
+  color: #d7dadc;
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.4;
+  outline: none;
+}
+.post-view__composer-input:focus {
+  border-color: #4f7cff;
+}
+.post-view__composer-input::placeholder { color: #6f7375; }
+.post-view__composer-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+}
+.post-view__composer-as {
+  font-size: 11.5px;
+  color: #818384;
+}
+.post-view__composer-btn {
+  border: 0;
+  border-radius: 999px;
+  padding: 5px 14px;
+  background: #4f7cff;
+  color: #fff;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.post-view__composer-btn:disabled {
+  background: #2b2f36;
+  color: #6f7375;
+  cursor: default;
+}
+.post-view__comments-error {
+  font-size: 12px;
+  color: #ff8a7a;
+  background: rgba(255, 69, 0, 0.08);
+  border: 1px solid rgba(255, 69, 0, 0.25);
+  border-radius: 8px;
+  padding: 6px 9px;
+  margin-bottom: 8px;
+  line-height: 1.4;
+}
+.post-view__comment-list {
+  display: flex; flex-direction: column; gap: 10px;
+  padding-top: 4px;
+}
+.post-view__comment {
+  display: flex; flex-direction: column; gap: 3px;
+  padding-left: 8px;
+  border-left: 2px solid #272729;
+}
+.post-view__comment-head {
+  display: flex; align-items: center; gap: 4px;
+  font-size: 11.5px;
+  color: #818384;
+}
+.post-view__comment-author { color: #d7dadc; font-weight: 500; }
+.post-view__comment-dot { color: #6f7375; }
+.post-view__comment-body {
+  font-size: 13px;
+  color: #d7dadc;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Mock post list — the emulator's other posts, selectable as the preview */
+.post-view__more {
+  background: rgb(14, 17, 19);
+  border-top: 1px solid #1f2225;
+  padding: 10px 12px 14px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.post-view__more-head {
+  display: flex; align-items: center; justify-content: space-between;
+  font-size: 12px;
+  font-weight: 700;
+  color: #818384;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.post-view__more-new {
+  border: 1px solid #343536;
+  background: transparent;
+  color: #d7dadc;
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+  text-transform: none;
+  letter-spacing: 0;
+}
+.post-view__more-new:hover { background: #1f2225; }
+.post-view__more-new:disabled { color: #6f7375; cursor: default; }
+.post-view__mock-card {
+  border: 1px solid #272729;
+  border-radius: 10px;
+  padding: 9px 11px;
+  display: flex; flex-direction: column; gap: 4px;
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+.post-view__mock-card:hover {
+  border-color: #4f7cff;
+  background: rgba(79, 124, 255, 0.06);
+}
+.post-view__mock-meta {
+  display: flex; align-items: center; gap: 4px;
+  font-size: 11px;
+  color: #818384;
+}
+.post-view__mock-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: #d7dadc;
+  line-height: 1.3;
+}
+.post-view__mock-foot {
+  display: flex; align-items: center; gap: 12px;
+  font-size: 11px;
+  color: #818384;
+}
+
 /* Second post teaser */
 .post-view__post-teaser {
   display: flex; align-items: center; gap: 8px;

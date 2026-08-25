@@ -55,6 +55,8 @@ export class RedditAPIClientEmulator {
     this._comments = new Map();     // t1_* → Comment
     this._flairs = new Map();       // `<subredditName>:<username>` → flair text
     this._counters = { post: 0, comment: 0, subreddit: 0, user: 0 };
+    this._persistTimer = null;
+    this._dirty = false;
 
     if (Array.isArray(options.seedUsers)) this._ingestUsers(options.seedUsers);
     if (Array.isArray(options.seedSubreddits)) this._ingestSubreddits(options.seedSubreddits);
@@ -90,12 +92,20 @@ export class RedditAPIClientEmulator {
 
   _schedulePersist() {
     if (!this._persistPath) return;
+    this._dirty = true;
     if (this._persistTimer) clearTimeout(this._persistTimer);
     this._persistTimer = setTimeout(() => this._flushNow(), 50);
   }
 
+  // Only ever write a store we actually mutated. Two emulator instances can
+  // hydrate the same state file in one Go Live (the NODE_OPTIONS loader hook
+  // in the Vite process and the server-runner), and _hookExitFlush fires on
+  // process exit unconditionally. Without this guard, an instance that never
+  // touched Reddit would write its boot-time snapshot over posts and comments
+  // the other instance had legitimately added.
   _flushNow() {
     if (!this._persistPath) return;
+    if (!this._dirty) return;
     this._persistTimer = null;
     try {
       let file = {};
@@ -114,6 +124,7 @@ export class RedditAPIClientEmulator {
       };
       mkdirSync(dirname(this._persistPath), { recursive: true });
       writeFileSync(this._persistPath, JSON.stringify(file, null, 2));
+      this._dirty = false;
     } catch (e) {
       console.error('[reddit-emulator] persist failed:', e.message);
     }
@@ -357,6 +368,24 @@ export class RedditAPIClientEmulator {
 
   async getRisingPosts(options) {
     return this._filterBySubreddit(this._posts, options.subredditName, 'createdUtc');
+  }
+
+  // ----------------------------------------------------------------------
+  // Farnsworth IDE admin surface
+  // ----------------------------------------------------------------------
+
+  // Plain-JSON view of the live store for Farnsworth's Post View.
+  // Reads go through the running process rather than the JSON state file on
+  // purpose: that file is a debounced projection of these maps, so anything
+  // written out-of-band is clobbered by the next flush.
+  adminSnapshot() {
+    return {
+      currentUsername: this._currentUsername,
+      currentSubredditName: this._currentSubredditName,
+      posts: Array.from(this._posts.values()),
+      comments: Array.from(this._comments.values()),
+      counters: { ...this._counters },
+    };
   }
 
   // ----------------------------------------------------------------------

@@ -214,6 +214,78 @@ function getServerPort() {
   return ${port};
 }
 
+// ---- Farnsworth IDE admin surface -------------------------------------
+// A second, independent listener so the IDE can read and mutate the Reddit
+// emulator's mock posts and comments against the LIVE in-memory instance.
+// Deliberately NOT mounted on the user's app: it has to work regardless of
+// how a project builds its server (dontdie's local.ts never calls the
+// createServer shim above), and it must never collide with user routes.
+// Port is derived so no template script change is needed to discover it.
+const _adminPort = Number(process.env.DEVVIT_EMULATOR_ADMIN_PORT || ${port} + 100);
+function _adminSend(res, code, obj) {
+  const body = JSON.stringify(obj);
+  res.writeHead(code, {
+    'content-type': 'application/json',
+    'content-length': Buffer.byteLength(body),
+    'access-control-allow-origin': '*',
+    'access-control-allow-headers': 'content-type',
+    'access-control-allow-methods': 'GET,POST,OPTIONS',
+  });
+  res.end(body);
+}
+async function _adminReadBody(req) {
+  const chunks = [];
+  for await (const c of req) chunks.push(c);
+  if (!chunks.length) return {};
+  try { return JSON.parse(Buffer.concat(chunks).toString('utf8')) || {}; }
+  catch { return {}; }
+}
+const _adminServer = _nodeHttpCreateServer(async (req, res) => {
+  try {
+    const u = new URL(req.url || '/', 'http://127.0.0.1');
+    if (req.method === 'OPTIONS') return _adminSend(res, 204, {});
+    if (u.pathname === '/emulator/ping') {
+      return _adminSend(res, 200, { ok: true, kind: 'farnsworth-devvit-emulator-admin', serverPort: ${port} });
+    }
+    if (u.pathname === '/emulator/state' && req.method === 'GET') {
+      return _adminSend(res, 200, { ok: true, ..._reddit.adminSnapshot() });
+    }
+    if (u.pathname === '/emulator/post' && req.method === 'POST') {
+      const b = await _adminReadBody(req);
+      if (!b.title || !String(b.title).trim()) {
+        return _adminSend(res, 400, { ok: false, error: 'title_required' });
+      }
+      const p = await _reddit.submitPost({
+        title: String(b.title),
+        text: b.body ? String(b.body) : undefined,
+        subredditName: b.subredditName || undefined,
+      });
+      return _adminSend(res, 200, { ok: true, id: p.id, post: _reddit.adminSnapshot().posts.find((x) => x.id === p.id) || null });
+    }
+    if (u.pathname === '/emulator/comment' && req.method === 'POST') {
+      const b = await _adminReadBody(req);
+      const target = b.postId || b.parentId;
+      if (!target) return _adminSend(res, 400, { ok: false, error: 'postId_required' });
+      if (!b.text || !String(b.text).trim()) {
+        return _adminSend(res, 400, { ok: false, error: 'text_required' });
+      }
+      // submitComment reads options.id as the parent thing id, which is how
+      // the real Devvit API is shaped (t3_* for a post, t1_* for a reply).
+      const c = await _reddit.submitComment({ id: String(target), text: String(b.text) });
+      return _adminSend(res, 200, { ok: true, id: c.id, comments: _reddit.adminSnapshot().comments });
+    }
+    return _adminSend(res, 404, { ok: false, error: 'unknown_route', path: u.pathname });
+  } catch (e) {
+    return _adminSend(res, 500, { ok: false, error: String((e && e.message) || e) });
+  }
+});
+_adminServer.on('error', (e) => {
+  console.error('[server-runner] admin surface failed to bind on', _adminPort, '-', e.message);
+});
+_adminServer.listen(_adminPort, '127.0.0.1', () => {
+  console.log('[server-runner] emulator admin surface on http://127.0.0.1:' + _adminPort);
+});
+
 const cache = { get: async () => null, set: async () => {}, del: async () => {} };
 const media = { upload: async () => ({ mediaUrl: '' }), get: async () => null };
 const notifications = { send: async () => ({ id: '' }), readAll: async () => {} };

@@ -28,6 +28,12 @@ contextBridge.exposeInMainWorld('farnsworth', {
   devFarnsworthBoot: (appType, repoRoot) => ipcRenderer.invoke('dev:farnsworth:boot', appType, repoRoot),
   // Stop the farnsworth dev server for an app type (kills vite, clears meta).
   devFarnsworthStop: (appType) => ipcRenderer.invoke('dev:farnsworth:stop', appType),
+  // Devvit emulator admin surface (Post View mock post feed + comments).
+  // These talk to the running server-runner's live emulator, not the state
+  // file, so a write here is authoritative and survives the next flush.
+  devvitEmulatorState: () => ipcRenderer.invoke('devvit:emulatorState'),
+  devvitEmulatorSubmitPost: (payload) => ipcRenderer.invoke('devvit:emulatorSubmitPost', payload),
+  devvitEmulatorSubmitComment: (payload) => ipcRenderer.invoke('devvit:emulatorSubmitComment', payload),
   // Go Live progress (Aug 5 2026): the boot handler now runs a dependency
   // preflight, so the button needs to say "Installing…" instead of sitting on
   // "Starting…" for a minute on a fresh clone.
