@@ -824,6 +824,37 @@ button { font-family: inherit; cursor: pointer; }
   min-height: 0;
 }
 
+/* Aug 24: header for a windowed thread. Long conversations mount only their
+   tail so a streaming turn cannot rebuild a 32k-node tree every 40ms. */
+.chat-window-notice {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 0 10px;
+  border-bottom: 1px solid var(--border-subtle);
+  margin-bottom: 4px;
+}
+.chat-window-notice__btn {
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-default);
+  border-radius: 999px;
+  padding: 4px 14px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: border-color .12s ease, color .12s ease;
+}
+.chat-window-notice__btn:hover {
+  border-color: var(--border-strong);
+  color: #fff;
+}
+.chat-window-notice__count {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
 .msg {
   display: flex; gap: 6px;
 }

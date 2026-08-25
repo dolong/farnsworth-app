@@ -660,18 +660,75 @@ function initChatAutoScrollToggle() {
   });
 }
 
-function renderChat() {
+// ---------------------------------------------------------------------------
+// CHAT WINDOWING (Aug 24) — render only the tail of a long conversation.
+//
+// renderChat() rebuilds the whole thread on every call, and the streaming path
+// calls it on a 40ms timer. At 215 messages Long's thread was 32,061 DOM nodes
+// (4,544 inline SVG icons, 1,924 code blocks), so a live turn rebuilt a 32k
+// tree ~25x/second until cppgc could not allocate and the renderer took a
+// SIGABRT. Two renderer aborts in three minutes on Aug 24.
+//
+// The message array is untouched — this is purely how much of it is mounted.
+// Everything still persists, still exports, and still reaches the agent; the
+// model gets its own history from state.chatMessages, never from the DOM.
+const CHAT_WINDOW_SIZE = 30;   // messages mounted by default
+const CHAT_WINDOW_STEP = 30;   // additional messages per "show earlier" click
+
+let chatRenderLimit = CHAT_WINDOW_SIZE;
+
+// Any transition to a different transcript re-arms the window, so opening an
+// old 400-message conversation never mounts it all at once.
+function resetChatWindow() {
+  chatRenderLimit = CHAT_WINDOW_SIZE;
+}
+
+function buildChatWindowNotice(hiddenCount, thread) {
+  const bar = document.createElement('div');
+  bar.className = 'chat-window-notice';
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'chat-window-notice__btn';
+  const step = Math.min(CHAT_WINDOW_STEP, hiddenCount);
+  btn.textContent = hiddenCount === 1
+    ? 'Show 1 earlier message'
+    : `Show ${step} earlier message${step === 1 ? '' : 's'}`;
+  const label = document.createElement('span');
+  label.className = 'chat-window-notice__count';
+  label.textContent = `${hiddenCount} earlier message${hiddenCount === 1 ? '' : 's'} not shown`;
+  btn.addEventListener('click', () => {
+    // Anchor the reader: growing the window upward would otherwise shove the
+    // message they were reading off the bottom of the viewport.
+    const beforeHeight = thread.scrollHeight;
+    const beforeTop = thread.scrollTop;
+    chatRenderLimit += CHAT_WINDOW_STEP;
+    renderChat({ preserveScroll: true });
+    thread.scrollTop = beforeTop + (thread.scrollHeight - beforeHeight);
+  });
+  bar.appendChild(btn);
+  bar.appendChild(label);
+  return bar;
+}
+
+function renderChat(opts = {}) {
   const thread = $('#chat-thread');
   initChatAutoScrollToggle();
   // Capture BEFORE the wipe — innerHTML='' resets scrollTop to 0.
   const prevTop = thread.scrollTop;
   thread.innerHTML = '';
-  state.chatMessages.forEach(m => thread.appendChild(renderMessage(m)));
+  const all = state.chatMessages || [];
+  const limit = Math.max(1, chatRenderLimit);
+  const start = Math.max(0, all.length - limit);
+  if (start > 0) thread.appendChild(buildChatWindowNotice(start, thread));
+  for (let i = start; i < all.length; i++) thread.appendChild(renderMessage(all[i]));
   // Keep the composer button's Send/Stop glyph in sync with the in-flight
   // turn — guards against a stale Stop glyph after a reload or a render that
   // happens outside the turn lifecycle.
   updateChatSendButton();
-  if (chatAutoScroll) thread.scrollTop = thread.scrollHeight;
+  // "Show earlier" re-renders to grow the window; its caller re-anchors the
+  // viewport itself, so autoscroll must not yank the reader to the bottom.
+  if (opts.preserveScroll) thread.scrollTop = prevTop;
+  else if (chatAutoScroll) thread.scrollTop = thread.scrollHeight;
   else thread.scrollTop = prevTop;
   // Persist the active conversation (debounced) so the dropdown always reflects
   // the current state and a hard refresh doesn't lose work-in-progress.
@@ -1184,6 +1241,7 @@ async function startNewConversation() {
   state.chatMessages = [
     { id: 'welcome-' + Date.now(), role: 'agent', text: 'New chat — what do you want to build?', verified: true },
   ];
+  resetChatWindow();
   renderChat();
   chatScrollToBottom();
   await refreshChatHistoryList();
@@ -1210,6 +1268,7 @@ async function switchConversation(id) {
   state.chatActiveId = conv.id;
   await persistChatActiveId(conv.id);
   state.chatMessages = Array.isArray(conv.messages) ? conv.messages : [];
+  resetChatWindow();
   // A renderer turn cannot survive a conversation reload. Normalize any
   // persisted spinner from an interrupted/older session so it cannot make
   // Companion report a false busy state forever.
@@ -1238,6 +1297,7 @@ async function deleteConversation(id) {
   if (id === state.chatActiveId) {
     // Active conversation: clear it locally + delete the DB row.
     state.chatMessages = [];
+    resetChatWindow();
     renderChat();
     state.chatActiveId = null;
     await persistChatActiveId(null);
