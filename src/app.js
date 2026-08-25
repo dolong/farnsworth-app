@@ -2738,6 +2738,85 @@ function sendModelsListToCompanions() {
 // superseded chips drop out here exactly as they do on the desktop.
 const COMPANION_CHIP_BUDGET = 120;
 
+// Companion chip detail (Aug 25 2026) ---------------------------------------
+// Chips shipped to the companion carried only {label, kind}, and the label is
+// already lossy: a terminal chip is '$ ' + command.slice(0, 80) and a tool chip
+// is a ~60-char argument preview. On the phone that renders as a clipped
+// one-liner ending in '…' with no way to see the rest, so Long could not read
+// what the agent actually ran. Ship the untruncated command alongside the label
+// and let the companion expand it.
+//
+// Bulk argument values (a whole file body in write_file) are replaced by a size
+// marker: the point is to read the command, not to mirror file contents through
+// the relay on every progress event.
+const COMPANION_CHIP_DETAIL_MAX = 2000;
+
+function companionChipDetailClip(s) {
+  const str = String(s);
+  if (str.length <= COMPANION_CHIP_DETAIL_MAX) return str;
+  return str.slice(0, COMPANION_CHIP_DETAIL_MAX)
+    + `\n… (${str.length - COMPANION_CHIP_DETAIL_MAX} more characters)`;
+}
+
+// Full text behind a chip: the real command for a terminal chip, otherwise the
+// tool's arguments. Returns null when there is nothing worth expanding.
+// `source` is carried so the lossy test does not have to guess from formatting
+// (pretty-printed args contain newlines; that is not evidence of truncation).
+function companionChipDetail(c, m) {
+  if (!c) return null;
+  if (typeof c.runIndex === 'number') {
+    const run = ((m && m.runOutputs) || [])[c.runIndex];
+    if (run && typeof run.command === 'string' && run.command.trim()) {
+      return { text: companionChipDetailClip(run.command), source: 'command', collapsed: false };
+    }
+  }
+  const input = c.input;
+  if (typeof input === 'string') {
+    return input.trim() ? { text: companionChipDetailClip(input), source: 'command', collapsed: false } : null;
+  }
+  if (input && typeof input === 'object') {
+    if (typeof input.command === 'string' && input.command.trim()) {
+      return { text: companionChipDetailClip(input.command), source: 'command', collapsed: false };
+    }
+    let collapsed = false;
+    const safe = {};
+    for (const [k, v] of Object.entries(input)) {
+      if (CHIP_PREVIEW_BULK_KEYS.has(k) && typeof v === 'string') {
+        safe[k] = `<${v.length} characters>`;
+        collapsed = true;
+      } else {
+        safe[k] = v;
+      }
+    }
+    try {
+      const json = JSON.stringify(safe, null, 2);
+      if (json && json !== '{}') return { text: companionChipDetailClip(json), source: 'args', collapsed };
+    } catch {}
+  }
+  return null;
+}
+
+// A chip only earns an expander when its label is actually lossy. Otherwise a
+// short call like read_file(src/App.tsx) would sprout a '+' that reveals the
+// same text again as JSON -- noise on a phone screen.
+function companionChipLabelIsLossy(c, d) {
+  if (!d || !d.text) return false;
+  const label = String(c.label || '');
+  if (label.includes('\u2026')) return true;             // argument preview was clipped
+  if (d.collapsed) return true;                      // a bulk argument was replaced
+  if (d.text.includes('\u2026 (')) return true;          // detail itself hit the cap
+  if (d.source === 'args') return false;             // short args already fit the label
+  const bare = label.startsWith('$ ') ? label.slice(2) : label;
+  return bare !== d.text;                            // command longer than the chip shows
+}
+
+function companionChipView(c, m) {
+  const view = { label: c.label, kind: c.kind };
+  const d = companionChipDetail(c, m);
+  if (companionChipLabelIsLossy(c, d)) view.detail = d.text;
+  return view;
+}
+
 function companionTimelineView(m) {
   const tl = Array.isArray(m.timeline) ? m.timeline : null;
   if (!tl || !tl.length) return null;
@@ -2745,7 +2824,7 @@ function companionTimelineView(m) {
   const referenced = new Set();
   const segments = [];
   const pushChip = (c) => {
-    const chip = { label: c.label, kind: c.kind };
+    const chip = companionChipView(c, m);
     const last = segments[segments.length - 1];
     if (last && last.type === 'chips') last.chips.push(chip);
     else segments.push({ type: 'chips', chips: [chip] });
@@ -2816,7 +2895,7 @@ function syncChatProgressToCompanions(agentMsg) {
       // is complete on the very first progress event, not just from here on.
       timeline: companionTimelineView(agentMsg),
       text: [agentMsg.preambleText, agentMsg.responseText].filter(Boolean).join('\n\n') || agentMsg.text || '',
-      chips: (agentMsg.chips || []).filter(c => !c._superseded).slice(-30).map(c => ({ label: c.label, kind: c.kind })),
+      chips: (agentMsg.chips || []).filter(c => !c._superseded).slice(-30).map(c => companionChipView(c, agentMsg)),
     });
   } catch (e) {
     console.warn('[chat-sync] chat:progress failed:', e.message);
@@ -2858,7 +2937,7 @@ function companionMessageView(m, opts) {
       chips: (m.chips || [])
         .filter(c => !c._superseded)
         .slice(-30)
-        .map(c => ({ label: c.label, kind: c.kind })),
+        .map(c => companionChipView(c, m)),
     };
   }
   if (m.role === 'user') return m.text ? { role: 'user', text: m.text } : null;
@@ -2878,7 +2957,7 @@ function companionMessageView(m, opts) {
       chips: (m.chips || [])
         .filter(c => !c._superseded)
         .slice(-30)
-        .map(c => ({ label: c.label, kind: c.kind })),
+        .map(c => companionChipView(c, m)),
     };
   }
   return null;
@@ -13737,7 +13816,7 @@ async function sendChatMessage(opts) {
     // Without this the companion's live interleave collapsed back to a flat
     // blob the moment the turn finished. (Aug 8 2026)
     timeline: companionTimelineView(agentMsg),
-    chips: (agentMsg.chips || []).filter(c => !c._superseded).slice(-30).map(c => ({ label: c.label, kind: c.kind })),
+    chips: (agentMsg.chips || []).filter(c => !c._superseded).slice(-30).map(c => companionChipView(c, agentMsg)),
   });
 }
 
