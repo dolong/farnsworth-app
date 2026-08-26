@@ -85,6 +85,27 @@ Switching into Test View (or any preview change) tears down all existing WebCont
 
 **Resizing.** Drag the artboard's corner handles to resize the whole Test View — the game canvas scales with it, exactly like the mobile/desktop previews. Unlike display zoom, this is a real resize: the game's viewport changes and it re-lays-out responsively. At the default 900 × 876 artboard the game canvas is the standard 390 × 844 phone.
 
+**Device frame: mobile or desktop.** Test View is not phone-only. While Test View is the active preview, the **resolution dropdown** in the canvas header picks the game frame, and the artboard resizes so the frame lands at exactly those dimensions:
+
+| Group | Presets |
+|---|---|
+| Mobile | **390 × 844 (default)**, 375 × 667 (iPhone SE 3), 412 × 915 (Pixel 7), 428 × 926 (iPhone 14+) |
+| Desktop | 724 × 596 (App Desktop default), 1280 × 800, 1512 × 1320, 1920 × 1080, 2560 × 1440, 3440 × 1440 |
+| Fullscreen | 1120 × 630 |
+| Post | 700 × 512 |
+| Custom | any W × H typed into the two boxes |
+
+Picking a preset is a real viewport change (breakpoints fire), clears any manual zoom so auto-fit re-fits the new artboard, and swaps the chrome the game is wrapped in: a phone for Mobile presets, a desktop window for Desktop / Fullscreen / Post. The `.fw-stage--desktop` / `.fw-stage--mobile` wrapper class follows it.
+
+`testviewDevice()` honours the explicit dropdown choice only while the picked dimensions still match the on-screen frame. After a corner drag or a restart it falls back to orientation: width ≥ height means desktop. A Custom W × H has no optgroup to read, so it always uses that fallback.
+
+::: warning A test cannot declare its own frame
+The runner reads only `name` and `steps` (see [§4](#_4-creating-tests)), so the frame is **ambient operator state**, not part of the test file. **Mobile 390 × 844 is what you get by omission**, which means a test authored against a desktop layout will silently run in a phone. Two consequences worth designing around:
+
+- An agent authoring tests has no way to see or set the frame. If a test assumes desktop, say so in the test `name` and make the first step after `reload` a `waitFor` on `.fw-stage--desktop`, so a wrong preset fails loudly on step 2 instead of producing confusing failures deeper in the run.
+- Switching the frame is a human action in the canvas header. Pick the Desktop preset **before** running a desktop test.
+:::
+
 ---
 
 ## 4. Creating tests

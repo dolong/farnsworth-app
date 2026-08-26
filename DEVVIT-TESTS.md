@@ -35,6 +35,42 @@ The filename (normalized to lowercase-dashes by `test_save`) is the test's ident
 
 Step fields: `action` (required) + action-specific fields. `_comment` and `name` on a step are annotation only (use `_comment` generously). `timeout` defaults to **5000ms**. There is NO `label`, `frame`, or `waitAfter` field; for a pause after an action, add a `sleep` step.
 
+## The canvas frame - mobile vs desktop (read this before authoring)
+
+**A test cannot declare its own frame.** The runner reads only `name` and `steps`, so
+the viewport a test executes against is ambient UI state: whatever the **resolution
+dropdown** in the canvas header is set to while Test View is the active preview.
+
+**The default is Mobile, 390 x 844.** If nobody has picked a preset, that is the frame
+you get - so a test authored for a desktop layout will silently run in a phone and fail
+in confusing ways. Desktop is fully supported; it just has to be selected.
+
+| Group | Presets |
+|---|---|
+| Mobile | **390 x 844 (default)**, 375 x 667, 412 x 915, 428 x 926 |
+| Desktop | 724 x 596 (App Desktop default), 1280 x 800, 1512 x 1320, 1920 x 1080, 2560 x 1440, 3440 x 1440 |
+| Fullscreen | 1120 x 630 |
+| Post | 700 x 512 |
+| Custom | any W x H typed into the two boxes |
+
+Picking a preset is a **real viewport change**: the game re-lays-out and its responsive
+breakpoints fire. Display zoom (the +/- controls) is not - it never changes the logical
+viewport, so selectors, clicks and screenshots behave identically at any zoom level.
+
+Rules for authoring:
+
+1. **Do not default to mobile silently.** If the layout differs between phone and
+   desktop, ask which frame the test is for, or state which one you assumed.
+2. **Make the assumption self-checking.** Right after `reload`, `waitFor` on
+   `.fw-stage--desktop` or `.fw-stage--mobile`. If the operator has the wrong preset
+   selected, the test then fails on step 2 with an obvious message instead of dying on
+   a selector that only exists in the other layout.
+3. **Device classification** follows the picked preset while its dimensions still match
+   the on-screen frame. After a corner-drag resize or a restart it falls back to
+   orientation: width >= height means desktop.
+4. **Switching the frame is the operator's job, not yours.** There is no test action and
+   no tool parameter that sets it. Say which preset the user needs to pick.
+
 ## Available actions (complete list - do not invent others)
 
 | Action | Required | Optional | Description |
@@ -130,6 +166,9 @@ Read the project source for anything not listed - do not guess selectors.
 4. **Generous timeouts around animations** (7-30s in the-last-draft draft sequence); `waitForNotVisible` to wait out transitions.
 5. **`screenshot` needs an absolute `path`** (`/tmp/...`). There is no auto screenshots dir.
 6. **Failed steps do not stop the run** at the top level (you get full output); nested steps abort their `if`/`while` block.
+7. **The frame is not part of the test.** Mobile 390 x 844 is the default, so a desktop
+   test needs a Desktop preset picked in the resolution dropdown first. Guard the
+   assumption with a `waitFor` on `.fw-stage--desktop` / `.fw-stage--mobile`.
 
 ## The tools you'll call
 

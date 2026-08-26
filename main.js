@@ -6984,7 +6984,7 @@ const AGENT_TOOLS = [
   },
   {
     name: 'test_save',
-    description: 'Save a test JSON file to the active workspace\'s .farnsworth/devvit-tests/ folder. JSON is validated before writing. The name is normalized to lowercase-dashes (e.g. "My Test!" → "my-test"). See DEVVIT-TESTS.md for the test format.',
+    description: 'Save a test JSON file to the active workspace\'s .farnsworth/devvit-tests/ folder. JSON is validated before writing. The name is normalized to lowercase-dashes (e.g. "My Test!" → "my-test"). See DEVVIT-TESTS.md for the test format. IMPORTANT - a test cannot declare its own viewport: the runner reads only `name` and `steps`, and the frame comes from the resolution dropdown in the canvas header, which defaults to MOBILE 390x844. Test View also supports Desktop presets (724x596, 1280x800, 1512x1320, 1920x1080, 2560x1440, 3440x1440), Fullscreen and Post. Do not silently assume mobile: if the layout differs between phone and desktop, ask which frame the test is for, state the assumption in the test name, and make the first step after `reload` a waitFor on `.fw-stage--desktop` or `.fw-stage--mobile` so a wrong preset fails loudly instead of dying on a selector that only exists in the other layout.',
     input_schema: {
       type: 'object',
       properties: {
@@ -6996,7 +6996,7 @@ const AGENT_TOOLS = [
   },
   {
     name: 'test_run',
-    description: 'Run a test against the canvas WebContentsView. Takes the test\'s ABSOLUTE file path (not a name) — get it from test_list or test_save results. Returns stdout/stderr (last 4000/2000 chars), exit code, a `failed` count parsed from the runner output, and — when the run was recorded — a `video` object with the .webm path, byte size and duration. Recording is on by default: report the video path back to the user when one comes back.',
+    description: 'Run a test against the canvas WebContentsView. Takes the test\'s ABSOLUTE file path (not a name) — get it from test_list or test_save results. Returns stdout/stderr (last 4000/2000 chars), exit code, a `failed` count parsed from the runner output, and — when the run was recorded — a `video` object with the .webm path, byte size and duration. Recording is on by default: report the video path back to the user when one comes back. The test runs against whatever frame Test View is currently set to - the resolution dropdown in the canvas header, default MOBILE 390x844 - and neither the test file nor this tool can change it. If a run fails on layout-specific selectors, consider that the user may need to pick a Desktop preset before re-running, and say so.',
     input_schema: {
       type: 'object',
       properties: {
