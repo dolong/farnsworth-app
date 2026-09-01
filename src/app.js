@@ -14048,14 +14048,13 @@ async function sendChatMessage(opts) {
           tool_use_id: tu.id,
           content: resultContent,
         });
-        // Auto-open files the agent wrote in Monaco
+        // Keep the editor's copy current without taking over the canvas.
+        // Agent writes are background work: Preview/Prod and the user's active
+        // editor tab stay exactly where they are. Code navigation remains an
+        // explicit file click or set_canvas_view("code") action.
         if (tu.name === 'write_file' && toolRes.ok && state.folder && tu.input?.path) {
           const absPath = state.folder + '/' + tu.input.path;
-          // Switch to code mode + open
-          state.canvasMode = 'code';
-          renderCanvas();
-          updateModeToggles();
-          openFileByPath(absPath);
+          stageAgentWrittenFile(absPath);
         }
       }
       // Stop pressed while a tool was executing — its result is in
@@ -16112,20 +16111,53 @@ async function openFileByPath(filePath) {
   await openFileInEditor(filePath, content);
 }
 
+
+// Refresh or stage a file written by the chat agent without navigating the
+// canvas, changing the active editor tab, or moving keyboard focus. A clean,
+// already-open model can safely follow disk. A dirty model keeps the user's
+// buffer and records the disk version as an external change. New files become
+// background tabs when Monaco is ready; otherwise a later explicit open reads
+// the current disk contents normally.
+async function stageAgentWrittenFile(filePath) {
+  const content = await readFileFromDisk(filePath);
+  if (content === null) return;
+
+  const existing = openFiles.findIndex(f => f.path === filePath);
+  if (existing >= 0) {
+    const file = openFiles[existing];
+    const relPath = relPathOf(filePath);
+    const bufferContent = file.model?.getValue() ?? file.diskContent ?? '';
+    if (file.dirty && bufferContent !== content) {
+      externalChanges.set(relPath, { diskContent: content, ts: Date.now() });
+    } else {
+      file.diskContent = content;
+      if (file.model && bufferContent !== content) file.model.setValue(content);
+      file.dirty = false;
+      externalChanges.delete(relPath);
+    }
+    updateTabUI();
+    if (state.canvasMode === 'code' && existing === activeFileIdx) syncExtBanner();
+    return;
+  }
+
+  if (!window.__monacoReady || typeof monaco === 'undefined') return;
+  const name = filePath.split('/').pop();
+  const uri = monaco.Uri.parse('file://' + filePath);
+  let model = monaco.editor.getModel(uri);
+  if (!model) model = monaco.editor.createModel(content, langForPath(filePath), uri);
+  else if (model.getValue() !== content) model.setValue(content);
+  openFiles.push({ path: filePath, name, dirty: false, model, diskContent: content });
+  updateTabUI();
+}
+
 // Is the USER actively typing somewhere right now?
 //
-// The agent moves the UI around while it works -- every successful write_file
-// auto-switches the canvas to code mode and opens the file in Monaco (see the
-// tool loop), and each of those opens ends in monacoEditor.focus(). That yanked
-// the caret out of whatever the user was typing in, which in practice is the
-// chat composer, mid-sentence, once per file the agent touched. Long reported
-// it Aug 24 2026: "very annoying to be deselected from the input box".
-//
-// The rule: programmatic focus may only move the caret when the user is not
-// already typing somewhere else. A genuine user gesture -- clicking an editor
-// tab, opening a file from the Files panel, Cmd+Shift+T -- leaves
-// activeElement on a button or the body, so those paths still focus Monaco
-// exactly like before. Only background/agent-driven opens are held back.
+// Earlier agent writes auto-opened Monaco and could end in
+// monacoEditor.focus(), stealing the caret from the chat composer. Agent writes
+// no longer navigate or focus the editor, but this remains the shared guard for
+// other programmatic open paths. Genuine user gestures -- clicking an editor
+// tab, opening a file from Files, Cmd+Shift+T -- leave activeElement on a button
+// or the body, so those paths still focus Monaco normally.
 function userIsTypingElsewhere() {
   const ae = document.activeElement;
   if (!ae || ae === document.body) return false;
