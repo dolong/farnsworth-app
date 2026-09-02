@@ -4035,6 +4035,20 @@ pre:hover .code-copy { opacity: 1; }
   resize: vertical; min-height: 70px; line-height: 1.5;
   font-family: var(--font-mono, ui-monospace, monospace); font-size: 12px;
 }
+.ci-model-grid-head, .ci-model-row {
+  display: grid; grid-template-columns: minmax(170px, 2fr) minmax(120px, 1.35fr) minmax(88px, .8fr) minmax(88px, .8fr) 28px;
+  gap: 8px; align-items: center;
+}
+.ci-model-grid-head { padding: 0 1px; color: #777d88; font-size: 10px; font-weight: 650; letter-spacing: .02em; }
+.ci-models-editor { display: flex; flex-direction: column; gap: 7px; }
+.ci-model-row .apikey-input { width: 100%; min-width: 0; font-size: 11.5px; }
+.ci-model-row input[type="number"] { font-family: var(--font-mono, ui-monospace, monospace); }
+.ci-model-remove {
+  width: 28px; height: 28px; border: 0; border-radius: 7px; cursor: pointer;
+  background: transparent; color: #777d88; font-size: 18px; line-height: 1;
+}
+.ci-model-remove:hover { color: #ef8d9a; background: rgba(239, 93, 113, .1); }
+.ci-model-add { align-self: flex-start; }
 .ci-form__actions { display: flex; gap: 8px; margin-top: 4px; }
 .settings-page__title {
   font-size: 20px; font-weight: 800; color: var(--text-primary);

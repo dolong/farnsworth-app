@@ -153,7 +153,7 @@ const state = {
     leftPanelTabs: { chat: true, terminal: true, claudecode: true, codex: true },
     // Custom-inference connection registry (Jul 19). Each entry is an
     // OpenAI-compatible endpoint the chat can route to, with full tool
-    // parity. Shape: { id, name, baseURL, keyRef, models: [{ apiId, display }] }.
+    // parity. Shape: { id, name, baseURL, keyRef, models: [{ apiId, display, inputCostPerMTok?, outputCostPerMTok? }] }.
     // keyRef points at an encrypted credential slot ('custom-<id>').
     customEndpoints: [],
     // Honest rows only — see ROUTING_CALL_SITES above for the id → call
@@ -8447,8 +8447,31 @@ function computeSessionUsage() {
   return { perModel, totalIn, totalOut, totalTurns };
 }
 
+function normalizeCustomModelPrice(value) {
+  if (value === '' || value == null) return null;
+  const price = Number(value);
+  return Number.isFinite(price) && price >= 0 ? price : null;
+}
+
+function customModelPricing(modelName) {
+  for (const ep of (state.settings?.customEndpoints || [])) {
+    for (const model of (ep.models || [])) {
+      if ((model.display || model.apiId) !== modelName && model.apiId !== modelName) continue;
+      const input = normalizeCustomModelPrice(model.inputCostPerMTok);
+      const output = normalizeCustomModelPrice(model.outputCostPerMTok);
+      return input != null && output != null ? { input, output } : null;
+    }
+  }
+  return undefined;
+}
+
+function modelPricingFor(modelName) {
+  const customRate = customModelPricing(modelName);
+  return customRate === undefined ? (MODEL_PRICING_PER_MTOK[modelName] || null) : customRate;
+}
+
 function estimateCostUSD(model, input, output) {
-  const rate = MODEL_PRICING_PER_MTOK[model];
+  const rate = modelPricingFor(model);
   if (!rate) return null;
   return (input / 1e6) * rate.input + (output / 1e6) * rate.output;
 }
@@ -8506,7 +8529,7 @@ function renderUsageModal() {
     <div class="usage-modal__section-title">By model</div>
     ${rowsHtml}
     <div class="usage-modal__note">
-      ${totalIn.toLocaleString()} in / ${totalOut.toLocaleString()} out, this conversation only. Cost is a rough estimate from list per-token rates — it does not account for prompt-cache discounts, so it can run high. ${models.some(m => !MODEL_PRICING_PER_MTOK[m]) ? 'No pricing data for one or more models shown (custom/OpenAI endpoints) — their tokens count toward the total but not the cost.' : ''}
+      ${totalIn.toLocaleString()} in / ${totalOut.toLocaleString()} out, this conversation only. Cost is a rough estimate from list per-token rates — it does not account for prompt-cache discounts, so it can run high. ${models.some(m => !modelPricingFor(m)) ? 'No pricing data for one or more models shown — their tokens count toward the total but not the cost. Configure custom model rates in Settings → AI → Custom inference.' : ''}
     </div>
   `;
 }
@@ -8608,7 +8631,7 @@ function renderAISettings() {
             <div class="settings-section__title">Custom inference</div>
             <span class="settings-pill settings-pill--cost">OPENAI-COMPATIBLE</span>
           </div>
-          <div class="settings-section__desc">Add any OpenAI-compatible endpoint (OpenAI, OpenRouter, Together, Fireworks, vLLM, llama.cpp, \u2026). Registered models appear in the chat model picker with full tool-calling.</div>
+          <div class="settings-section__desc">Add any OpenAI-compatible endpoint (OpenAI, OpenRouter, Together, Fireworks, vLLM, llama.cpp, \u2026). Registered models appear in the chat model picker with full tool-calling. Optional input/output prices power Session token usage estimates.</div>
         </div>
         <button id="ci-add-btn" class="btn btn--primary btn--sm" style="white-space:nowrap;">+ Add endpoint</button>
       </div>
@@ -8840,7 +8863,7 @@ function renderAISettings() {
 
 // Render the custom-inference endpoint cards + wire the add/edit/delete flow.
 // Each endpoint is an OpenAI-compatible connection: name + baseURL + an
-// encrypted key slot ('custom-<id>') + a list of model { apiId, display }.
+// encrypted key slot ('custom-<id>') + model IDs, display names, and optional pricing.
 function renderCustomEndpoints(wrap) {
   const listEl = wrap.querySelector('.ci-list');
   const addBtn = wrap.querySelector('#ci-add-btn');
@@ -8857,8 +8880,11 @@ function renderCustomEndpoints(wrap) {
     }
     for (const ep of eps) {
       const card = el('div', { class: 'ci-card' });
-      const modelCount = (ep.models || []).length;
-      const modelPreview = (ep.models || []).map(m => m.display || m.apiId).slice(0, 4).join(', ') + (modelCount > 4 ? ', \u2026' : '');
+      const endpointModels = ep.models || [];
+      const modelCount = endpointModels.length;
+      const modelPreview = endpointModels.map(m => m.display || m.apiId).slice(0, 4).join(', ') + (modelCount > 4 ? ', \u2026' : '');
+      const pricedCount = endpointModels.filter(m => normalizeCustomModelPrice(m.inputCostPerMTok) != null && normalizeCustomModelPrice(m.outputCostPerMTok) != null).length;
+      const pricingPreview = modelCount ? ` \u00b7 ${pricedCount === modelCount ? 'all priced' : pricedCount + ' priced'}` : '';
       card.innerHTML = `
         <div class="ci-card__main">
           <div class="ci-card__icon">
@@ -8867,7 +8893,7 @@ function renderCustomEndpoints(wrap) {
           <div class="ci-card__text">
             <div class="ci-card__name">${escapeHtml(ep.name || 'Endpoint')}</div>
             <div class="ci-card__url">${escapeHtml(ep.baseURL || '')}</div>
-            <div class="ci-card__models">${modelCount} model${modelCount === 1 ? '' : 's'}${modelCount ? ' \u00b7 ' + escapeHtml(modelPreview) : ''}</div>
+            <div class="ci-card__models">${modelCount} model${modelCount === 1 ? '' : 's'}${modelCount ? ' \u00b7 ' + escapeHtml(modelPreview) : ''}${pricingPreview}</div>
           </div>
         </div>
         <div class="ci-card__actions">
@@ -8896,15 +8922,29 @@ function renderCustomEndpoints(wrap) {
   const openForm = (existing) => {
     const isEdit = !!existing;
     const form = el('div', { class: 'ci-form' });
-    const modelsText = isEdit
-      ? (existing.models || []).map(m => (m.apiId + (m.display && m.display !== m.apiId ? ' | ' + m.display : ''))).join('\n')
-      : '';
+    const formModels = isEdit && (existing.models || []).length
+      ? existing.models
+      : [{ apiId: '', display: '', inputCostPerMTok: null, outputCostPerMTok: null }];
+    const modelRowHtml = (model = {}) => `
+      <div class="ci-model-row">
+        <input type="text" class="apikey-input ci-model-api" placeholder="accounts/provider/models/model-id" value="${escapeHtml(model.apiId || '')}">
+        <input type="text" class="apikey-input ci-model-display" placeholder="Display name" value="${escapeHtml(model.display && model.display !== model.apiId ? model.display : '')}">
+        <input type="number" min="0" step="any" inputmode="decimal" class="apikey-input ci-model-input-cost" placeholder="0.00" value="${normalizeCustomModelPrice(model.inputCostPerMTok) ?? ''}">
+        <input type="number" min="0" step="any" inputmode="decimal" class="apikey-input ci-model-output-cost" placeholder="0.00" value="${normalizeCustomModelPrice(model.outputCostPerMTok) ?? ''}">
+        <button type="button" class="ci-model-remove" title="Remove model" aria-label="Remove model">×</button>
+      </div>`;
+    const modelRowsHtml = formModels.map(modelRowHtml).join('');
     form.innerHTML = `
       <div class="ci-form__title">${isEdit ? 'Edit endpoint' : 'New endpoint'}</div>
       <label class="ci-field"><span>Name</span><input type="text" class="apikey-input ci-name" placeholder="OpenRouter" value="${isEdit ? escapeHtml(existing.name || '') : ''}"></label>
       <label class="ci-field"><span>Base URL</span><input type="text" class="apikey-input ci-url" placeholder="https://openrouter.ai/api/v1" value="${isEdit ? escapeHtml(existing.baseURL || '') : ''}"></label>
       <label class="ci-field"><span>API key</span><input type="password" class="apikey-input ci-key" placeholder="${isEdit ? '\u2022\u2022\u2022\u2022 leave blank to keep' : 'sk-\u2026'}" autocomplete="off"></label>
-      <label class="ci-field"><span>Models <em>(one per line: <code>api-id | Display Name</code>)</em></span><textarea class="apikey-input ci-models" rows="4" placeholder="anthropic/claude-3.5-sonnet | Claude 3.5 Sonnet&#10;meta-llama/llama-3.1-70b-instruct | Llama 3.1 70B">${escapeHtml(modelsText)}</textarea></label>
+      <div class="ci-field">
+        <span>Models <em>(prices are USD per 1M tokens; leave both blank if unknown)</em></span>
+        <div class="ci-model-grid-head" aria-hidden="true"><span>API model ID</span><span>Display name</span><span>Input $ / 1M</span><span>Output $ / 1M</span><span></span></div>
+        <div class="ci-models-editor">${modelRowsHtml}</div>
+        <button type="button" class="btn btn--ghost btn--sm ci-model-add">+ Add model</button>
+      </div>
       <div class="ci-form__actions">
         <button class="btn btn--primary btn--sm ci-save">${isEdit ? 'Save' : 'Add endpoint'}</button>
         <button class="btn btn--ghost btn--sm ci-cancel">Cancel</button>
@@ -8914,24 +8954,55 @@ function renderCustomEndpoints(wrap) {
     listEl.appendChild(form);
     addBtn.disabled = true;
 
+    const modelsEditor = form.querySelector('.ci-models-editor');
+    form.querySelector('.ci-model-add').addEventListener('click', () => {
+      modelsEditor.insertAdjacentHTML('beforeend', modelRowHtml());
+      modelsEditor.lastElementChild?.querySelector('.ci-model-api')?.focus();
+    });
+    modelsEditor.addEventListener('click', event => {
+      const remove = event.target.closest('.ci-model-remove');
+      if (!remove) return;
+      const row = remove.closest('.ci-model-row');
+      if (modelsEditor.children.length === 1) {
+        row.querySelectorAll('input').forEach(input => { input.value = ''; });
+      } else {
+        row.remove();
+      }
+    });
+
     form.querySelector('.ci-cancel').addEventListener('click', () => { addBtn.disabled = false; draw(); });
     form.querySelector('.ci-save').addEventListener('click', async () => {
       const name = form.querySelector('.ci-name').value.trim();
       let url = form.querySelector('.ci-url').value.trim();
       const key = form.querySelector('.ci-key').value.trim();
-      const rawModels = form.querySelector('.ci-models').value;
+      const modelRows = [...form.querySelectorAll('.ci-model-row')];
       if (!name) { form.querySelector('.ci-name').focus(); return; }
       if (!/^https?:\/\//i.test(url)) { form.querySelector('.ci-url').focus(); return; }
       url = url.replace(/\/+$/, '');
-      const models = rawModels.split('\n').map(line => {
-        const t = line.trim();
-        if (!t) return null;
-        const [apiId, ...rest] = t.split('|');
-        const id = apiId.trim();
-        if (!id) return null;
-        const disp = rest.join('|').trim();
-        return { apiId: id, display: disp || id };
-      }).filter(Boolean);
+      const models = [];
+      for (const row of modelRows) {
+        const apiInput = row.querySelector('.ci-model-api');
+        const displayInput = row.querySelector('.ci-model-display');
+        const inputCostInput = row.querySelector('.ci-model-input-cost');
+        const outputCostInput = row.querySelector('.ci-model-output-cost');
+        const apiId = apiInput.value.trim();
+        if (!apiId) continue;
+        const display = displayInput.value.trim() || apiId;
+        const inputText = inputCostInput.value.trim();
+        const outputText = outputCostInput.value.trim();
+        const inputCostPerMTok = normalizeCustomModelPrice(inputText);
+        const outputCostPerMTok = normalizeCustomModelPrice(outputText);
+        if (inputText || outputText) {
+          if (inputCostPerMTok == null) { inputCostInput.focus(); return; }
+          if (outputCostPerMTok == null) { outputCostInput.focus(); return; }
+        }
+        const model = { apiId, display };
+        if (inputCostPerMTok != null && outputCostPerMTok != null) {
+          model.inputCostPerMTok = inputCostPerMTok;
+          model.outputCostPerMTok = outputCostPerMTok;
+        }
+        models.push(model);
+      }
 
       const id = isEdit ? existing.id : ('ep_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5));
       const keyRef = isEdit ? (existing.keyRef || ('custom-' + id)) : ('custom-' + id);
