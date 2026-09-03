@@ -7738,6 +7738,48 @@ function resolveEndpointKey(ep) {
   return getOpenAIKey();
 }
 
+// Conversation affinity is an endpoint capability, not a hostname special
+// case. Each endpoint can map Farnsworth's stable conversation ID to a header
+// and/or top-level request-body field without provider-specific adapter code.
+function endpointSessionRouting(ep) {
+  const raw = ep && ep.sessionRouting && typeof ep.sessionRouting === 'object'
+    ? ep.sessionRouting
+    : {};
+  const headerCandidate = typeof raw.header === 'string' ? raw.header.trim() : '';
+  const bodyFieldCandidate = typeof raw.bodyField === 'string' ? raw.bodyField.trim() : '';
+  const reservedHeaders = new Set(['authorization', 'content-type', 'accept']);
+  const reservedBodyFields = new Set(['model', 'messages', 'tools', 'stream', 'stream_options', 'max_completion_tokens', 'reasoning_effort']);
+  const header = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/.test(headerCandidate) && !reservedHeaders.has(headerCandidate.toLowerCase())
+    ? headerCandidate
+    : '';
+  const bodyField = /^[A-Za-z_][A-Za-z0-9_]*$/.test(bodyFieldCandidate) && !reservedBodyFields.has(bodyFieldCandidate)
+    ? bodyFieldCandidate
+    : '';
+  return { header, bodyField };
+}
+
+function endpointSessionValue(ep, sessionAffinity) {
+  const value = typeof sessionAffinity === 'string' ? sessionAffinity.trim() : '';
+  const routing = endpointSessionRouting(ep);
+  return value && (routing.header || routing.bodyField) ? value : null;
+}
+
+function openAIRequestHeaders(ep, key, sessionAffinity, streaming = false) {
+  const headers = { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` };
+  if (streaming) headers.Accept = 'text/event-stream';
+  const value = endpointSessionValue(ep, sessionAffinity);
+  const { header } = endpointSessionRouting(ep);
+  if (value && header) headers[header] = value;
+  return headers;
+}
+
+function applyEndpointSessionRouting(body, ep, sessionAffinity) {
+  const value = endpointSessionValue(ep, sessionAffinity);
+  const { bodyField } = endpointSessionRouting(ep);
+  if (value && bodyField) body[bodyField] = value;
+  return body;
+}
+
 // Aug 7 2026: returns null (not {}) when the accumulated argument JSON doesn't
 // parse, so the caller can report a truncated tool call instead of dispatching
 // one with no arguments. An absent/empty string is still a legitimate no-arg
@@ -7906,11 +7948,11 @@ async function openAISend(opts) {
   const buildBody = (allowImages) => {
     const b = { model, messages: toOpenAIMessages(messages, system, allowImages), max_completion_tokens: maxTokens };
     if (tools) { b.tools = tools; if (isReasoningModel(model)) b.reasoning_effort = 'none'; }
-    return b;
+    return applyEndpointSessionRouting(b, ep, opts.sessionAffinity);
   };
   const post = (allowImages) => fetch(`${base}/chat/completions`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` },
+    headers: openAIRequestHeaders(ep, key, opts.sessionAffinity),
     body: JSON.stringify(buildBody(allowImages)),
   });
   try {
@@ -7973,11 +8015,11 @@ async function openAIStream(opts, send, abortSignal) {
   const buildBody = (allowImages) => {
     const b = { model, messages: toOpenAIMessages(messages, system, allowImages), max_completion_tokens: maxTokens, stream: true, stream_options: { include_usage: true } };
     if (tools) { b.tools = tools; if (isReasoningModel(model)) b.reasoning_effort = 'none'; }
-    return b;
+    return applyEndpointSessionRouting(b, ep, opts.sessionAffinity);
   };
   const post = (allowImages) => fetch(`${base}/chat/completions`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}`, 'Accept': 'text/event-stream' },
+    headers: openAIRequestHeaders(ep, key, opts.sessionAffinity, true),
     body: JSON.stringify(buildBody(allowImages)),
     signal: abortSignal,
   });

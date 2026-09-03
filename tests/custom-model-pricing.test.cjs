@@ -44,6 +44,7 @@ assert.match(appSource, /model\.inputCostPerMTok = inputCostPerMTok/);
 assert.match(appSource, /model\.outputCostPerMTok = outputCostPerMTok/);
 assert.match(appSource, /Configure custom model rates in Settings → AI → Custom inference/);
 assert.match(cssSource, /\.ci-model-grid-head, \.ci-model-row/);
-assert.match(appSource, /const record = \{ id, name, baseURL: url, keyRef, models \};/);
+assert.match(appSource, /const record = \{ id, name, baseURL: url, keyRef, models, sessionRouting \};/,
+  'custom endpoint records must preserve pricing models and endpoint-level session routing');
 
 console.log('custom model pricing regression: OK');

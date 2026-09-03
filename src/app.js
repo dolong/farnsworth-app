@@ -153,8 +153,9 @@ const state = {
     leftPanelTabs: { chat: true, terminal: true, claudecode: true, codex: true },
     // Custom-inference connection registry (Jul 19). Each entry is an
     // OpenAI-compatible endpoint the chat can route to, with full tool
-    // parity. Shape: { id, name, baseURL, keyRef, models: [{ apiId, display, inputCostPerMTok?, outputCostPerMTok? }] }.
-    // keyRef points at an encrypted credential slot ('custom-<id>').
+    // parity. Shape: { id, name, baseURL, keyRef, models, sessionRouting }.
+    // Models may include input/output pricing. sessionRouting maps the stable
+    // conversation ID into a provider-specific header and/or body field.
     customEndpoints: [],
     // Honest rows only — see ROUTING_CALL_SITES above for the id → call
     // site mapping. behavior/verification/streaming were removed Jul 13
@@ -318,11 +319,57 @@ function resolveEndpointForModel(displayName) {
   for (const ep of (state.settings?.customEndpoints || [])) {
     for (const m of (ep.models || [])) {
       if ((m.display || m.apiId) === displayName || m.apiId === displayName) {
-        return { name: ep.name, baseURL: ep.baseURL, keyRef: ep.keyRef };
+        return {
+          name: ep.name,
+          baseURL: ep.baseURL,
+          keyRef: ep.keyRef,
+          sessionRouting: ep.sessionRouting || null,
+        };
       }
     }
   }
   return null;
+}
+
+// Endpoint-level session routing is inherited by every model under the
+// endpoint, so adding a model never needs another provider-specific patch.
+function normalizeEndpointSessionRouting(raw) {
+  const value = raw && typeof raw === 'object' ? raw : {};
+  const mode = ['none', 'fireworks', 'custom'].includes(value.mode) ? value.mode : 'none';
+  if (mode === 'fireworks') return { mode, header: 'x-session-affinity', bodyField: '' };
+  if (mode === 'custom') return {
+    mode,
+    header: typeof value.header === 'string' ? value.header.trim() : '',
+    bodyField: typeof value.bodyField === 'string' ? value.bodyField.trim() : '',
+  };
+  return { mode: 'none', header: '', bodyField: '' };
+}
+
+function isFireworksBaseURL(baseURL) {
+  try {
+    const hostname = new URL(String(baseURL || '')).hostname.toLowerCase();
+    return hostname === 'api.fireworks.ai' || hostname.endsWith('.fireworks.ai');
+  } catch { return false; }
+}
+
+function reconcileEndpointSessionRouting() {
+  const eps = Array.isArray(state.settings.customEndpoints) ? state.settings.customEndpoints : [];
+  let changed = false;
+  for (const ep of eps) {
+    // One-time migration only. Runtime requests never infer behavior from URL.
+    // An explicit mode, including "none", always wins.
+    if (!ep.sessionRouting && isFireworksBaseURL(ep.baseURL)) {
+      ep.sessionRouting = { mode: 'fireworks', header: 'x-session-affinity', bodyField: '' };
+      changed = true;
+    } else if (ep.sessionRouting) {
+      const normalized = normalizeEndpointSessionRouting(ep.sessionRouting);
+      if (JSON.stringify(normalized) !== JSON.stringify(ep.sessionRouting)) {
+        ep.sessionRouting = normalized;
+        changed = true;
+      }
+    }
+  }
+  return changed;
 }
 
 // Per-call-site routing lookups (Jul 13 ~23:05 ET). See ROUTING_CALL_SITES
@@ -8863,7 +8910,7 @@ function renderAISettings() {
 
 // Render the custom-inference endpoint cards + wire the add/edit/delete flow.
 // Each endpoint is an OpenAI-compatible connection: name + baseURL + an
-// encrypted key slot ('custom-<id>') + model IDs, display names, and optional pricing.
+// encrypted key slot + models, pricing, and optional provider-specific session routing.
 function renderCustomEndpoints(wrap) {
   const listEl = wrap.querySelector('.ci-list');
   const addBtn = wrap.querySelector('#ci-add-btn');
@@ -8885,6 +8932,12 @@ function renderCustomEndpoints(wrap) {
       const modelPreview = endpointModels.map(m => m.display || m.apiId).slice(0, 4).join(', ') + (modelCount > 4 ? ', \u2026' : '');
       const pricedCount = endpointModels.filter(m => normalizeCustomModelPrice(m.inputCostPerMTok) != null && normalizeCustomModelPrice(m.outputCostPerMTok) != null).length;
       const pricingPreview = modelCount ? ` \u00b7 ${pricedCount === modelCount ? 'all priced' : pricedCount + ' priced'}` : '';
+      const routing = normalizeEndpointSessionRouting(ep.sessionRouting);
+      const affinityLabel = routing.mode === 'fireworks'
+        ? 'Prompt cache affinity \u00b7 x-session-affinity'
+        : routing.mode === 'custom'
+          ? 'Conversation affinity \u00b7 ' + ([routing.header, routing.bodyField].filter(Boolean).join(' + ') || 'not configured')
+          : 'Conversation affinity \u00b7 Off';
       card.innerHTML = `
         <div class="ci-card__main">
           <div class="ci-card__icon">
@@ -8894,6 +8947,7 @@ function renderCustomEndpoints(wrap) {
             <div class="ci-card__name">${escapeHtml(ep.name || 'Endpoint')}</div>
             <div class="ci-card__url">${escapeHtml(ep.baseURL || '')}</div>
             <div class="ci-card__models">${modelCount} model${modelCount === 1 ? '' : 's'}${modelCount ? ' \u00b7 ' + escapeHtml(modelPreview) : ''}${pricingPreview}</div>
+            <div class="ci-card__capabilities">${escapeHtml(affinityLabel)}</div>
           </div>
         </div>
         <div class="ci-card__actions">
@@ -8934,6 +8988,7 @@ function renderCustomEndpoints(wrap) {
         <button type="button" class="ci-model-remove" title="Remove model" aria-label="Remove model">×</button>
       </div>`;
     const modelRowsHtml = formModels.map(modelRowHtml).join('');
+    const existingRouting = normalizeEndpointSessionRouting(existing?.sessionRouting);
     form.innerHTML = `
       <div class="ci-form__title">${isEdit ? 'Edit endpoint' : 'New endpoint'}</div>
       <label class="ci-field"><span>Name</span><input type="text" class="apikey-input ci-name" placeholder="OpenRouter" value="${isEdit ? escapeHtml(existing.name || '') : ''}"></label>
@@ -8945,6 +9000,18 @@ function renderCustomEndpoints(wrap) {
         <div class="ci-models-editor">${modelRowsHtml}</div>
         <button type="button" class="btn btn--ghost btn--sm ci-model-add">+ Add model</button>
       </div>
+      <label class="ci-field"><span>Conversation affinity <em>(inherited by every model)</em></span>
+        <select class="apikey-input ci-affinity-mode">
+          <option value="none"${existingRouting.mode === 'none' ? ' selected' : ''}>Off</option>
+          <option value="fireworks"${existingRouting.mode === 'fireworks' ? ' selected' : ''}>Fireworks prompt cache affinity</option>
+          <option value="custom"${existingRouting.mode === 'custom' ? ' selected' : ''}>Custom request fields</option>
+        </select>
+      </label>
+      <div class="ci-affinity-custom"${existingRouting.mode === 'custom' ? '' : ' hidden'}>
+        <label class="ci-field"><span>Conversation ID header <em>(optional)</em></span><input type="text" class="apikey-input ci-affinity-header" placeholder="x-session-affinity" value="${escapeHtml(existingRouting.header)}"></label>
+        <label class="ci-field"><span>Conversation ID body field <em>(optional, top-level)</em></span><input type="text" class="apikey-input ci-affinity-body" placeholder="prompt_cache_key" value="${escapeHtml(existingRouting.bodyField)}"></label>
+      </div>
+      <div class="ci-affinity-note">Farnsworth sends the stable conversation ID using this endpoint contract. Prompt caching itself remains automatic when the provider supports it.</div>
       <div class="ci-form__actions">
         <button class="btn btn--primary btn--sm ci-save">${isEdit ? 'Save' : 'Add endpoint'}</button>
         <button class="btn btn--ghost btn--sm ci-cancel">Cancel</button>
@@ -8970,12 +9037,19 @@ function renderCustomEndpoints(wrap) {
       }
     });
 
+    const affinityMode = form.querySelector('.ci-affinity-mode');
+    const affinityCustom = form.querySelector('.ci-affinity-custom');
+    affinityMode.addEventListener('change', () => { affinityCustom.hidden = affinityMode.value !== 'custom'; });
+
     form.querySelector('.ci-cancel').addEventListener('click', () => { addBtn.disabled = false; draw(); });
     form.querySelector('.ci-save').addEventListener('click', async () => {
       const name = form.querySelector('.ci-name').value.trim();
       let url = form.querySelector('.ci-url').value.trim();
       const key = form.querySelector('.ci-key').value.trim();
       const modelRows = [...form.querySelectorAll('.ci-model-row')];
+      const routingMode = affinityMode.value;
+      const routingHeader = form.querySelector('.ci-affinity-header').value.trim();
+      const routingBodyField = form.querySelector('.ci-affinity-body').value.trim();
       if (!name) { form.querySelector('.ci-name').focus(); return; }
       if (!/^https?:\/\//i.test(url)) { form.querySelector('.ci-url').focus(); return; }
       url = url.replace(/\/+$/, '');
@@ -9004,11 +9078,36 @@ function renderCustomEndpoints(wrap) {
         models.push(model);
       }
 
+      if (routingMode === 'custom') {
+        const reservedHeaders = new Set(['authorization', 'content-type', 'accept']);
+        const reservedBodyFields = new Set(['model', 'messages', 'tools', 'stream', 'stream_options', 'max_completion_tokens', 'reasoning_effort']);
+        if (reservedHeaders.has(routingHeader.toLowerCase())) {
+          form.querySelector('.ci-affinity-header').focus(); return;
+        }
+        if (reservedBodyFields.has(routingBodyField)) {
+          form.querySelector('.ci-affinity-body').focus(); return;
+        }
+        if (routingHeader && !/^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/.test(routingHeader)) {
+          form.querySelector('.ci-affinity-header').focus(); return;
+        }
+        if (routingBodyField && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(routingBodyField)) {
+          form.querySelector('.ci-affinity-body').focus(); return;
+        }
+        if (!routingHeader && !routingBodyField) {
+          form.querySelector('.ci-affinity-header').focus(); return;
+        }
+      }
+      const sessionRouting = normalizeEndpointSessionRouting({
+        mode: routingMode,
+        header: routingHeader,
+        bodyField: routingBodyField,
+      });
+
       const id = isEdit ? existing.id : ('ep_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5));
       const keyRef = isEdit ? (existing.keyRef || ('custom-' + id)) : ('custom-' + id);
       if (key) { try { await window.farnsworth?.setApiKey(key, keyRef); } catch {} }
 
-      const record = { id, name, baseURL: url, keyRef, models };
+      const record = { id, name, baseURL: url, keyRef, models, sessionRouting };
       if (isEdit) {
         const idx = eps.indexOf(existing);
         if (idx >= 0) eps[idx] = record; else eps.push(record);
@@ -10106,6 +10205,7 @@ async function loadSettings() {
     const loaded = await window.farnsworth.getSettings();
     if (loaded) Object.assign(state.settings, loaded);
     reconcileHonestSettings(loaded);
+    const endpointSessionRoutingMigrated = reconcileEndpointSessionRouting();
     // Jul 14 ~09:20 ET: keep the chat input's model chip in sync with
     // whatever default the user picked. The HTML had "Opus 4.8" +
     // "High" hardcoded; this rewrites the named spans in place.
@@ -10151,7 +10251,7 @@ async function loadSettings() {
       if (!migrated) { mem[k].model = memDefaults[k].model; mem[k].tier = memDefaults[k].tier; }
     }
     state.settings.memory = mem;
-    if (!migrated && loaded) persistSettings();
+    if ((!migrated && loaded) || endpointSessionRoutingMigrated) persistSettings();
   } catch (e) {
     console.warn('Failed to load settings:', e);
   }
@@ -13754,6 +13854,9 @@ async function sendChatMessage(opts) {
           requestId: turn.requestId,
           messages: history,
           system: systemPrompt,
+          // Keep every request in this persisted conversation on the same
+          // provider routing key, including every tool-loop iteration.
+          sessionAffinity: state.chatActiveId || null,
           // Jul 19: route custom-inference models to their endpoint. null for
           // built-in Anthropic / OpenAI models (main.js falls back correctly).
           endpoint: resolveEndpointForModel(state.settings?.defaultModel),

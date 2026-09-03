@@ -4016,6 +4016,7 @@ pre:hover .code-copy { opacity: 1; }
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .ci-card__models { font-size: 11.5px; color: #6f7480; margin-top: 1px; }
+.ci-card__capabilities { font-size: 10.5px; color: #8c72c7; margin-top: 2px; }
 .ci-card__actions { display: flex; gap: 6px; flex: 0 0 auto; }
 
 .ci-form {
@@ -4049,6 +4050,10 @@ pre:hover .code-copy { opacity: 1; }
 }
 .ci-model-remove:hover { color: #ef8d9a; background: rgba(239, 93, 113, .1); }
 .ci-model-add { align-self: flex-start; }
+.ci-form select.apikey-input { width: 100%; }
+.ci-affinity-custom { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.ci-affinity-custom[hidden] { display: none; }
+.ci-affinity-note { font-size: 10.5px; line-height: 1.45; color: #747983; margin-top: -3px; }
 .ci-form__actions { display: flex; gap: 8px; margin-top: 4px; }
 .settings-page__title {
   font-size: 20px; font-weight: 800; color: var(--text-primary);
