@@ -8957,6 +8957,7 @@ function renderAISettings() {
 function providerLabel(provider) { return provider === 'openai' ? 'OpenAI' : 'Anthropic'; }
 function providerDisplayName(provider, apiId, rawDisplay) {
   if (provider === 'anthropic') return String(rawDisplay || apiId).replace(/^Claude\s+/i, '');
+  if (/^gpt-6-astra$/i.test(apiId)) return 'GPT-6 Astra';
   return String(apiId || rawDisplay || '').replace(/^gpt-/i, 'GPT-').replace(/^o([0-9])/i, 'o$1');
 }
 function providerModelDescription(row) {

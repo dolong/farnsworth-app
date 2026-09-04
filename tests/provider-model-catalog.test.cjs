@@ -15,12 +15,13 @@ test('provider catalog is account-specific and keeps secrets in main', () => {
   assert.doesNotMatch(app, /db\.getAuthToken|Authorization: `Bearer \${key}`|x-api-key.*accessToken/);
 });
 
-test('unknown OpenAI models stay visible but gated until this adapter is validated', () => {
+test('GPT-6 Astra stays visible but gated until the Responses API tool loop exists', () => {
+  assert.ok(main.includes('^gpt-6-astra'));
+  assert.ok(main.includes('Tool calling requires the OpenAI Responses API'));
   assert.ok(main.includes('Needs compatibility validation with the current Chat Completions agent adapter'));
   assert.ok(main.includes('function collapseOpenAIModelSnapshots(models)'));
+  assert.ok(app.includes('GPT-6 Astra'));
   assert.ok(app.includes('Needs adapter support'));
-  assert.doesNotMatch(main, /gpt-6-astra/i);
-  assert.doesNotMatch(app, /GPT-6 Astra/i);
 });
 
 test('enabled provider models drive app pickers and persist add-remove choices', () => {

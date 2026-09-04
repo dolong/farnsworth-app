@@ -7745,6 +7745,9 @@ function relevantOpenAIModelId(id) {
 
 function openAIModelCompatibility(id) {
   const value = String(id || '').toLowerCase();
+  if (/^gpt-6-astra(?:-|$)/.test(value)) {
+    return { compatible: false, reason: 'Tool calling requires the OpenAI Responses API' };
+  }
   if (/^(gpt-5\.6(?:-(sol|terra|luna))?|gpt-4o|chatgpt-4o|gpt-4\.1|o[134])(?:-|$)/.test(value)) {
     return { compatible: true, reason: null };
   }
