@@ -54,7 +54,7 @@ async function action_waitFor(webContents, vars, step) {
   while (Date.now() < deadline) {
     try {
       const result = await webContents.debugger.sendCommand('Runtime.evaluate', {
-        expression: `!!document.querySelector(${selectorLiteral(selector)})`,
+        expression: selectorPresentExpression(selector),
         returnByValue: true,
       })
       if (result.result?.value === true) return
@@ -73,7 +73,7 @@ async function action_waitForNotVisible(webContents, vars, step) {
   while (Date.now() < deadline) {
     try {
       const result = await webContents.debugger.sendCommand('Runtime.evaluate', {
-        expression: `!document.querySelector(${selectorLiteral(selector)})`,
+        expression: `!(${selectorPresentExpression(selector)})`,
         returnByValue: true,
       })
       if (result.result?.value === true) return
@@ -131,7 +131,9 @@ async function action_clickIfPresent(webContents, vars, step) {
 
 async function action_type(webContents, vars, step) {
   const selector = interpolate(step.selector, vars)
-  const value = step.value ?? ''
+  // `text` is the documented field and the field every historical script
+  // uses. Keep `value` as a compatibility alias for the original Node port.
+  const value = interpolate(step.text ?? step.value ?? '', vars)
 
   // Focus the element first
   await webContents.debugger.sendCommand('Runtime.evaluate', {
@@ -488,14 +490,57 @@ function selectorLiteral(selector) {
   return JSON.stringify(String(selector))
 }
 
-async function getElementBox(webContents, selector) {
-  const result = await webContents.debugger.sendCommand('Runtime.evaluate', {
-    expression: `(() => {
+function selectorPresentExpression(selector) {
+  if (String(selector).startsWith('text=')) {
+    const text = selectorLiteral(String(selector).slice(5))
+    return `!!(document.body && document.body.innerText && document.body.innerText.includes(${text}))`
+  }
+  return `!!document.querySelector(${selectorLiteral(selector)})`
+}
+
+function elementBoxExpression(selector) {
+  if (!String(selector).startsWith('text=')) {
+    return `(() => {
       const el = document.querySelector(${selectorLiteral(selector)});
       if (!el) return null;
       const r = el.getBoundingClientRect();
       return { x: r.x, y: r.y, width: r.width, height: r.height };
-    })()`,
+    })()`
+  }
+  const target = selectorLiteral(String(selector).slice(5))
+  return `(() => {
+    const target = ${target};
+    const all = Array.from(document.querySelectorAll(
+      'button, [role="button"], .lb2-qbtn, .da-btn, .bnav-item, .bnav-play, .draft-start-btn, .draft-card-anim, .lb2-mission-tab, .lb2-mission-cta, .lb2-ts-events, .lb2-ts-mute, .lb2-ts-bell, .paid-result-btn, g, text, rect'
+    ));
+    document.querySelectorAll('foreignObject').forEach((fo) => {
+      fo.querySelectorAll('button, [role="button"]').forEach((el) => all.push(el));
+    });
+    document.querySelectorAll('div, span').forEach((el) => {
+      if (!all.includes(el) && getComputedStyle(el).cursor === 'pointer') all.push(el);
+    });
+    const matches = all.filter((el) => {
+      if (el.offsetParent === null && el.tagName !== 'foreignObject') return false;
+      return (el.textContent || '').trim().includes(target);
+    });
+    if (!matches.length) return null;
+    matches.sort((a, b) => a.children.length - b.children.length);
+    const el = matches[0];
+    let clickable = el;
+    while (clickable && !['BUTTON', 'A', 'INPUT'].includes(clickable.tagName) && clickable.tagName !== 'g' && clickable.onclick == null) {
+      if (clickable.parentElement && clickable.parentElement.onclick) { clickable = clickable.parentElement; break; }
+      clickable = clickable.parentElement;
+      if (!clickable || clickable === document.body) break;
+    }
+    const targetEl = clickable && clickable.getBoundingClientRect ? clickable : el;
+    const r = targetEl.getBoundingClientRect();
+    return { x: r.x, y: r.y, width: r.width, height: r.height };
+  })()`
+}
+
+async function getElementBox(webContents, selector) {
+  const result = await webContents.debugger.sendCommand('Runtime.evaluate', {
+    expression: elementBoxExpression(selector),
     returnByValue: true,
   })
   return result.result?.value ?? null

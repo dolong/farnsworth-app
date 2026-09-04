@@ -4099,24 +4099,37 @@ function resolvePythonBin() {
   if (_pythonBinCache !== undefined) return _pythonBinCache;
   const os = require('os');
   const fs = require('fs'); // NOT the module-scope fs/promises -- see above.
+  const { execFileSync } = require('child_process');
   const isExec = (f) => {
     try { fs.accessSync(f, fs.constants.X_OK); return fs.statSync(f).isFile(); }
     catch { return false; }
   };
+  const hasWebsocket = (f) => {
+    try {
+      execFileSync(f, ['-c', 'import websocket'], { timeout: 15000, stdio: 'ignore' });
+      return true;
+    } catch { return false; }
+  };
+
+  // An explicit override is a contract. Return it when executable so the
+  // dependency probe below can explain exactly what is missing from THAT
+  // interpreter instead of silently substituting another Python.
+  const explicit = process.env.FARNSWORTH_PYTHON;
+  if (explicit && isExec(explicit)) {
+    _pythonBinCache = explicit;
+    return _pythonBinCache;
+  }
+
   const names = ['python3', 'python3.14', 'python3.13', 'python3.12', 'python3.11', 'python3.10'];
   const candidates = [];
-  // 1. Explicit escape hatch for exotic setups.
-  if (process.env.FARNSWORTH_PYTHON) candidates.push(process.env.FARNSWORTH_PYTHON);
-  // 2. The user's own login shell -- the one place that knows about pyenv,
-  //    conda, uv, asdf and friends. Preferred over /usr/bin/python3, which on
-  //    macOS is a Command Line Tools stub with no third-party packages.
+  // Discover every plausible interpreter first. Selection below is based on
+  // actual runner readiness, not PATH order: a newly installed Homebrew Python
+  // must not shadow an older interpreter that already has websocket-client.
   for (const d of getUserShellPathDirs()) for (const n of names) candidates.push(path.join(d, n));
   for (const d of discoverToolchainDirs()) for (const n of names) candidates.push(path.join(d, n));
-  // 3. Static fallbacks for the common installs.
   for (const d of ['/opt/homebrew/bin', '/usr/local/bin']) {
     for (const n of names) candidates.push(path.join(d, n));
   }
-  // 4. Version managers, newest first, in case the shell probe failed.
   const home = os.homedir();
   candidates.push(path.join(home, '.pyenv', 'shims', 'python3'));
   try {
@@ -4128,13 +4141,24 @@ function resolvePythonBin() {
   for (const d of ['miniconda3', 'anaconda3', '.local']) {
     candidates.push(path.join(home, d, 'bin', 'python3'));
   }
-  // 5. System python last: it exists on every Mac but is the least likely to
-  //    have websocket-client installed.
   candidates.push('/usr/bin/python3');
+
+  const seen = new Set();
+  let firstExecutable = null;
   for (const c of candidates) {
-    if (isExec(c)) { _pythonBinCache = c; return _pythonBinCache; }
+    if (!c || seen.has(c)) continue;
+    seen.add(c);
+    if (!isExec(c)) continue;
+    if (!firstExecutable) firstExecutable = c;
+    if (hasWebsocket(c)) {
+      _pythonBinCache = c;
+      return _pythonBinCache;
+    }
   }
-  _pythonBinCache = null;
+  // Preserve the useful existing error path when Python exists but none of
+  // the candidates has websocket-client. checkTestRunnerDeps() will name this
+  // interpreter and print an exact install command.
+  _pythonBinCache = firstExecutable;
   return _pythonBinCache;
 }
 
