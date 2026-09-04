@@ -7871,6 +7871,8 @@ body.density-compact .msg__body { font-size: 12.5px; }
 .provider-model-row__name { display: flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 650; color: var(--text-secondary); }
 .provider-model-row.is-enabled .provider-model-row__name { color: var(--text-primary); }
 .provider-model-row__name span { padding: 2px 5px; border-radius: 4px; background: rgba(59,165,92,.13); color: #69c783; font-size: 8px; font-weight: 800; letter-spacing: .06em; }
+.provider-model-row__name span.is-rollout { background: rgba(221,153,65,.14); color: #e5ad61; }
+.provider-model-row__name span.is-documented { background: rgba(93,113,214,.16); color: #9eaaf1; }
 .provider-model-row__meta { margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-muted); font-size: 10px; }
 .provider-model-row__meta code { color: #aeb3bd; font-size: 9.5px; }
 .provider-model-row__reason { margin-top: 4px; color: #d7a35d; font-size: 10px; }

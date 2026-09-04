@@ -8671,7 +8671,7 @@ function renderAISettings() {
       <div style="display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin-bottom:6px;">
         <div>
           <div style="display:flex;align-items:center;gap:8px;"><div class="settings-section__title">Model catalog</div><span class="settings-pill settings-pill--v23">LIVE</span></div>
-          <div class="settings-section__desc">Check the models available to your saved Anthropic and OpenAI credentials, then choose which compatible models appear throughout the app.</div>
+          <div class="settings-section__desc">Check account availability and official provider documentation, then choose which compatible models appear throughout the app.</div>
         </div>
         <button id="provider-model-refresh" class="btn btn--primary btn--sm" style="white-space:nowrap;">Check providers</button>
       </div>
@@ -8962,6 +8962,7 @@ function providerDisplayName(provider, apiId, rawDisplay) {
 }
 function providerModelDescription(row) {
   const parts = [providerLabel(row.provider)];
+  if (row.docsDescription) parts.push(row.docsDescription);
   if (row.maxInputTokens) parts.push(`${Math.round(row.maxInputTokens / 1000).toLocaleString()}k context`);
   if (row.createdAt) parts.push(`released ${String(row.createdAt).slice(0, 10)}`);
   return parts.join(' · ');
@@ -8998,7 +8999,12 @@ function mergeProviderCatalogResult(result) {
       maxInputTokens: incoming.maxInputTokens || null,
       maxOutputTokens: incoming.maxOutputTokens || null,
       createdAt: incoming.createdAt || null,
-      lastSeenAt: result.fetchedAt || new Date().toISOString(),
+      accountAvailable: incoming.accountAvailable !== false,
+      documented: !!incoming.documented,
+      latestDocumented: !!incoming.latestDocumented,
+      docsDescription: incoming.docsDescription || null,
+      source: incoming.source || null,
+      lastSeenAt: incoming.accountAvailable === false ? (existing?.lastSeenAt || null) : (result.fetchedAt || new Date().toISOString()),
     };
     next.desc = providerModelDescription(next);
     if (existing) Object.assign(existing, next);
@@ -9083,11 +9089,20 @@ function renderProviderModelCatalog(wrap) {
     for (const provider of ['anthropic', 'openai']) {
       const group = el('div', { class: 'provider-model-group' });
       const providerRows = rows.filter((row) => row.provider === provider);
-      group.innerHTML = `<div class="provider-model-group__head"><strong>${providerLabel(provider)}</strong><span>${errors[provider] ? escapeHtml(errors[provider]) : `${providerRows.filter((row) => row.enabled).length} enabled`}</span></div>`;
+      const providerError = errors[provider] || errors[`${provider}-account`] || errors[`${provider}-docs`];
+      group.innerHTML = `<div class="provider-model-group__head"><strong>${providerLabel(provider)}</strong><span>${providerError ? escapeHtml(providerError) : `${providerRows.filter((row) => row.enabled).length} enabled`}</span></div>`;
       for (const row of providerRows) {
         const item = el('div', { class: 'provider-model-row' + (row.enabled ? ' is-enabled' : '') + (row.compatible === false ? ' is-unsupported' : '') });
         const liveSeen = row.lastSeenAt && checked && row.lastSeenAt === checked;
-        item.innerHTML = `<div class="provider-model-row__body"><div class="provider-model-row__name">${escapeHtml(row.display || row.apiId)}${liveSeen ? '<span>AVAILABLE</span>' : ''}</div><div class="provider-model-row__meta"><code>${escapeHtml(row.apiId)}</code> · ${escapeHtml(row.desc || providerModelDescription(row))}</div>${row.compatible === false ? `<div class="provider-model-row__reason">${escapeHtml(row.reason || 'Needs adapter support')}</div>` : ''}</div><button class="provider-model-toggle ${row.enabled ? 'is-on' : ''}" ${row.compatible === false ? 'disabled' : ''} aria-label="${row.enabled ? 'Remove' : 'Add'} ${escapeHtml(row.display || row.apiId)}"><i></i></button>`;
+        const accountAvailable = row.provider === 'openai' ? row.accountAvailable === true : liveSeen;
+        const sourceBadge = accountAvailable
+          ? '<span>AVAILABLE</span>'
+          : row.latestDocumented
+            ? '<span class="is-rollout">ROLLING OUT</span>'
+            : row.documented
+              ? '<span class="is-documented">DOCUMENTED</span>'
+              : '';
+        item.innerHTML = `<div class="provider-model-row__body"><div class="provider-model-row__name">${escapeHtml(row.display || row.apiId)}${sourceBadge}</div><div class="provider-model-row__meta"><code>${escapeHtml(row.apiId)}</code> · ${escapeHtml(row.desc || providerModelDescription(row))}</div>${row.compatible === false ? `<div class="provider-model-row__reason">${escapeHtml(row.reason || 'Needs adapter support')}</div>` : ''}</div><button class="provider-model-toggle ${row.enabled ? 'is-on' : ''}" ${row.compatible === false ? 'disabled' : ''} aria-label="${row.enabled ? 'Remove' : 'Add'} ${escapeHtml(row.display || row.apiId)}"><i></i></button>`;
         item.querySelector('.provider-model-toggle')?.addEventListener('click', () => setProviderModelEnabled(row, !row.enabled));
         group.appendChild(item);
       }
@@ -9107,6 +9122,8 @@ function renderProviderModelCatalog(wrap) {
       if (result?.ok) {
         result.fetchedAt = checkedAt;
         mergeProviderCatalogResult(result);
+        if (result.accountError && !result.models?.some((model) => model.accountAvailable)) state.modelCatalog.errors[`${result.provider}-account`] = result.accountError;
+        if (result.docsError && !result.models?.some((model) => model.documented)) state.modelCatalog.errors[`${result.provider}-docs`] = result.docsError;
       } else state.modelCatalog.errors[result?.provider || 'unknown'] = result?.message || result?.error || 'Check failed';
     }
     state.settings.providerModelCatalogCheckedAt = checkedAt;

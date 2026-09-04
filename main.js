@@ -7767,6 +7767,55 @@ function validHeaderToken(token) {
   return typeof token === 'string' && token.length > 0 && /^[\x20-\x7e]+$/.test(token);
 }
 
+const OPENAI_DOCS_MODELS_URL = 'https://developers.openai.com/api/docs/models.md';
+const OPENAI_DOCS_LATEST_MODEL_URL = 'https://developers.openai.com/api/docs/guides/latest-model.md';
+
+function parseOpenAIDocumentedModels(catalogMarkdown, latestMarkdown) {
+  const found = new Map();
+  const featured = String(catalogMarkdown || '').match(/## Featured models([\s\S]*?)(?=\n## |$)/i)?.[1] || '';
+  const linkPattern = /- \[([^\]]+)\]\(\/api\/docs\/models\/([a-z0-9][a-z0-9._-]*)\.md\):\s*([^\n]+)/gi;
+  for (const match of featured.matchAll(linkPattern)) {
+    const apiId = String(match[2] || '').trim();
+    if (!relevantOpenAIModelId(apiId)) continue;
+    found.set(apiId, {
+      apiId,
+      display: String(match[1] || apiId).trim(),
+      docsDescription: String(match[3] || '').trim(),
+      documented: true,
+      latestDocumented: false,
+    });
+  }
+  const latestId = String(latestMarkdown || '').match(/latestModelInfo:\s*[\r\n]+\s*model:\s*([^\s]+)/i)?.[1]?.trim();
+  if (latestId && relevantOpenAIModelId(latestId)) {
+    const existing = found.get(latestId) || { apiId: latestId, display: latestId, docsDescription: '' };
+    found.set(latestId, { ...existing, documented: true, latestDocumented: true });
+  }
+  return [...found.values()];
+}
+
+async function listDocumentedOpenAIModels() {
+  const settled = await Promise.allSettled([
+    fetch(OPENAI_DOCS_MODELS_URL),
+    fetch(OPENAI_DOCS_LATEST_MODEL_URL),
+  ]);
+  const texts = [];
+  const errors = [];
+  for (const result of settled) {
+    if (result.status !== 'fulfilled') {
+      errors.push(String(result.reason?.message || result.reason || 'Documentation request failed'));
+      texts.push('');
+      continue;
+    }
+    if (!result.value.ok) {
+      errors.push(`OpenAI documentation returned ${result.value.status}`);
+      texts.push('');
+      continue;
+    }
+    texts.push(await result.value.text());
+  }
+  return { models: parseOpenAIDocumentedModels(texts[0], texts[1]), error: errors.join('; ') || null };
+}
+
 async function listAvailableProviderModels(provider) {
   if (provider === 'anthropic') {
     const manual = db.getAuthToken('anthropic-console');
@@ -7804,29 +7853,77 @@ async function listAvailableProviderModels(provider) {
   }
   if (provider === 'openai') {
     const key = getOpenAIKey();
-    if (!key) return { ok: false, provider, error: 'no_auth', message: 'Add an OpenAI API key first.' };
-    if (!validHeaderToken(key)) return { ok: false, provider, error: 'invalid_auth', message: 'The stored OpenAI credential could not be read. Save the API key again, then check again.' };
-    const res = await fetch('https://api.openai.com/v1/models', { headers: { Authorization: `Bearer ${key}` } });
-    if (!res.ok) {
-      const text = await res.text();
-      return { ok: false, provider, status: res.status, error: 'api_error', message: text.slice(0, 500) };
+    if (key && !validHeaderToken(key)) return { ok: false, provider, error: 'invalid_auth', message: 'The stored OpenAI credential could not be read. Save the API key again, then check again.' };
+
+    const docsPromise = listDocumentedOpenAIModels();
+    let accountModels = [];
+    let accountError = key ? null : 'Add an OpenAI API key to verify account access.';
+    if (key) {
+      try {
+        const res = await fetch('https://api.openai.com/v1/models', { headers: { Authorization: `Bearer ${key}` } });
+        if (res.ok) {
+          const body = await res.json();
+          accountModels = collapseOpenAIModelSnapshots(body.data || []).filter((m) => relevantOpenAIModelId(m.id));
+        } else {
+          const text = await res.text();
+          accountError = text.slice(0, 500) || `OpenAI API returned ${res.status}`;
+        }
+      } catch (err) {
+        accountError = String(err?.message || err);
+      }
     }
-    const body = await res.json();
-    const models = collapseOpenAIModelSnapshots(body.data || []).filter((m) => relevantOpenAIModelId(m.id)).map((m) => {
-      const support = openAIModelCompatibility(m.id);
-      return {
-        apiId: m.id,
-        display: m.id,
-        createdAt: Number.isFinite(m.created) ? new Date(m.created * 1000).toISOString() : null,
+
+    const docs = await docsPromise;
+    if (!accountModels.length && !docs.models.length) {
+      return { ok: false, provider, error: key ? 'catalog_failed' : 'no_auth', message: accountError || docs.error || 'OpenAI model discovery failed.' };
+    }
+
+    const documented = new Map(docs.models.map((model) => [model.apiId, model]));
+    const merged = new Map();
+    for (const model of accountModels) {
+      const doc = documented.get(model.id);
+      const support = openAIModelCompatibility(model.id);
+      merged.set(model.id, {
+        apiId: model.id,
+        display: doc?.display || model.id,
+        docsDescription: doc?.docsDescription || null,
+        createdAt: Number.isFinite(model.created) ? new Date(model.created * 1000).toISOString() : null,
         maxInputTokens: null,
         maxOutputTokens: null,
         effort: null,
         compatible: support.compatible,
         reason: support.reason,
-      };
-    });
-    models.sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')) || a.apiId.localeCompare(b.apiId));
-    return { ok: true, provider, fetchedAt: new Date().toISOString(), models };
+        accountAvailable: true,
+        documented: !!doc,
+        latestDocumented: !!doc?.latestDocumented,
+        source: doc ? 'account+docs' : 'account',
+      });
+    }
+    for (const doc of docs.models) {
+      if (merged.has(doc.apiId)) continue;
+      const support = openAIModelCompatibility(doc.apiId);
+      merged.set(doc.apiId, {
+        apiId: doc.apiId,
+        display: doc.display || doc.apiId,
+        docsDescription: doc.docsDescription || null,
+        createdAt: null,
+        maxInputTokens: null,
+        maxOutputTokens: null,
+        effort: null,
+        compatible: support.compatible,
+        reason: support.reason,
+        accountAvailable: false,
+        documented: true,
+        latestDocumented: !!doc.latestDocumented,
+        source: 'docs',
+      });
+    }
+    const models = [...merged.values()];
+    models.sort((a, b) => Number(b.latestDocumented) - Number(a.latestDocumented)
+      || Number(b.accountAvailable) - Number(a.accountAvailable)
+      || String(b.createdAt || '').localeCompare(String(a.createdAt || ''))
+      || a.apiId.localeCompare(b.apiId));
+    return { ok: true, provider, fetchedAt: new Date().toISOString(), models, accountError, docsError: docs.error };
   }
   return { ok: false, provider, error: 'bad_provider', message: 'Provider must be anthropic or openai.' };
 }
