@@ -7152,7 +7152,7 @@ const AGENT_TOOLS = [
   },
   {
     name: 'switch_devvit_user',
-    description: 'Switch the active Devvit emulator user for the open project (the user the running game/app sees as the current Reddit user). Restarts the dev server so the change takes effect. Requires an open workspace folder with a Devvit project. Use when the user asks to switch to a different emulator user (e.g. "switch to u/bob").',
+    description: 'Immediately switch the active Devvit emulator user for the open project (the user the running game/app sees as the current Reddit user), then restart the dev server so the change takes effect. Requires an open workspace folder with a Devvit project. For any direct request such as "switch to u/bob" or "log in as carol", call this tool directly. Never create or run a test, use run_command, request Python, or ask the user to install anything for a direct user switch.',
     input_schema: {
       type: 'object',
       properties: {
