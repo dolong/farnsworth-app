@@ -576,12 +576,19 @@ function createConversation(id, workspacePath, title, messages) {
 }
 
 function saveConversation(id, title, messages) {
-  db.prepare(`
+  const normalizedMessages = messages || [];
+  const serialized = JSON.stringify(normalizedMessages);
+  const ftsRows = memoryConversationFtsRows(title, normalizedMessages);
+  const ftsChanged = !memoryConversationFtsMatches(id, ftsRows);
+  const result = db.prepare(`
     UPDATE chat_conversations
     SET title = ?, messages = ?, updated_at = CURRENT_TIMESTAMP
-    WHERE id = ?
-  `).run(title, JSON.stringify(messages || []), id);
-  memoryRebuildConversationFts(id, title, messages || []);
+    WHERE id = ? AND (title IS NOT ? OR messages IS NOT ?)
+  `).run(title, serialized, id, title, serialized);
+  // Screenshot payloads and tool outputs are not searchable. Avoid deleting and
+  // rebuilding the conversation FTS rows when only those heavy fields changed.
+  if (ftsChanged) memoryRebuildConversationFts(id, title, normalizedMessages, ftsRows);
+  return { changed: result.changes > 0, ftsChanged };
 }
 
 function deleteConversation(id) {
@@ -1495,19 +1502,41 @@ function memoryMessageText(m) {
   return '';
 }
 
+function memoryConversationFtsRows(title, messages) {
+  const normalizedTitle = title || 'Untitled';
+  const rows = [];
+  const msgs = (Array.isArray(messages) ? messages : []).slice(-200);
+  for (const m of msgs) {
+    const text = memoryMessageText(m).trim();
+    if (!text) continue;
+    rows.push({ title: normalizedTitle, content: `${m.role || 'user'}: ${text}`.slice(0, 2000) });
+  }
+  return rows;
+}
+
+function memoryConversationFtsMatches(convId, rows) {
+  if (!db || !convId) return false;
+  try {
+    const existing = db.prepare(`
+      SELECT title, content FROM memory_conversations_fts
+      WHERE conv_id = ? ORDER BY rowid
+    `).all(convId);
+    return existing.length === rows.length && existing.every((row, i) =>
+      row.title === rows[i].title && row.content === rows[i].content);
+  } catch {
+    return false;
+  }
+}
+
 // Rebuild the FTS rows for one conversation (DELETE + INSERT — same derived-
 // index pattern as memory_sections). Last 200 messages, 2000 chars each.
-function memoryRebuildConversationFts(convId, title, messages) {
+function memoryRebuildConversationFts(convId, title, messages, preparedRows = null) {
   if (!db || !convId) return;
   try {
+    const rows = preparedRows || memoryConversationFtsRows(title, messages);
     db.prepare('DELETE FROM memory_conversations_fts WHERE conv_id = ?').run(convId);
-    const msgs = (Array.isArray(messages) ? messages : []).slice(-200);
     const ins = db.prepare('INSERT INTO memory_conversations_fts (conv_id, title, content) VALUES (?, ?, ?)');
-    for (const m of msgs) {
-      const text = memoryMessageText(m).trim();
-      if (!text) continue;
-      ins.run(convId, title || 'Untitled', `${m.role || 'user'}: ${text}`.slice(0, 2000));
-    }
+    for (const row of rows) ins.run(convId, row.title, row.content);
   } catch (e) {
     console.warn('[memory v3.1] conversation fts rebuild failed:', e.message);
   }

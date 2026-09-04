@@ -836,13 +836,21 @@ function renderChat(opts = {}) {
 // ============================================================================
 //
 // Each conversation is a row in `chat_conversations` (SQLite) keyed by id,
-// with the message list stored as a JSON blob. The renderer auto-saves on
-// every renderChat() (debounced 500ms), lists conversations in the dropdown
+// with the message list stored as a JSON blob. The renderer coalesces UI
+// updates and periodically saves active turns, then promptly saves completion;
+// the dropdown lists conversations and switches between them by loading JSON.
 // panel, and switches between them by loading the JSON. "New chat" creates
 // a fresh row and resets the message list to a single welcome message.
 
 const CHAT_HISTORY_PREVIEW_LIMIT = 80;
+// Persist an in-flight turn periodically, not after every brief tool pause.
+// Large conversations can carry megabytes of screenshot/tool payloads; rewriting
+// that blob every few hundred milliseconds caused multi-gigabyte WAL churn and
+// renderer allocation pressure. Finished/idle changes still save promptly.
+const CHAT_HISTORY_IDLE_SAVE_DELAY_MS = 750;
+const CHAT_HISTORY_ACTIVE_SAVE_INTERVAL_MS = 5 * 60 * 1000;
 let _chatHistorySaveTimer = null;
+let _chatHistoryLastSavedAt = 0;
 
 function buildConversationTitle(messages) {
   // First user message, trimmed. Falls back to "New chat" if no user text.
@@ -882,7 +890,15 @@ function buildConversationPreview(messages) {
 function scheduleChatHistorySave() {
   if (!state.chatActiveId) return; // no active conversation to save into
   if (_chatHistorySaveTimer) clearTimeout(_chatHistorySaveTimer);
-  _chatHistorySaveTimer = setTimeout(saveActiveConversation, 500);
+  const active = isChatTurnActive();
+  const elapsed = Date.now() - _chatHistoryLastSavedAt;
+  const delay = active
+    ? Math.max(CHAT_HISTORY_IDLE_SAVE_DELAY_MS, CHAT_HISTORY_ACTIVE_SAVE_INTERVAL_MS - elapsed)
+    : CHAT_HISTORY_IDLE_SAVE_DELAY_MS;
+  _chatHistorySaveTimer = setTimeout(() => {
+    _chatHistorySaveTimer = null;
+    saveActiveConversation();
+  }, delay);
 }
 
 async function saveActiveConversation() {
@@ -902,6 +918,7 @@ async function saveActiveConversation() {
       title,
       messages: state.chatMessages,
     });
+    _chatHistoryLastSavedAt = Date.now();
     // Refresh the dropdown list so titles/previews update in place.
     refreshChatHistoryList();
   } catch (e) {
@@ -1727,16 +1744,19 @@ function renderMessage(m) {
         // Screenshot thumbnail for take_canvas_screenshot chips (Jul 20).
         // When chip.screenshotBase64 is set, show the PNG inline in the expand block
         // so the user can see the captured canvas alongside the agent's analysis.
+        let screenshotImg = null;
         if (c.screenshotBase64) {
           expand.appendChild(el('span', { class: 'chip__expand-label' }, 'SCREENSHOT'));
-          const screenshotImg = el('img', {
+          // Keep the base64 in message state, but do not ask Chromium to decode
+          // every historical screenshot during each streaming re-render. The
+          // image source is attached only when this individual chip is opened.
+          screenshotImg = el('img', {
             class: 'chip__screenshot',
-            src: 'data:image/png;base64,' + c.screenshotBase64,
             alt: 'canvas screenshot',
           });
           expand.appendChild(screenshotImg);
         }
-                let showFullBtn = null;
+        let showFullBtn = null;
         if (isLong) {
           showFullBtn = el('button', { class: 'chip__show-full', type: 'button' }, 'Show full output');
           showFullBtn.addEventListener('click', (e) => {
@@ -1758,6 +1778,9 @@ function renderMessage(m) {
           if (e.target && e.target.classList && e.target.classList.contains('chip__show-full')) return;
           const open = expand.classList.toggle('chip__expand--open');
           chip.classList.toggle('chip--expanded', open);
+          if (open && screenshotImg && !screenshotImg.getAttribute('src')) {
+            screenshotImg.setAttribute('src', 'data:image/png;base64,' + c.screenshotBase64);
+          }
         });
 
         const wrap = el('div', { class: 'chip-wrap' });
@@ -1797,12 +1820,33 @@ function renderMessage(m) {
       pill.innerHTML = '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg><span>' + stepsLabel + '</span>';
       pill.title = 'Show tool calls';
       const wrap = el('div', { class: 'msg__chips-wrap' });
-      for (const c of chips) wrap.appendChild(renderChipNode(c));
+      const LIVE_CHIP_RENDER_LIMIT = 40;
+      let chipsBuilt = false;
+      let fullGroupBuilt = false;
+      const buildChips = (full = true) => {
+        if (fullGroupBuilt || (chipsBuilt && !full)) return;
+        wrap.innerHTML = '';
+        const visible = full || chips.length <= LIVE_CHIP_RENDER_LIMIT
+          ? chips
+          : chips.slice(-LIVE_CHIP_RENDER_LIMIT);
+        if (visible.length < chips.length) {
+          wrap.appendChild(el('div', { class: 'msg__steps-omitted' },
+            `${chips.length - visible.length} earlier steps hidden while running`));
+        }
+        for (const c of visible) wrap.appendChild(renderChipNode(c));
+        chipsBuilt = true;
+        fullGroupBuilt = full;
+      };
       if (isLive) {
+        // A live turn re-renders every ~40ms. Keep only its recent steps mounted;
+        // completed collapsed groups stay entirely lazy until the user opens them.
+        buildChips(false);
         wrap.classList.add('msg__chips-wrap--open');
         pill.classList.add('msg__steps-pill--open');
       }
       pill.addEventListener('click', () => {
+        const opening = !wrap.classList.contains('msg__chips-wrap--open');
+        if (opening) buildChips(true);
         const open = wrap.classList.toggle('msg__chips-wrap--open');
         pill.classList.toggle('msg__steps-pill--open', open);
       });
@@ -1869,9 +1913,16 @@ function renderMessage(m) {
         pill.title = 'Show tool calls';
 
         const wrap = el('div', { class: 'msg__chips-wrap' });
-        for (const c of infoChips) wrap.appendChild(renderChipNode(c));
+        let chipsBuilt = false;
+        const buildChips = () => {
+          if (chipsBuilt) return;
+          for (const c of infoChips) wrap.appendChild(renderChipNode(c));
+          chipsBuilt = true;
+        };
 
         pill.addEventListener('click', () => {
+          const opening = !wrap.classList.contains('msg__chips-wrap--open');
+          if (opening) buildChips();
           const open = wrap.classList.toggle('msg__chips-wrap--open');
           pill.classList.toggle('msg__steps-pill--open', open);
         });
@@ -14490,6 +14541,10 @@ async function sendChatMessage(opts) {
     // exit path (success, error, cancel, early return) or the composer stays
     // locked in Stop state and no further message can be sent.
     if (activeChatTurn === turn) activeChatTurn = null;
+    // The last streaming render may have armed the long in-flight interval.
+    // Re-schedule now that the slot is released so the completed turn is
+    // durably saved after the short idle delay instead of minutes later.
+    if (state.chatActiveId === turn.conversationId) scheduleChatHistorySave();
     // Message state is turn-private and must be cleaned independently of slot
     // ownership. stopChatTurn() releases the slot immediately, so gating this
     // on activeChatTurn identity would skip the exact interrupted path that can
