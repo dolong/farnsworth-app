@@ -7745,7 +7745,7 @@ function relevantOpenAIModelId(id) {
 
 function openAIModelCompatibility(id) {
   const value = String(id || '').toLowerCase();
-  if (/^(gpt-6-astra|gpt-5\.6(?:-(sol|terra|luna))?|gpt-4o|chatgpt-4o|gpt-4\.1|o[134])(?:-|$)/.test(value)) {
+  if (/^(gpt-5\.6(?:-(sol|terra|luna))?|gpt-4o|chatgpt-4o|gpt-4\.1|o[134])(?:-|$)/.test(value)) {
     return { compatible: true, reason: null };
   }
   return { compatible: false, reason: 'Needs compatibility validation with the current Chat Completions agent adapter' };
