@@ -4252,10 +4252,20 @@ const MODEL_DISPLAY_TO_API = {
   'Fable 5': 'claude-fable-5',
 };
 
+function configuredProviderModelApiId(displayName) {
+  const raw = db.getSetting('providerModels');
+  if (!raw) return null;
+  try {
+    const rows = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    const match = Array.isArray(rows) && rows.find((row) => row && (row.display === displayName || row.apiId === displayName));
+    return match?.apiId || null;
+  } catch { return null; }
+}
+
 function testingModelApiId() {
   const display = db.getSetting('testingModel');
   if (!display || typeof display !== 'string') return null;
-  return MODEL_DISPLAY_TO_API[display] || display;
+  return MODEL_DISPLAY_TO_API[display] || configuredProviderModelApiId(display) || display;
 }
 
 // Resolve a per-project tests dir from a `folder` arg. The folder must
@@ -4730,7 +4740,7 @@ async function memoryStageInference(stage, system, user, maxTokens = 512, meta =
   if (!conf.enabled) return null;
   const auth = await getValidAccessToken();
   if (!auth) { console.warn(`[memory tier3] ${stage}: no auth, skipping`); return null; }
-  const model = MODEL_DISPLAY_TO_API[conf.model] || conf.model || 'claude-haiku-4-5';
+  const model = MODEL_DISPLAY_TO_API[conf.model] || configuredProviderModelApiId(conf.model) || conf.model || 'claude-haiku-4-5';
   const headers = { 'Content-Type': 'application/json', 'anthropic-version': '2023-06-01' };
   if (auth.kind === 'oauth') {
     headers['Authorization'] = `Bearer ${auth.token}`;
@@ -6019,6 +6029,17 @@ ipcMain.handle('auth:hasApiKey', async (_event, provider) => {
 ipcMain.handle('auth:clearApiKey', async (_event, provider) => {
   db.deleteAuthToken(apiKeyProvider(provider));
   return { ok: true };
+});
+
+
+// Provider model catalogs. Fetch with the credentials already stored by the app,
+// then return only sanitized model metadata to the renderer.
+ipcMain.handle('models:listAvailable', async (_event, provider) => {
+  try {
+    return await listAvailableProviderModels(provider);
+  } catch (err) {
+    return { ok: false, provider, error: 'catalog_failed', message: String(err?.message || err) };
+  }
 });
 
 // Codex CLI login detection (~/.codex/auth.json). Read-only, same idea as
@@ -7713,6 +7734,98 @@ function getOpenAIKey() {
     }
   } catch {}
   return null;
+}
+
+
+function relevantOpenAIModelId(id) {
+  const value = String(id || '').toLowerCase();
+  if (!/^(gpt-|chatgpt-|o[0-9])/.test(value)) return false;
+  return !/(audio|realtime|transcribe|tts|image|embedding|moderation|whisper|dall-e|search-preview)/.test(value);
+}
+
+function openAIModelCompatibility(id) {
+  const value = String(id || '').toLowerCase();
+  if (/^(gpt-6-astra|gpt-5\.6(?:-(sol|terra|luna))?|gpt-4o|chatgpt-4o|gpt-4\.1|o[134])(?:-|$)/.test(value)) {
+    return { compatible: true, reason: null };
+  }
+  return { compatible: false, reason: 'Needs compatibility validation with the current Chat Completions agent adapter' };
+}
+
+function collapseOpenAIModelSnapshots(models) {
+  const ids = new Set(models.map((model) => String(model?.id || '')));
+  return models.filter((model) => {
+    const id = String(model?.id || '');
+    const alias = id.replace(/-\d{4}-\d{2}-\d{2}$/, '');
+    return alias === id || !ids.has(alias);
+  });
+}
+
+function validHeaderToken(token) {
+  return typeof token === 'string' && token.length > 0 && /^[\x20-\x7e]+$/.test(token);
+}
+
+async function listAvailableProviderModels(provider) {
+  if (provider === 'anthropic') {
+    const manual = db.getAuthToken('anthropic-console');
+    const auth = manual?.accessToken
+      ? { kind: 'api_key', token: manual.accessToken }
+      : await getValidAccessToken();
+    if (!auth) return { ok: false, provider, error: 'no_auth', message: 'Connect Anthropic or add an Anthropic API key first.' };
+    if (!validHeaderToken(auth.token)) return { ok: false, provider, error: 'invalid_auth', message: 'The stored Anthropic credential could not be read. Reconnect Anthropic, then check again.' };
+    const headers = { 'anthropic-version': '2023-06-01' };
+    if (auth.kind === 'oauth') {
+      headers.Authorization = `Bearer ${auth.token}`;
+      headers['anthropic-beta'] = 'oauth-2025-04-20,claude-code-20250219';
+    } else headers['x-api-key'] = auth.token;
+    const res = await fetch('https://api.anthropic.com/v1/models?limit=1000', { headers });
+    if (!res.ok) {
+      const text = await res.text();
+      return { ok: false, provider, status: res.status, error: 'api_error', message: text.slice(0, 500) };
+    }
+    const body = await res.json();
+    return {
+      ok: true,
+      provider,
+      fetchedAt: new Date().toISOString(),
+      models: (body.data || []).filter((m) => /^claude-/i.test(m.id || '')).map((m) => ({
+        apiId: m.id,
+        display: m.display_name || m.id,
+        createdAt: m.created_at || null,
+        maxInputTokens: Number.isFinite(m.max_input_tokens) ? m.max_input_tokens : null,
+        maxOutputTokens: Number.isFinite(m.max_tokens) ? m.max_tokens : null,
+        effort: m.capabilities?.effort?.supported ? 'high' : null,
+        compatible: true,
+        reason: null,
+      })),
+    };
+  }
+  if (provider === 'openai') {
+    const key = getOpenAIKey();
+    if (!key) return { ok: false, provider, error: 'no_auth', message: 'Add an OpenAI API key first.' };
+    if (!validHeaderToken(key)) return { ok: false, provider, error: 'invalid_auth', message: 'The stored OpenAI credential could not be read. Save the API key again, then check again.' };
+    const res = await fetch('https://api.openai.com/v1/models', { headers: { Authorization: `Bearer ${key}` } });
+    if (!res.ok) {
+      const text = await res.text();
+      return { ok: false, provider, status: res.status, error: 'api_error', message: text.slice(0, 500) };
+    }
+    const body = await res.json();
+    const models = collapseOpenAIModelSnapshots(body.data || []).filter((m) => relevantOpenAIModelId(m.id)).map((m) => {
+      const support = openAIModelCompatibility(m.id);
+      return {
+        apiId: m.id,
+        display: m.id,
+        createdAt: Number.isFinite(m.created) ? new Date(m.created * 1000).toISOString() : null,
+        maxInputTokens: null,
+        maxOutputTokens: null,
+        effort: null,
+        compatible: support.compatible,
+        reason: support.reason,
+      };
+    });
+    models.sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')) || a.apiId.localeCompare(b.apiId));
+    return { ok: true, provider, fetchedAt: new Date().toISOString(), models };
+  }
+  return { ok: false, provider, error: 'bad_provider', message: 'Provider must be anthropic or openai.' };
 }
 
 // Jul 19: custom-inference connection registry. The renderer registers

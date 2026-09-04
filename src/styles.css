@@ -7856,3 +7856,26 @@ body.density-compact .msg__body { font-size: 12.5px; }
 
 /* Prod canvas reclaims the full width now that the identities aside is gone. */
 .prod__browser-card { flex: 1 1 auto; min-width: 0; }
+
+
+/* Settings → AI → live provider model catalog */
+.provider-model-status { margin: 8px 0 10px; color: var(--text-muted); font-size: 11px; }
+.provider-model-list { display: flex; flex-direction: column; gap: 12px; }
+.provider-model-group { overflow: hidden; border: 1px solid var(--border-default); border-radius: 10px; background: #17181b; }
+.provider-model-group__head { display: flex; align-items: center; justify-content: space-between; padding: 9px 12px; border-bottom: 1px solid var(--border-subtle); }
+.provider-model-group__head strong { font-size: 12px; color: var(--text-primary); }
+.provider-model-group__head span { max-width: 70%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; color: var(--text-muted); }
+.provider-model-row { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-top: 1px solid rgba(255,255,255,.04); }
+.provider-model-group__head + .provider-model-row { border-top: 0; }
+.provider-model-row__body { min-width: 0; flex: 1; }
+.provider-model-row__name { display: flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 650; color: var(--text-secondary); }
+.provider-model-row.is-enabled .provider-model-row__name { color: var(--text-primary); }
+.provider-model-row__name span { padding: 2px 5px; border-radius: 4px; background: rgba(59,165,92,.13); color: #69c783; font-size: 8px; font-weight: 800; letter-spacing: .06em; }
+.provider-model-row__meta { margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-muted); font-size: 10px; }
+.provider-model-row__meta code { color: #aeb3bd; font-size: 9.5px; }
+.provider-model-row__reason { margin-top: 4px; color: #d7a35d; font-size: 10px; }
+.provider-model-toggle { position: relative; flex: 0 0 auto; width: 34px; height: 20px; padding: 0; border: 0; border-radius: 999px; background: #34363d; cursor: pointer; }
+.provider-model-toggle i { position: absolute; top: 3px; left: 3px; width: 14px; height: 14px; border-radius: 50%; background: #b5bac1; transition: transform 120ms ease, background 120ms ease; }
+.provider-model-toggle.is-on { background: var(--accent-blurple); }
+.provider-model-toggle.is-on i { transform: translateX(14px); background: #fff; }
+.provider-model-toggle:disabled { cursor: not-allowed; opacity: .38; }

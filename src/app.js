@@ -45,6 +45,7 @@ const state = {
   rightTab: 'files',          // files | tasks | live
   leftPanel: 'claudecode',    // chat | terminal | claudecode | codex
   settingsOpen: false,
+  modelCatalog: { loading: false, results: null, errors: {} },
   settingsPage: 'ai',         // ai | memory | canvas | workspace | appearance | account
   vm: { markup: false, comments: false, edit: false, tweaks: true },
   vmMarkupStrokes: [],        // [{ points: [{x,y}], color, width }] in 0-1 coords
@@ -157,6 +158,10 @@ const state = {
     // Models may include input/output pricing. sessionRouting maps the stable
     // conversation ID into a provider-specific header and/or body field.
     customEndpoints: [],
+    // Account-specific provider models discovered on demand. New models are
+    // opt-in; existing built-ins remain enabled until explicitly removed.
+    providerModels: [],
+    providerModelCatalogCheckedAt: null,
     // Honest rows only — see ROUTING_CALL_SITES above for the id → call
     // site mapping. behavior/verification/streaming were removed Jul 13
     // (persisted with zero consumers since day 1 — dead-controls audit).
@@ -264,6 +269,8 @@ const state = {
 // we don't need to pass it explicitly.
 function modelToApiId(displayName) {
   if (!displayName) return 'claude-opus-4-8'; // safe default if settings haven't loaded yet
+  const discovered = (state.settings?.providerModels || []).find((row) => row && (row.display === displayName || row.apiId === displayName));
+  if (discovered?.apiId) return discovered.apiId;
   const map = {
     'Opus 5': 'claude-opus-5',
     'Opus 5 High': 'claude-opus-5',
@@ -307,9 +314,31 @@ function customModelOptions() {
   }
   return out;
 }
-// Model list for the DEFAULT chat model picker: built-ins + custom endpoints.
+function providerModelRows() {
+  return Array.isArray(state.settings?.providerModels) ? state.settings.providerModels : [];
+}
+function providerModelKey(provider, apiId) { return `${provider}:${apiId}`; }
+function providerModelOverride(provider, apiId) {
+  return providerModelRows().find((row) => row && row.provider === provider && row.apiId === apiId) || null;
+}
+function getBuiltInModelOptions() {
+  const baseIds = new Set(CHAT_MODEL_OPTIONS.map((opt) => providerModelKey(opt.provider, opt.apiId)));
+  const base = CHAT_MODEL_OPTIONS.filter((opt) => providerModelOverride(opt.provider, opt.apiId)?.enabled !== false);
+  const extra = providerModelRows().filter((row) => row?.enabled && row.compatible !== false && !baseIds.has(providerModelKey(row.provider, row.apiId))).map((row) => ({
+    provider: row.provider,
+    apiId: row.apiId,
+    display: row.display || row.apiId,
+    effort: row.effort || null,
+    maxInputTokens: row.maxInputTokens || null,
+    maxOutputTokens: row.maxOutputTokens || null,
+    desc: row.desc || `${row.provider === 'openai' ? 'OpenAI' : 'Anthropic'} · ${row.apiId}`,
+    _discovered: true,
+  }));
+  return base.concat(extra);
+}
+// Model list for the DEFAULT chat model picker: enabled provider models + custom endpoints.
 function getAllModelOptions() {
-  return CHAT_MODEL_OPTIONS.concat(customModelOptions());
+  return getBuiltInModelOptions().concat(customModelOptions());
 }
 // Given a default-model display name, return the endpoint to route through
 // (or null for built-in Anthropic / hardcoded-OpenAI models). Passed as
@@ -390,18 +419,18 @@ function routedModelApiId(id) {
 // popover below. API ids come from modelToApiId() so the picker can stay in
 // display-name space.
 const CHAT_MODEL_OPTIONS = [
-  { display: 'Opus 5 High',   effort: 'high', desc: '1M context · newest flagship · adaptive thinking' },
-  { display: 'Opus 5',        effort: 'medium', desc: '1M context · newest flagship' },
-  { display: 'Opus 4.8 High', effort: 'high', desc: '1M context · most capable · adaptive thinking' },
-  { display: 'Opus 4.8',      effort: 'medium', desc: '1M context · most capable' },
-  { display: 'Sonnet 5',      effort: 'high', desc: '1M context · fast · new' },
-  { display: 'Sonnet 4.6',    effort: 'high', desc: '1M context · balanced' },
-  { display: 'Sonnet 4.5',    effort: 'high', desc: '200k context · balanced' },
-  { display: 'Haiku 4.5',     effort: null,   desc: '200k context · fastest' },
-  { display: 'Fable 5',       effort: 'high', desc: 'Vellum default (Jul 2 ~16:00 ET)' },
-  { display: 'GPT-5.6 Sol',   effort: null,   desc: 'OpenAI · 1.05M context · advanced reasoning' },
-  { display: 'GPT-5.6 Terra', effort: null,   desc: 'OpenAI · 1.05M context · balanced' },
-  { display: 'GPT-5.6 Luna',  effort: null,   desc: 'OpenAI · 1.05M context · fast + affordable' },
+  { provider: 'anthropic', apiId: 'claude-opus-5', display: 'Opus 5 High',   effort: 'high', desc: '1M context · newest flagship · adaptive thinking' },
+  { provider: 'anthropic', apiId: 'claude-opus-5', display: 'Opus 5',        effort: 'medium', desc: '1M context · newest flagship' },
+  { provider: 'anthropic', apiId: 'claude-opus-4-8', display: 'Opus 4.8 High', effort: 'high', desc: '1M context · most capable · adaptive thinking' },
+  { provider: 'anthropic', apiId: 'claude-opus-4-8', display: 'Opus 4.8',      effort: 'medium', desc: '1M context · most capable' },
+  { provider: 'anthropic', apiId: 'claude-sonnet-5', display: 'Sonnet 5',      effort: 'high', desc: '1M context · fast · new' },
+  { provider: 'anthropic', apiId: 'claude-sonnet-4-6', display: 'Sonnet 4.6',  effort: 'high', desc: '1M context · balanced' },
+  { provider: 'anthropic', apiId: 'claude-sonnet-4-5', display: 'Sonnet 4.5',  effort: 'high', desc: '200k context · balanced' },
+  { provider: 'anthropic', apiId: 'claude-haiku-4-5', display: 'Haiku 4.5',    effort: null, desc: '200k context · fastest' },
+  { provider: 'anthropic', apiId: 'claude-fable-5', display: 'Fable 5',        effort: 'high', desc: '1M context · research + coding' },
+  { provider: 'openai', apiId: 'gpt-5.6-sol', display: 'GPT-5.6 Sol',           effort: null, desc: 'OpenAI · 1.05M context · advanced reasoning' },
+  { provider: 'openai', apiId: 'gpt-5.6-terra', display: 'GPT-5.6 Terra',       effort: null, desc: 'OpenAI · 1.05M context · balanced' },
+  { provider: 'openai', apiId: 'gpt-5.6-luna', display: 'GPT-5.6 Luna',         effort: null, desc: 'OpenAI · 1.05M context · fast + affordable' },
 ];
 
 // Model picker popover — anchored under a dropdown button in Settings → AI.
@@ -429,7 +458,10 @@ function openModelPicker(anchorBtn, settingsKey = 'defaultModel', onPick = null,
   // Jul 19: the default chat-model picker also lists custom-inference models;
   // testing-model / per-call-site routing pickers stay on the built-in list.
   const _modelList = (settingsKey === 'defaultModel' && typeof onPick !== 'function')
-    ? getAllModelOptions() : CHAT_MODEL_OPTIONS;
+    ? getAllModelOptions()
+    : settingsKey === 'testingModel'
+      ? getBuiltInModelOptions().filter((item) => item.provider === 'anthropic')
+      : getBuiltInModelOptions();
   for (const opt of _modelList) {
     const isCurrent = (currentDisplay ?? state.settings?.[settingsKey]) === opt.display;
     const row = el('button', {
@@ -8277,8 +8309,8 @@ function renderLiveTickets(s) {
 // (router count, last-turn usage, memory stats) · settings.defaultModel.
 // ============================================================
 function modelContextWindow(display) {
-  const opt = CHAT_MODEL_OPTIONS.find(o => o.display === display);
-  return opt && /1M/i.test(opt.desc || '') ? 1000000 : 200000;
+  const opt = getAllModelOptions().find(o => o.display === display);
+  return opt?.maxInputTokens || (opt && /1M/i.test(opt.desc || '') ? 1000000 : 200000);
 }
 
 function updateStatusBar() {
@@ -8635,6 +8667,18 @@ function renderAISettings() {
       </div>
     </div>
 
+    <div class="settings-section" id="ai-provider-models">
+      <div style="display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin-bottom:6px;">
+        <div>
+          <div style="display:flex;align-items:center;gap:8px;"><div class="settings-section__title">Model catalog</div><span class="settings-pill settings-pill--v23">LIVE</span></div>
+          <div class="settings-section__desc">Check the models available to your saved Anthropic and OpenAI credentials, then choose which compatible models appear throughout the app.</div>
+        </div>
+        <button id="provider-model-refresh" class="btn btn--primary btn--sm" style="white-space:nowrap;">Check providers</button>
+      </div>
+      <div class="provider-model-status"></div>
+      <div class="provider-model-list"></div>
+    </div>
+
     <div class="settings-section">
       <div class="settings-section__title">Default model</div>
       <div class="settings-section__desc">Used for the main chat thread unless a call-site overrides it below.</div>
@@ -8902,10 +8946,175 @@ function renderAISettings() {
   // The chat always streams; safety prompts live in nono + Claude Code's
   // own trust dialog; verbosity is the model's job.
 
+  renderProviderModelCatalog(wrap);
+
   // Custom-inference endpoint registry UI (Jul 19).
   renderCustomEndpoints(wrap);
 
   return wrap;
+}
+
+function providerLabel(provider) { return provider === 'openai' ? 'OpenAI' : 'Anthropic'; }
+function providerDisplayName(provider, apiId, rawDisplay) {
+  if (provider === 'anthropic') return String(rawDisplay || apiId).replace(/^Claude\s+/i, '');
+  if (/^gpt-6-astra$/i.test(apiId)) return 'GPT-6 Astra';
+  return String(apiId || rawDisplay || '').replace(/^gpt-/i, 'GPT-').replace(/^o([0-9])/i, 'o$1');
+}
+function providerModelDescription(row) {
+  const parts = [providerLabel(row.provider)];
+  if (row.maxInputTokens) parts.push(`${Math.round(row.maxInputTokens / 1000).toLocaleString()}k context`);
+  if (row.createdAt) parts.push(`released ${String(row.createdAt).slice(0, 10)}`);
+  return parts.join(' · ');
+}
+function baseProviderModelMap() {
+  const map = new Map();
+  for (const opt of CHAT_MODEL_OPTIONS) {
+    const key = providerModelKey(opt.provider, opt.apiId);
+    const existing = map.get(key);
+    if (!existing || (/ High$/.test(existing.display) && !/ High$/.test(opt.display))) map.set(key, { ...opt });
+  }
+  return map;
+}
+function mergeProviderCatalogResult(result) {
+  if (!result?.ok) return;
+  const rows = providerModelRows();
+  const base = baseProviderModelMap();
+  for (const incoming of result.models || []) {
+    const incomingDisplay = providerDisplayName(result.provider, incoming.apiId, incoming.display);
+    const directKey = providerModelKey(result.provider, incoming.apiId);
+    const baseRow = base.get(directKey) || [...base.values()].find((row) => row.provider === result.provider && row.display === incomingDisplay);
+    const apiId = baseRow?.apiId || incoming.apiId;
+    const key = providerModelKey(result.provider, apiId);
+    const existing = rows.find((row) => providerModelKey(row.provider, row.apiId) === key);
+    const next = {
+      provider: result.provider,
+      apiId,
+      display: baseRow?.display || incomingDisplay,
+      catalogApiId: incoming.apiId,
+      enabled: existing ? existing.enabled !== false : !!baseRow,
+      compatible: incoming.compatible !== false,
+      reason: incoming.reason || null,
+      effort: incoming.effort || baseRow?.effort || null,
+      maxInputTokens: incoming.maxInputTokens || null,
+      maxOutputTokens: incoming.maxOutputTokens || null,
+      createdAt: incoming.createdAt || null,
+      lastSeenAt: result.fetchedAt || new Date().toISOString(),
+    };
+    next.desc = providerModelDescription(next);
+    if (existing) Object.assign(existing, next);
+    else rows.push(next);
+  }
+  state.settings.providerModels = rows;
+}
+function allProviderCatalogRows() {
+  const base = baseProviderModelMap();
+  const out = new Map();
+  for (const [key, opt] of base) {
+    const override = providerModelOverride(opt.provider, opt.apiId);
+    out.set(key, {
+      ...opt,
+      enabled: override?.enabled !== false,
+      compatible: override?.compatible !== false,
+      reason: override?.reason || null,
+      createdAt: override?.createdAt || null,
+      maxInputTokens: override?.maxInputTokens || (/1M/i.test(opt.desc || '') ? 1000000 : 200000),
+      lastSeenAt: override?.lastSeenAt || null,
+      desc: override?.desc || opt.desc,
+    });
+  }
+  for (const row of providerModelRows()) out.set(providerModelKey(row.provider, row.apiId), { ...out.get(providerModelKey(row.provider, row.apiId)), ...row });
+  return [...out.values()].sort((a, b) => a.provider.localeCompare(b.provider) || String(b.createdAt || '').localeCompare(String(a.createdAt || '')) || a.display.localeCompare(b.display));
+}
+function modelDisplaysForProviderId(provider, apiId) {
+  const displays = CHAT_MODEL_OPTIONS.filter((opt) => opt.provider === provider && opt.apiId === apiId).map((opt) => opt.display);
+  const row = providerModelOverride(provider, apiId);
+  if (row?.display) displays.push(row.display);
+  return [...new Set(displays)];
+}
+function repairDisabledModelReferences(provider, apiId) {
+  const disabled = new Set(modelDisplaysForProviderId(provider, apiId));
+  const fallback = getBuiltInModelOptions()[0]?.display;
+  if (!fallback) return;
+  if (disabled.has(state.settings.defaultModel)) state.settings.defaultModel = fallback;
+  if (disabled.has(state.settings.testingModel)) state.settings.testingModel = fallback;
+  for (const row of state.settings.perCallSiteRouting || []) if (disabled.has(row.model)) row.model = fallback;
+  const anthFallback = getBuiltInModelOptions().find((row) => row.provider === 'anthropic')?.display || fallback;
+  for (const stage of Object.values(state.settings.memory || {})) if (stage && typeof stage === 'object' && disabled.has(stage.model)) stage.model = anthFallback;
+  updateChatInputModelButton();
+}
+function setProviderModelEnabled(row, enabled) {
+  if (enabled && row.compatible === false) return;
+  const records = providerModelRows();
+  let stored = records.find((item) => item.provider === row.provider && item.apiId === row.apiId);
+  if (!stored) { stored = { ...row }; records.push(stored); }
+  if (!enabled) {
+    const remaining = getBuiltInModelOptions().filter((opt) => !(opt.provider === row.provider && opt.apiId === row.apiId));
+    if (!remaining.length) { showToast('At least one provider model must stay enabled'); return; }
+    if (row.provider === 'anthropic' && !remaining.some((opt) => opt.provider === 'anthropic')) {
+      showToast('At least one Anthropic model must stay enabled for testing and memory');
+      return;
+    }
+  }
+  stored.enabled = enabled;
+  state.settings.providerModels = records;
+  if (!enabled) repairDisabledModelReferences(row.provider, row.apiId);
+  persistSettings();
+  sendModelsListToCompanions();
+  renderSettings();
+}
+function renderProviderModelCatalog(wrap) {
+  const section = wrap.querySelector('#ai-provider-models');
+  if (!section) return;
+  const button = section.querySelector('#provider-model-refresh');
+  const status = section.querySelector('.provider-model-status');
+  const list = section.querySelector('.provider-model-list');
+  const draw = () => {
+    const rows = allProviderCatalogRows();
+    const checked = state.settings.providerModelCatalogCheckedAt;
+    const errors = state.modelCatalog.errors || {};
+    status.textContent = state.modelCatalog.loading
+      ? 'Checking Anthropic and OpenAI…'
+      : checked
+        ? `Last checked ${new Date(checked).toLocaleString()}${Object.keys(errors).length ? ' · Some providers could not be checked' : ''}`
+        : 'Click Check providers to compare this app with the live catalogs.';
+    button.disabled = !!state.modelCatalog.loading;
+    button.textContent = state.modelCatalog.loading ? 'Checking…' : 'Check providers';
+    list.innerHTML = '';
+    for (const provider of ['anthropic', 'openai']) {
+      const group = el('div', { class: 'provider-model-group' });
+      const providerRows = rows.filter((row) => row.provider === provider);
+      group.innerHTML = `<div class="provider-model-group__head"><strong>${providerLabel(provider)}</strong><span>${errors[provider] ? escapeHtml(errors[provider]) : `${providerRows.filter((row) => row.enabled).length} enabled`}</span></div>`;
+      for (const row of providerRows) {
+        const item = el('div', { class: 'provider-model-row' + (row.enabled ? ' is-enabled' : '') + (row.compatible === false ? ' is-unsupported' : '') });
+        const liveSeen = row.lastSeenAt && checked && row.lastSeenAt === checked;
+        item.innerHTML = `<div class="provider-model-row__body"><div class="provider-model-row__name">${escapeHtml(row.display || row.apiId)}${liveSeen ? '<span>AVAILABLE</span>' : ''}</div><div class="provider-model-row__meta"><code>${escapeHtml(row.apiId)}</code> · ${escapeHtml(row.desc || providerModelDescription(row))}</div>${row.compatible === false ? `<div class="provider-model-row__reason">${escapeHtml(row.reason || 'Needs adapter support')}</div>` : ''}</div><button class="provider-model-toggle ${row.enabled ? 'is-on' : ''}" ${row.compatible === false ? 'disabled' : ''} aria-label="${row.enabled ? 'Remove' : 'Add'} ${escapeHtml(row.display || row.apiId)}"><i></i></button>`;
+        item.querySelector('.provider-model-toggle')?.addEventListener('click', () => setProviderModelEnabled(row, !row.enabled));
+        group.appendChild(item);
+      }
+      list.appendChild(group);
+    }
+  };
+  button.addEventListener('click', async () => {
+    if (state.modelCatalog.loading) return;
+    state.modelCatalog.loading = true; state.modelCatalog.errors = {}; draw();
+    const api = window.farnsworth;
+    const settled = await Promise.all(['anthropic', 'openai'].map(async (provider) => {
+      try { return await api.listAvailableModels(provider); }
+      catch (error) { return { ok: false, provider, message: String(error?.message || error) }; }
+    }));
+    const checkedAt = new Date().toISOString();
+    for (const result of settled) {
+      if (result?.ok) {
+        result.fetchedAt = checkedAt;
+        mergeProviderCatalogResult(result);
+      } else state.modelCatalog.errors[result?.provider || 'unknown'] = result?.message || result?.error || 'Check failed';
+    }
+    state.settings.providerModelCatalogCheckedAt = checkedAt;
+    state.modelCatalog.loading = false;
+    persistSettings();
+    renderSettings();
+  });
+  draw();
 }
 
 // Render the custom-inference endpoint cards + wire the add/edit/delete flow.
@@ -8962,7 +9171,7 @@ function renderCustomEndpoints(wrap) {
         try { if (ep.keyRef && window.farnsworth?.clearApiKey) await window.farnsworth.clearApiKey(ep.keyRef); } catch {}
         // If the deleted endpoint owned the active default model, fall back.
         if (resolveEndpointForModel(state.settings.defaultModel) === null &&
-            !CHAT_MODEL_OPTIONS.some(o => o.display === state.settings.defaultModel)) {
+            !getBuiltInModelOptions().some(o => o.display === state.settings.defaultModel)) {
           state.settings.defaultModel = 'Opus 4.8 High';
           updateChatInputModelButton();
         }
@@ -9677,7 +9886,7 @@ function openStageModelPicker(anchorBtn, cfg) {
   pop.style.top = (r.bottom + 6) + 'px';
   pop.style.left = r.left + 'px';
 
-  for (const opt of CHAT_MODEL_OPTIONS) {
+  for (const opt of getBuiltInModelOptions().filter((item) => item.provider === 'anthropic')) {
     const isCurrent = cfg.model === opt.display;
     const row = el('button', {
       class: 'model-picker__row' + (isCurrent ? ' is-current' : ''),
@@ -10205,6 +10414,7 @@ async function loadSettings() {
     const loaded = await window.farnsworth.getSettings();
     if (loaded) Object.assign(state.settings, loaded);
     reconcileHonestSettings(loaded);
+    state.settings.providerModels = Array.isArray(state.settings.providerModels) ? state.settings.providerModels : [];
     const endpointSessionRoutingMigrated = reconcileEndpointSessionRouting();
     // Jul 14 ~09:20 ET: keep the chat input's model chip in sync with
     // whatever default the user picked. The HTML had "Opus 4.8" +

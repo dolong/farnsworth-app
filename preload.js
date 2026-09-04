@@ -181,6 +181,7 @@ contextBridge.exposeInMainWorld('farnsworth', {
   hasApiKey: (provider) => ipcRenderer.invoke('auth:hasApiKey', provider),
   clearApiKey: (provider) => ipcRenderer.invoke('auth:clearApiKey', provider),
   codexStatus: () => ipcRenderer.invoke('auth:codexStatus'),
+  listAvailableModels: (provider) => ipcRenderer.invoke('models:listAvailable', provider),
 
   // Auth — Claude.ai OAuth (PKCE) — loopback flow
   oauthStart: () => ipcRenderer.invoke('auth:oauthStart'),
