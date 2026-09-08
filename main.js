@@ -2629,15 +2629,16 @@ async function listTestRecordings(folder, limit = 25) {
   }
   const out = [];
   for (const entry of entries) {
-    if (!entry.isFile() || !/\.webm$/i.test(entry.name)) continue;
+    if (!entry.isFile() || !/\.(webm|mp4)$/i.test(entry.name)) continue;
     const filePath = path.join(dir, entry.name);
     let stat;
     try { stat = await fs.stat(filePath); } catch { continue; }
     out.push({
       name: entry.name,
       path: filePath,
-      // recordings are named <test>_<iso-stamp>.webm
-      test: entry.name.replace(/\.webm$/i, '').replace(/_\d{4}-\d{2}-\d{2}T[\d-]+$/, ''),
+      // recordings are named <test>_<iso-stamp>.mp4 (.webm when ffmpeg is absent)
+      test: entry.name.replace(/\.(webm|mp4)$/i, '').replace(/_\d{4}-\d{2}-\d{2}T[\d-]+$/, ''),
+      format: /\.mp4$/i.test(entry.name) ? 'mp4' : 'webm',
       size: stat.size,
       modified: stat.mtimeMs,
     });
@@ -2735,6 +2736,84 @@ async function startCanvasTestRecording({ testPath, title, view }) {
   return filePath;
 }
 
+// ─── WebM → MP4 transcode (Sep 8 2026) ──────────────────────────────────────
+// MediaRecorder in Electron 31 (Chromium 126) cannot mux H.264/MP4, so capture
+// stays VP9/WebM and we transcode once the file is closed. MP4 is what actually
+// plays everywhere: QuickTime, Slack, iMessage, Google Drive preview, Keynote.
+// ffmpeg is optional — without it the .webm is kept and reported as-is, so a
+// missing binary degrades the artifact rather than losing the recording.
+const RECORDING_FFMPEG_CANDIDATES = [
+  '/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg', '/opt/local/bin/ffmpeg', '/usr/bin/ffmpeg',
+];
+let _ffmpegBinCache;
+function resolveFfmpegBin() {
+  if (_ffmpegBinCache !== undefined) return _ffmpegBinCache;
+  const explicit = process.env.FARNSWORTH_FFMPEG;
+  const candidates = explicit ? [explicit, ...RECORDING_FFMPEG_CANDIDATES] : RECORDING_FFMPEG_CANDIDATES;
+  for (const bin of candidates) {
+    try { fsSync.accessSync(bin, fsSync.constants.X_OK); _ffmpegBinCache = bin; return bin; } catch {}
+  }
+  _ffmpegBinCache = null;
+  return null;
+}
+
+// 'webm' anywhere in FARNSWORTH_RECORD_FORMAT keeps the raw capture.
+function recordingMp4Enabled() {
+  return String(process.env.FARNSWORTH_RECORD_FORMAT || '').toLowerCase() !== 'webm';
+}
+
+// Resolves to the path that should be reported to the user. Never throws: on
+// any failure the original .webm path comes back untouched.
+function transcodeRecordingToMp4(webmPath) {
+  return new Promise((resolve) => {
+    if (!webmPath || !/\.webm$/i.test(webmPath) || !recordingMp4Enabled()) {
+      resolve({ path: webmPath, format: 'webm' }); return;
+    }
+    const bin = resolveFfmpegBin();
+    if (!bin) {
+      console.warn('[test-record] ffmpeg not found — keeping .webm');
+      resolve({ path: webmPath, format: 'webm', transcodeError: 'ffmpeg_not_found' }); return;
+    }
+    const mp4Path = webmPath.replace(/\.webm$/i, '.mp4');
+    // yuv420p + even dimensions: QuickTime refuses odd-sized H.264 and any
+    // non-4:2:0 pixel format. faststart moves the moov atom to the front so the
+    // file streams/scrubs immediately. The capture has no audio track.
+    const args = [
+      '-y', '-loglevel', 'error', '-i', webmPath,
+      '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+      '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
+      '-pix_fmt', 'yuv420p', '-movflags', '+faststart', '-an', mp4Path,
+    ];
+    let done = false;
+    const finish = (res) => { if (!done) { done = true; resolve(res); } };
+    let child;
+    try {
+      child = require('child_process').execFile(bin, args, { timeout: 300000 }, async (err) => {
+        if (err) {
+          console.warn('[test-record] ffmpeg failed:', err.message);
+          try { await fs.unlink(mp4Path); } catch {}
+          finish({ path: webmPath, format: 'webm', transcodeError: err.message });
+          return;
+        }
+        let bytes = 0;
+        try { bytes = (await fs.stat(mp4Path)).size; } catch {}
+        if (!bytes) {
+          try { await fs.unlink(mp4Path); } catch {}
+          finish({ path: webmPath, format: 'webm', transcodeError: 'empty_output' });
+          return;
+        }
+        // Only drop the source once a non-empty MP4 exists.
+        try { await fs.unlink(webmPath); } catch {}
+        finish({ path: mp4Path, format: 'mp4', bytes, transcoded: true });
+      });
+    } catch (e) {
+      finish({ path: webmPath, format: 'webm', transcodeError: e.message });
+      return;
+    }
+    child.on('error', (e) => finish({ path: webmPath, format: 'webm', transcodeError: e.message }));
+  });
+}
+
 async function stopCanvasTestRecording({ status, error, tailMs = 1200 } = {}) {
   const rec = canvasRecording;
   if (!rec) return null;
@@ -2750,7 +2829,15 @@ async function stopCanvasTestRecording({ status, error, tailMs = 1200 } = {}) {
   await new Promise((resolve) => rec.out.end(resolve));
   canvasRecording = null;
   canvasCaptureViewOverride = null;
-  return { path: rec.filePath, bytes: rec.bytes, durationMs: Date.now() - rec.startedAt };
+  const durationMs = Date.now() - rec.startedAt;
+  const conv = await transcodeRecordingToMp4(rec.filePath);
+  return {
+    path: conv.path,
+    bytes: conv.bytes || rec.bytes,
+    durationMs,
+    format: conv.format,
+    ...(conv.transcodeError ? { transcodeError: conv.transcodeError } : {}),
+  };
 }
 const _CANVAS_IFRAME_RECT_JS =
   '(function(){var f=document.querySelector("iframe[src*=localhost]")' +
@@ -7041,7 +7128,7 @@ const AGENT_TOOLS = [
   },
   {
     name: 'test_run',
-    description: 'Run a test against the canvas WebContentsView. Takes the test\'s ABSOLUTE file path (not a name) — get it from test_list or test_save results. Returns stdout/stderr (last 4000/2000 chars), exit code, a `failed` count parsed from the runner output, and — when the run was recorded — a `video` object with the .webm path, byte size and duration. Recording is on by default: report the video path back to the user when one comes back. The test runs against whatever frame Test View is currently set to - the resolution dropdown in the canvas header, default MOBILE 390x844 - and neither the test file nor this tool can change it. If a run fails on layout-specific selectors, consider that the user may need to pick a Desktop preset before re-running, and say so.',
+    description: 'Run a test against the canvas WebContentsView. Takes the test\'s ABSOLUTE file path (not a name) — get it from test_list or test_save results. Returns stdout/stderr (last 4000/2000 chars), exit code, a `failed` count parsed from the runner output, and — when the run was recorded — a `video` object with the video path (.mp4; .webm only if ffmpeg is unavailable), byte size and duration. Recording is on by default: report the video path back to the user when one comes back. The test runs against whatever frame Test View is currently set to - the resolution dropdown in the canvas header, default MOBILE 390x844 - and neither the test file nor this tool can change it. If a run fails on layout-specific selectors, consider that the user may need to pick a Desktop preset before re-running, and say so.',
     input_schema: {
       type: 'object',
       properties: {
@@ -7053,7 +7140,7 @@ const AGENT_TOOLS = [
   },
   {
     name: 'test_recordings_list',
-    description: 'List recorded test-run videos for the active workspace, newest first. Each entry has the .webm path, the test it came from, byte size, and modification time. Recordings live at <workspace>/.farnsworth/recordings/. Use this to answer "where is the recording" or to find the video from a previous run.',
+    description: 'List recorded test-run videos for the active workspace, newest first. Each entry has the video path (.mp4, or .webm for older/untranscoded runs), the test it came from, byte size, and modification time. Recordings live at <workspace>/.farnsworth/recordings/. Use this to answer "where is the recording" or to find the video from a previous run.',
     input_schema: {
       type: 'object',
       properties: {
@@ -7067,7 +7154,7 @@ const AGENT_TOOLS = [
     input_schema: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: 'Optional absolute path to a specific .webm recording to reveal. Omit to open the recordings folder itself.' }
+        path: { type: 'string', description: 'Optional absolute path to a specific recording (.mp4 or .webm) to reveal. Omit to open the recordings folder itself.' }
       }
     }
   },

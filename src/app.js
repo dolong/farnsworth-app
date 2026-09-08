@@ -1705,7 +1705,7 @@ function renderMessage(m) {
       } else if (c.action === 'git-commit-cancel') {
         chip.addEventListener('click', () => cancelPendingGitCommit(m));
       } else if (c.action === 'open-recording') {
-        // Recorded test run — open the .webm in the OS video player.
+        // Recorded test run — open the .mp4 (or legacy .webm) in the OS video player.
         chip.addEventListener('click', async () => {
           const res = await window.farnsworth?.testRecordingsOpen?.({ path: c.recordingPath });
           if (res && !res.ok) console.warn('[chat] could not open recording:', res.error);
@@ -14123,10 +14123,10 @@ async function sendChatMessage(opts) {
           '- test_save(name, json) — save a test JSON file (validates JSON first)',
           '- test_run(path, record?) — run a test (path is ABSOLUTE, not relative — get it from test_list or test_save). Runs are recorded to video by default; pass record:true/false to force it on or off for this run.',
           '- test_recordings_list(limit?) — list recorded run videos for this workspace (newest first) from .farnsworth/recordings/',
-          '- open_recordings_folder(path?) — reveal the recordings folder in Finder, or one specific .webm',
+          '- open_recordings_folder(path?) — reveal the recordings folder in Finder, or one specific recording',
           '- set_test_recording(enabled) — turn default test-run recording on or off (same toggle as the Record button in Test View)',
           '',
-          '**Recording test runs:** a recorded run returns a `video` object with the .webm path. The video has a burned-in overlay showing each step number, action, selector, elapsed time and pass/fail state, so it is a real artifact — ALWAYS give the user the full path when one comes back, and offer to reveal it with open_recordings_folder. Recording only works on the Node runner path: tests containing `switchUser` or `llm-step` run under Python and cannot be recorded, so say so plainly instead of claiming a video exists. Recording needs an active Test View / mobile / desktop game preview to capture.',
+          '**Recording test runs:** a recorded run returns a `video` object with the video path — an .mp4 (H.264, plays in QuickTime/Slack/Drive), or a .webm with a `transcodeError` when ffmpeg is unavailable on the machine. The video has a burned-in overlay showing each step number, action, selector, elapsed time and pass/fail state, so it is a real artifact — ALWAYS give the user the full path when one comes back, and offer to reveal it with open_recordings_folder. Recording only works on the Node runner path: tests containing `switchUser` or `llm-step` run under Python and cannot be recorded, so say so plainly instead of claiming a video exists. Recording needs an active Test View / mobile / desktop game preview to capture.',
           '',
           '- take_canvas_screenshot(filename?) — capture the active canvas preview as a PNG and return the image so you can SEE what the app looks like right now. Use before writing tests (to discover selectors), after code changes (to verify the result), or any time the user asks what the app currently looks like. Returns the image directly.',
           '',
