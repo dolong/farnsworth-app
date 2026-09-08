@@ -3843,6 +3843,14 @@ pre:hover .code-copy { opacity: 1; }
   margin-top: 14px; padding-top: 12px; border-top: 1px solid #26272b;
   font-size: 11px; color: var(--text-muted); line-height: 1.5;
 }
+/* Sep 8 2026: legacy conversations record only the final API round, so their
+   totals are a floor, not an estimate -- say so loudly instead of printing a
+   confident dollar figure that is ~50x too low. */
+.usage-modal__note--warn {
+  margin-top: 14px; padding: 10px 12px; border: 1px solid #6a4a12;
+  border-radius: 8px; background: #1f1806; color: #e8c98a;
+}
+.usage-modal__note--warn strong { color: #ffd479; display: block; margin-bottom: 3px; }
 .settings-overlay {
   position: fixed; inset: 0; z-index: 50;
   display: flex; align-items: center; justify-content: center;

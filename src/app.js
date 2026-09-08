@@ -8553,28 +8553,59 @@ const MODEL_PRICING_PER_MTOK = {
 // (see the usageChip literals around line 8704/11085) rather than
 // re-deriving from res.usage, since the chip IS the persisted record --
 // res.usage itself isn't saved to the conversation JSON.
+// Sep 8 2026 (ported from Citadel v0.2.47): a turn's usage figure must account
+// for EVERY API round the turn made -- one round per tool call, each re-billing
+// the whole prompt. This app's system prompt plus its ~29 tool definitions
+// alone bill far more than this floor on every single round, so an average
+// input-per-round below it is arithmetically impossible for a cumulative
+// total. It proves the figure is a legacy last-round-only number, recorded
+// before cumulative turnUsage accounting landed, which understates a heavy
+// tool turn by ~50x.
+const USAGE_MIN_TOKENS_PER_ROUND = 2000;
+// Only judge turns that actually looped; a one-round exchange has no
+// cumulative-vs-final distinction to get wrong.
+const USAGE_MIN_ROUNDS_TO_JUDGE = 4;
+
+function usageUnderReported(input, rounds) {
+  return rounds >= USAGE_MIN_ROUNDS_TO_JUDGE && input > 0 && (input / rounds) < USAGE_MIN_TOKENS_PER_ROUND;
+}
+
 function computeSessionUsage() {
-  const perModel = {}; // display name -> { input, output, turns }
-  let totalIn = 0, totalOut = 0, totalTurns = 0;
+  const perModel = {}; // display name -> { input, output, turns, cached, rounds }
+  let totalIn = 0, totalOut = 0, totalTurns = 0, totalCached = 0, totalRounds = 0;
   for (const m of (state.chatMessages || [])) {
     const chips = m.chips || [];
+    // Tool chips carry a `name`; the usage chip does not. Each tool call cost
+    // another API round-trip, so rounds = tool calls + the final answer round.
+    const rounds = chips.filter((c) => c && c.name).length + 1;
     for (const c of chips) {
       if (c.kind !== 'read') continue;
-      const match = /^([\d,]+)\s*→\s*([\d,]+)\s*tok$/.exec(c.label || '');
+      // Labels may carry a measured cache suffix -- "N→M tok (K cached)" --
+      // from providers that report cached prompt tokens. Bare labels still match.
+      const match = /^([\d,]+)\s*→\s*([\d,]+)\s*tok(?:\s*\(([\d,]+) cached\))?$/.exec(c.label || '');
       if (!match) continue;
       const inTok = parseInt(match[1].replace(/,/g, ''), 10) || 0;
       const outTok = parseInt(match[2].replace(/,/g, ''), 10) || 0;
+      const cachedTok = match[3] ? parseInt(match[3].replace(/,/g, ''), 10) || 0 : 0;
       const model = m.model || 'Unknown model';
-      if (!perModel[model]) perModel[model] = { input: 0, output: 0, turns: 0 };
+      if (!perModel[model]) perModel[model] = { input: 0, output: 0, turns: 0, cached: 0, rounds: 0 };
       perModel[model].input += inTok;
       perModel[model].output += outTok;
       perModel[model].turns += 1;
+      perModel[model].cached += cachedTok;
+      perModel[model].rounds += rounds;
       totalIn += inTok;
       totalOut += outTok;
       totalTurns += 1;
+      totalCached += cachedTok;
+      totalRounds += rounds;
     }
   }
-  return { perModel, totalIn, totalOut, totalTurns };
+  for (const row of Object.values(perModel)) row.underReported = usageUnderReported(row.input, row.rounds);
+  return {
+    perModel, totalIn, totalOut, totalTurns, totalCached, totalRounds,
+    underReported: usageUnderReported(totalIn, totalRounds),
+  };
 }
 
 function normalizeCustomModelPrice(value) {
@@ -8614,7 +8645,7 @@ function formatUSD(v) {
 function renderUsageModal() {
   const body = $('#usage-modal-body');
   if (!body) return;
-  const { perModel, totalIn, totalOut, totalTurns } = computeSessionUsage();
+  const { perModel, totalIn, totalOut, totalTurns, totalRounds, underReported } = computeSessionUsage();
   const models = Object.keys(perModel);
 
   if (!totalTurns) {
@@ -8626,18 +8657,21 @@ function renderUsageModal() {
   let anyPriced = false;
   const rows = models
     .map(model => {
-      const { input, output, turns } = perModel[model];
+      const { input, output, turns, rounds } = perModel[model];
       const cost = estimateCostUSD(model, input, output);
       if (cost != null) { totalCost += cost; anyPriced = true; }
-      return { model, input, output, turns, cost };
+      return { model, input, output, turns, rounds, cost, low: !!perModel[model].underReported };
     })
     .sort((a, b) => (b.input + b.output) - (a.input + a.output));
+
+  // Sep 8 2026: never print a bare number we can prove is only a floor.
+  const atLeast = (text) => (underReported ? `≥ ${text}` : text);
 
   const rowsHtml = rows.map(r => `
     <div class="usage-modal__row">
       <span class="usage-modal__row-model">${r.model}</span>
-      <span class="usage-modal__row-toks">${r.input.toLocaleString()}→${r.output.toLocaleString()} tok · ${r.turns} turn${r.turns === 1 ? '' : 's'}</span>
-      <span class="usage-modal__row-cost">${formatUSD(r.cost)}</span>
+      <span class="usage-modal__row-toks">${r.low ? '≥' : ''}${r.input.toLocaleString()}→${r.output.toLocaleString()} tok · ${r.rounds.toLocaleString()} round${r.rounds === 1 ? '' : 's'}</span>
+      <span class="usage-modal__row-cost">${r.cost != null && r.low ? '≥' : ''}${formatUSD(r.cost)}</span>
     </div>
   `).join('');
 
@@ -8645,22 +8679,27 @@ function renderUsageModal() {
     <div class="usage-modal__totals">
       <div class="usage-modal__stat">
         <div class="usage-modal__stat-label">Tokens</div>
-        <div class="usage-modal__stat-value">${(totalIn + totalOut).toLocaleString()}</div>
+        <div class="usage-modal__stat-value">${atLeast((totalIn + totalOut).toLocaleString())}</div>
       </div>
       <div class="usage-modal__stat">
-        <div class="usage-modal__stat-label">Turns</div>
-        <div class="usage-modal__stat-value">${totalTurns}</div>
+        <div class="usage-modal__stat-label">API rounds</div>
+        <div class="usage-modal__stat-value">${totalRounds.toLocaleString()}</div>
       </div>
       <div class="usage-modal__stat">
         <div class="usage-modal__stat-label">Est. cost</div>
-        <div class="usage-modal__stat-value usage-modal__stat-value--cost">${anyPriced ? formatUSD(totalCost) : '—'}</div>
+        <div class="usage-modal__stat-value usage-modal__stat-value--cost">${anyPriced ? atLeast(formatUSD(totalCost)) : '—'}</div>
       </div>
     </div>
     <div class="usage-modal__section-title">By model</div>
     ${rowsHtml}
+    ${underReported ? `
+    <div class="usage-modal__note usage-modal__note--warn">
+      <strong>Incomplete accounting — the real cost is higher.</strong>
+      This conversation ran ${totalRounds.toLocaleString()} API rounds across ${totalTurns} turn${totalTurns === 1 ? '' : 's'}, and every round re-bills the whole prompt. The figures above average only ${Math.round(totalIn / Math.max(1, totalRounds)).toLocaleString()} input tokens per round, which is less than this app's system prompt and tool definitions cost on a single round — so they record just the final round, not the total. Conversations from before per-round usage accounting shipped cannot be reconstructed: the intermediate rounds were never stored. Treat these numbers as a floor.
+    </div>` : `
     <div class="usage-modal__note">
-      ${totalIn.toLocaleString()} in / ${totalOut.toLocaleString()} out, this conversation only. Cost is a rough estimate from list per-token rates — it does not account for prompt-cache discounts, so it can run high. ${models.some(m => !modelPricingFor(m)) ? 'No pricing data for one or more models shown — their tokens count toward the total but not the cost. Configure custom model rates in Settings → AI → Custom inference.' : ''}
-    </div>
+      ${totalIn.toLocaleString()} in / ${totalOut.toLocaleString()} out over ${totalRounds.toLocaleString()} API round${totalRounds === 1 ? '' : 's'}, this conversation only. Cost is a rough estimate from list per-token rates — it does not account for prompt-cache discounts, so it can run high. ${models.some(m => !modelPricingFor(m)) ? 'No pricing data for one or more models shown — their tokens count toward the total but not the cost. Configure custom model rates in Settings → AI → Custom inference.' : ''}
+    </div>`}
   `;
 }
 
@@ -14003,6 +14042,31 @@ async function sendChatMessage(opts) {
   const turn = activeChatTurn;
   updateChatSendButton();
 
+  // Sep 8 2026: billed-usage accounting for the WHOLE turn, ported from
+  // Citadel v0.2.43. Every model round is billed separately, but the usage
+  // chip recorded only the FINAL round -- so a 100-round tool turn persisted
+  // one round's numbers and the Session modal reported a total ~50x too low,
+  // and a turn that died mid-loop persisted nothing at all. Accumulate every
+  // round here and persist the total on every exit path, success or failure.
+  // computeSessionUsage() parses these chips, so the Session modal now shows
+  // real billed totals; state.session.lastUsage keeps last-round semantics
+  // because the ctx gauge measures context size, not spend.
+  const turnUsage = { input: 0, output: 0, cached: 0, rounds: 0 };
+  const addRoundUsage = (u) => {
+    if (!u) return;
+    turnUsage.input += u.input_tokens || 0;
+    turnUsage.output += u.output_tokens || 0;
+    turnUsage.cached += u.cached_input_tokens || u.cache_read_input_tokens || 0;
+    turnUsage.rounds += 1;
+  };
+  // Cached suffix only when the provider actually reported cached prompt
+  // tokens; computeSessionUsage() accepts both the bare and suffixed forms.
+  const turnUsageChip = () => {
+    if (!turnUsage.rounds) return null;
+    const cached = turnUsage.cached ? ` (${turnUsage.cached} cached)` : '';
+    return { label: `${turnUsage.input}→${turnUsage.output} tok${cached}`, kind: 'read' };
+  };
+
   try {
     // Tool-use loop. Jul 22: raised 10 -> 50 for headroom on complex turns.
     // Jul 28 2026: removed as a practical limit — a fixed iteration count
@@ -14218,7 +14282,7 @@ async function sendChatMessage(opts) {
           working: false,
           text: msg,
           error: true,
-          chips: [...(agentMsg.chips || []), ...extraChips],
+          chips: [...(agentMsg.chips || []), ...extraChips, ...(turnUsageChip() ? [turnUsageChip()] : [])],
         });
         // Forward the error as a chat:done with error info so companion can
         // mark the in-progress bubble as failed and stop its spinner.
@@ -14249,7 +14313,7 @@ async function sendChatMessage(opts) {
           working: false,
           text: msg,
           error: true,
-          chips: [...(agentMsg.chips || []), ...extraChips],
+          chips: [...(agentMsg.chips || []), ...extraChips, ...(turnUsageChip() ? [turnUsageChip()] : [])],
         });
         // Forward the error as a chat:done with error info so companion can
         // mark the in-progress bubble as failed and stop its spinner.
@@ -14260,6 +14324,9 @@ async function sendChatMessage(opts) {
         });
         return;
       }
+
+      // Sep 8 2026: every model round is billed; count each one as it lands.
+      addRoundUsage(res.usage);
 
       // Append assistant message to history (full content blocks so Claude can see its own tool_use)
       // Strip the streaming handler's renderer-side accumulator fields (inputJson, caller) from
@@ -14280,7 +14347,9 @@ async function sendChatMessage(opts) {
         // Feed the status bar's ctx gauge: the chat thread is the context
         // that matters (commit/review/title one-shots stay out of it).
         if (res.usage) { state.session.lastUsage = res.usage; try { updateStatusBar(); } catch {} }
-        const usageChip = res.usage ? { label: `${res.usage.input_tokens}→${res.usage.output_tokens} tok`, kind: 'read' } : null;
+        // The final round is billed too, then the chip carries the whole turn.
+        addRoundUsage(res.usage);
+        const usageChip = turnUsageChip();
         // Jul 21 fix: if the whole turn produced NO tool calls, the model's
         // answer accumulated in preambleText (which renders small/faint/italic
         // as "thinking" text). Promote it to responseText so a plain Q&A answer
@@ -14520,7 +14589,9 @@ async function sendChatMessage(opts) {
     if (turn.cancelled) {
       // Leave whatever the agent already produced visible and append a quiet
       // marker, matching how Vellum / Claude Code show an interrupted turn.
-      updateAgentMsg({ working: false, workingLabel: '', stopped: true });
+      // A stopped turn still burned every round it completed -- record them.
+      const spentChip = turnUsageChip();
+      updateAgentMsg({ working: false, workingLabel: '', stopped: true, ...(spentChip ? { chips: [...(agentMsg.chips || []), spentChip] } : {}) });
       sendChatEventToCompanions('chat:done', {
         messageId: agentMsgId,
         finalText: agentMsg.text || '',
