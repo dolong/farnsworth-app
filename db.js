@@ -181,6 +181,7 @@ CREATE TABLE IF NOT EXISTS memory_essentials (
 -- of {heading, content} for granular retrieval.
 CREATE TABLE IF NOT EXISTS memory_concepts (
   slug TEXT PRIMARY KEY,
+  workspace_path TEXT,
   title TEXT NOT NULL,
   lead TEXT,
   body TEXT,
@@ -353,7 +354,7 @@ function init(userDataPath, electronSafeStorage) {
   // silently skipped fresh installs -- PRAGMA table_info on a table that
   // doesn't exist yet returns nothing, the `cols.length` guard treats that
   // as "nothing to migrate", and the column was never created.
-  for (const [table, col] of [['memory_buffer', 'workspace_path'], ['memory_archive', 'workspace_path']]) {
+  for (const [table, col] of [['memory_buffer', 'workspace_path'], ['memory_archive', 'workspace_path'], ['memory_concepts', 'workspace_path']]) {
     try {
       const cols = db.prepare(`PRAGMA table_info(${table})`).all().map(r => r.name);
       if (cols.length && !cols.includes(col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} TEXT`);
@@ -1007,12 +1008,19 @@ function memoryDeleteEssential(key) {
 }
 
 // ---- Concepts (long-form wiki-style articles) ----
-function memoryListConcepts(limit = 100) {
+// workspacePath scopes the corpus to one project plus the genuinely global
+// articles (workspace_path IS NULL: user facts, preferences, tool knowledge,
+// and every article created before provenance existed). Passing null returns
+// everything, which is the correct answer when no folder is open and the
+// pre-provenance behaviour for callers that browse the whole corpus.
+function memoryListConcepts(limit = 100, workspacePath = null) {
   if (!db) return [];
+  const scoped = workspacePath ? 'WHERE workspace_path IS NULL OR workspace_path = ?' : '';
+  const args = workspacePath ? [workspacePath, limit] : [limit];
   return db.prepare(`
-    SELECT slug, title, lead, tags, source, confidence, created_at, updated_at
-    FROM memory_concepts ORDER BY updated_at DESC LIMIT ?
-  `).all(limit).map(r => ({ ...r, tags: r.tags ? JSON.parse(r.tags) : [] }));
+    SELECT slug, workspace_path, title, lead, tags, source, confidence, created_at, updated_at
+    FROM memory_concepts ${scoped} ORDER BY updated_at DESC LIMIT ?
+  `).all(...args).map(r => ({ ...r, tags: r.tags ? JSON.parse(r.tags) : [] }));
 }
 
 function memoryGetConcept(slug) {
@@ -1026,13 +1034,18 @@ function memoryGetConcept(slug) {
   };
 }
 
-function memoryUpsertConcept({ slug, title, lead, body, sections, tags, source = 'manual', confidence = 1.0 }) {
+// workspacePath is the project the contributing facts came from, or null for a
+// global article. On conflict the FIRST owner wins (COALESCE), so appending a
+// project's fact into an existing article never re-attributes it and never
+// demotes a scoped article to global.
+function memoryUpsertConcept({ slug, title, lead, body, sections, tags, source = 'manual', confidence = 1.0, workspacePath = null }) {
   if (!db || !slug || !title) return { ok: false, error: 'missing_slug_or_title' };
   try {
     db.prepare(`
-      INSERT INTO memory_concepts (slug, title, lead, body, sections, tags, source, confidence, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+      INSERT INTO memory_concepts (slug, workspace_path, title, lead, body, sections, tags, source, confidence, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
       ON CONFLICT(slug) DO UPDATE SET
+        workspace_path = COALESCE(memory_concepts.workspace_path, excluded.workspace_path),
         title = excluded.title,
         lead = excluded.lead,
         body = excluded.body,
@@ -1042,7 +1055,7 @@ function memoryUpsertConcept({ slug, title, lead, body, sections, tags, source =
         confidence = excluded.confidence,
         updated_at = CURRENT_TIMESTAMP
     `).run(
-      slug, title, lead || null, body || null,
+      slug, workspacePath || null, title, lead || null, body || null,
       sections ? JSON.stringify(sections) : null,
       tags ? JSON.stringify(tags) : null,
       source, confidence
@@ -1195,13 +1208,16 @@ async function memoryRecall(query, limit = 8, workspacePath = null) {
       const like = `%${t}%`;
       for (let i = 0; i < 4; i++) args.push(like);
     }
+    // Same boundary as the router: this project's articles plus the global ones.
+    const conceptScope = workspacePath ? 'WHERE workspace_path IS NULL OR workspace_path = ?' : '';
     const conceptRows = db.prepare(`
-      SELECT slug, title, lead, tags, source, confidence, updated_at,
+      SELECT slug, workspace_path, title, lead, tags, source, confidence, updated_at,
              (${likeClauses}) AS hit_count
       FROM memory_concepts
+      ${conceptScope}
       ORDER BY hit_count DESC, updated_at DESC
       LIMIT ?
-    `).all(...args, limit);
+    `).all(...args, ...(workspacePath ? [workspacePath] : []), limit);
     likeConcepts = conceptRows.map(r => ({
       ...r,
       tags: r.tags ? JSON.parse(r.tags) : [],
@@ -1288,7 +1304,18 @@ async function memoryRecall(query, limit = 8, workspacePath = null) {
 
   // v3: section-grain hits (FTS5 bm25 over memory_sections). The 5th key
   // in the recall shape — callers iterating keys must include 'sections'.
-  const sectionHits = memorySectionsSearch(String(query), Math.max(limit, 8));
+  let sectionHits = memorySectionsSearch(String(query), Math.max(limit, 8));
+  // Sections are derived from concept bodies and carry no workspace of their
+  // own, so they inherit their article's boundary. Without this filter a
+  // section-grain hit is a back door into another project's article.
+  if (workspacePath && sectionHits.length) {
+    try {
+      const visible = new Set(db.prepare(
+        'SELECT slug FROM memory_concepts WHERE workspace_path IS NULL OR workspace_path = ?'
+      ).all(workspacePath).map(r => r.slug));
+      sectionHits = sectionHits.filter(h => visible.has(h.slug));
+    } catch (_) {}
+  }
 
   // v3.1: past-conversation hits (FTS5 bm25 over memory_conversations_fts).
   const conversationHits = memoryConversationsSearch(String(query), Math.min(limit, 6));

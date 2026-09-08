@@ -5188,7 +5188,14 @@ async function runConsolidationBatch(reason = 'manual') {
       };
     } // Tier-1: flip ordinary rows only
     const concepts = db.memoryListConcepts(100);
-    const articleIndex = concepts.map(c => `- ${c.slug} — ${c.title}${c.lead ? ': ' + String(c.lead).slice(0, 120) : ''}`).join('\n') || '(no articles yet)';
+    // Deliberately unscoped: one consolidation pass drains buffer rows from
+    // every project, so the model needs to see every article. Each line is
+    // annotated with the article's project instead, which is what lets the
+    // model honour "never merge facts from two different projects".
+    const articleIndex = concepts.map(c => {
+      const owner = c.workspace_path ? String(c.workspace_path).split('/').filter(Boolean).pop() : null;
+      return `- ${c.slug}${owner ? ` [project: ${owner}]` : ' [global]'} — ${c.title}${c.lead ? ': ' + String(c.lead).slice(0, 120) : ''}`;
+    }).join('\n') || '(no articles yet)';
     // Facts carry the project they came from so the model can attribute them
     // instead of blending two codebases into one article.
     const projectOf = (p) => (p ? String(p).split('/').filter(Boolean).pop() : null);
@@ -5217,6 +5224,17 @@ Every buffer id must appear in exactly one non-lane op. Return ONLY JSON:
     const parsed = memoryParseJson(text);
     // Truncated output is still partially usable — salvage the complete ops
     // rather than discarding the whole pass.
+    // Real provenance, not a naming convention: an op names the buffer ids it
+    // consumed, and every buffer row already carries the project it came from.
+    // One project behind all of them -> the article belongs to that project.
+    // Mixed or unattributed -> global, which is the safe direction.
+    const bufferWorkspaceById = new Map(buffer.map(b => [Number(b.id), b.workspace_path || null]));
+    const opWorkspace = (op) => {
+      const ids = Array.isArray(op?.ids) ? op.ids.map(Number) : [];
+      const owners = new Set(ids.map(id => bufferWorkspaceById.get(id) || null));
+      if (owners.size !== 1) return null;
+      return [...owners][0];
+    };
     const ops = (parsed && Array.isArray(parsed.ops)) ? parsed.ops : memorySalvageOps(text);
     if (!ops.length) {
       db.memoryStageStatsSetGlobal('lastConsolidationError', `bad_model_output (stop=${meta.stopReason || '?'}, textLen=${text.length})`);
@@ -5233,11 +5251,11 @@ Every buffer id must appear in exactly one non-lane op. Return ONLY JSON:
           else {
             // Model referenced an unknown slug — recover by creating a
             // minimal article rather than losing the fact.
-            db.memoryUpsertConcept({ slug: op.slug, title: op.slug.replace(/-/g, ' '), lead: null, body: `## ${op.section || 'notes'}\n\n${op.content}\n`, source: 'consolidation' });
+            db.memoryUpsertConcept({ slug: op.slug, title: op.slug.replace(/-/g, ' '), lead: null, body: `## ${op.section || 'notes'}\n\n${op.content}\n`, source: 'consolidation', workspacePath: opWorkspace(op) });
             applied.create++;
           }
         } else if (op.op === 'create' && op.slug && op.title) {
-          db.memoryUpsertConcept({ slug: op.slug, title: op.title, lead: op.lead || null, body: op.body || null, source: 'consolidation' });
+          db.memoryUpsertConcept({ slug: op.slug, title: op.title, lead: op.lead || null, body: op.body || null, source: 'consolidation', workspacePath: opWorkspace(op) });
           applied.create++;
         } else if (op.op === 'essential' && op.key && op.value) {
           db.memorySetEssential(op.key, op.value, 'consolidation', 0.9);
@@ -5528,7 +5546,12 @@ ipcMain.handle('memory:route', async (_event, opts = {}) => {
   }
 
   // Lanes are always injected, so they never compete for router budget.
-  const all = db.memoryListConcepts(150).filter(c => !db.MEMORY_LANE_SLUGS.includes(c.slug));
+  // Scoped to the open project plus the global articles. Before this, the
+  // router was handed every article in the database and picked across
+  // projects -- the Aug 24 leak, where a the-last-draft article surfaced
+  // while a different project was open.
+  const all = db.memoryListConcepts(150, currentFolderSetting() || null)
+    .filter(c => !db.MEMORY_LANE_SLUGS.includes(c.slug));
   if (!all.length) return { ok: true, essentials, lanes, concepts: [], routed: [] };
   const budget = Math.max(1, Math.min(Number(routerConf.bucketBudget) || 3, 6));
   const index = all.map(c => `- ${c.slug} — ${c.title}${c.lead ? ': ' + String(c.lead).slice(0, 140) : ''}`).join('\n');
