@@ -61,10 +61,18 @@ assert.match(appSource, /reservedHeaders = new Set/,
   'the endpoint editor must reject reserved request fields before saving');
 assert.match(appSource, /inputCostPerMTok/,
   'the existing custom model pricing editor must remain present');
-assert.equal((mainSource.match(/return applyEndpointSessionRouting\(b, ep, opts\.sessionAffinity\);/g) || []).length, 2,
-  'blocking and streaming bodies must apply endpoint session routing');
-assert.equal((mainSource.match(/headers: openAIRequestHeaders\(ep, key, opts\.sessionAffinity/g) || []).length, 2,
-  'blocking and streaming headers must apply endpoint session routing, including retries');
+// Sep 10 2026: was a count of 2 (blocking + streaming on chat completions),
+// which the Responses adapter turned into 4. Assert PER ADAPTER instead, so
+// adding a transport can never silently skip endpoint affinity again.
+for (const fn of ['openAISend', 'openAIStream', 'responsesSend', 'responsesStream']) {
+  const start = mainSource.indexOf(`async function ${fn}(`);
+  assert.notEqual(start, -1, `${fn} exists`);
+  const head = mainSource.slice(start, start + 4000);
+  assert.match(head, /return applyEndpointSessionRouting\(b, ep, opts\.sessionAffinity\);/,
+    `${fn} must apply endpoint session routing to its request body`);
+  assert.match(head, /headers: openAIRequestHeaders\(ep, key, opts\.sessionAffinity/,
+    `${fn} must apply endpoint session routing to its headers, including retries`);
+}
 assert.doesNotMatch(mainSource, /isFireworksEndpoint|applyFireworksPromptCache|prompt_cache_key/,
   'main-process requests must not contain provider-specific Fireworks routing code');
 

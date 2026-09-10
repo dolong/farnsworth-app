@@ -17,9 +17,14 @@ test('provider catalog is account-specific and keeps secrets in main', () => {
   assert.doesNotMatch(app, /db\.getAuthToken|Authorization: `Bearer \${key}`|x-api-key.*accessToken/);
 });
 
-test('GPT-6 Astra stays visible but gated until the Responses API tool loop exists', () => {
-  assert.ok(main.includes('^gpt-6-astra'));
-  assert.ok(main.includes('Tool calling requires the OpenAI Responses API'));
+test('GPT-6 Astra is enabled now that the Responses adapter exists', () => {
+  // Sep 10 2026: the v0.1.52 gate (02fb988) is retired -- responsesSend /
+  // responsesStream give Astra the native tool calling it was waiting on.
+  assert.ok(main.includes('Astra is no longer gated'));
+  assert.ok(!main.includes("reason: 'Tool calling requires the OpenAI Responses API'"));
+  assert.ok(main.includes('function isResponsesModel(model, ep)'));
+  assert.ok(app.includes("apiId: 'gpt-6-astra'"));
+  assert.ok(app.includes("'GPT-6 Astra': 'gpt-6-astra'"));
   assert.ok(main.includes('Needs compatibility validation with the current Chat Completions agent adapter'));
   assert.ok(main.includes('function collapseOpenAIModelSnapshots(models)'));
   assert.ok(main.includes('function parseOpenAIDocumentedModels(catalogMarkdown, latestMarkdown)'));

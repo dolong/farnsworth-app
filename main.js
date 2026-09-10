@@ -7879,8 +7879,11 @@ function relevantOpenAIModelId(id) {
 
 function openAIModelCompatibility(id) {
   const value = String(id || '').toLowerCase();
-  if (/^gpt-6-astra(?:-|$)/.test(value)) {
-    return { compatible: false, reason: 'Tool calling requires the OpenAI Responses API' };
+  // Sep 10 2026: Astra is no longer gated -- the Responses adapter
+  // (isResponsesModel / responsesSend / responsesStream) gives it native tool
+  // calling, which is the capability the old gate was waiting on.
+  if (/^gpt-6(?:[-.]|$)/.test(value)) {
+    return { compatible: true, reason: null };
   }
   if (/^(gpt-5\.6(?:-(sol|terra|luna))?|gpt-4o|chatgpt-4o|gpt-4\.1|o[134])(?:-|$)/.test(value)) {
     return { compatible: true, reason: null };
@@ -8280,6 +8283,416 @@ function toOpenAITools(tools) {
   }));
 }
 
+
+// ============================================================
+// OpenAI Responses provider (Sep 10 2026) -- GPT-6 Astra, plus any
+// endpoint that must speak /v1/responses instead of /v1/chat/completions.
+//
+// Why this exists: OpenAI reasoning models reject function tools on
+// /v1/chat/completions unless reasoning_effort is 'none', which throws the
+// reasoning away (see isReasoningModel above). GPT-6 Astra goes further --
+// its tool calling is only supported through /v1/responses at all, which is
+// exactly why openAIModelCompatibility used to gate it.
+//
+// This adapter speaks the Responses wire format and re-emits the SAME
+// Anthropic-shaped events as the other two paths, so the renderer, the
+// chat-agent tool loop, usage accounting, and every existing model
+// implementation need ZERO changes. It is routed BEFORE the chat-completions
+// branch because isOpenAIModel() also matches gpt-6-*; anything this adapter
+// does not claim falls through to the old path byte-for-byte.
+//
+// Wire differences handled here (the whole reason it is a separate adapter):
+//   messages[]                  -> input[]
+//   system message              -> instructions
+//   {type:function,function:{}} -> flat {type:function,name,parameters}
+//   role:tool + tool_call_id    -> {type:function_call_output, call_id}
+//   choices[].delta             -> typed response.* SSE events
+// ============================================================
+
+function isResponsesModel(model, ep) {
+  // An explicit per-endpoint opt-in wins, so a custom OpenAI-compatible
+  // endpoint that only exposes /v1/responses can be registered without a
+  // code change.
+  if (ep && String(ep.api || '').toLowerCase() === 'responses') return true;
+  if (typeof model !== 'string') return false;
+  return /^(?:openai\/)?gpt-6(?:[-.]|$)/i.test(model);
+}
+
+// Reasoning effort for the Responses path. Unlike chat completions, tools and
+// real reasoning coexist here, so we deliberately do NOT force 'none' -- that
+// workaround exists only because /v1/chat/completions cannot do both.
+function responsesReasoning(opts) {
+  const eff = typeof opts?.reasoningEffort === 'string' ? opts.reasoningEffort.toLowerCase() : 'medium';
+  if (eff === 'none') return null;
+  if (!/^(low|medium|high)$/.test(eff)) return { effort: 'medium' };
+  return { effort: eff };
+}
+
+// Anthropic-shaped messages / content blocks -> Responses input items.
+//
+// `allowImages` carries the same load-bearing contract as the chat-completions
+// path: when false the image is replaced by an explicit note telling the model
+// it is blind, never dropped in silence.
+function toResponsesInput(messages, allowImages = true) {
+  const out = [];
+  const imgUrl = (source) => {
+    const mt = source.media_type || 'image/png';
+    return source.type === 'url' ? source.url : `data:${mt};base64,${source.data || ''}`;
+  };
+  for (const m of messages) {
+    const role = m.role;
+    const content = m.content;
+    if (typeof content === 'string') {
+      out.push({ role, content: [{ type: role === 'assistant' ? 'output_text' : 'input_text', text: content }] });
+      continue;
+    }
+    if (!Array.isArray(content)) continue;
+    if (role === 'user') {
+      const parts = [];
+      const toolItems = [];
+      for (const b of content) {
+        if (b.type === 'text') {
+          parts.push({ type: 'input_text', text: b.text || '' });
+        } else if (b.type === 'image' && b.source) {
+          parts.push({ type: 'input_image', image_url: imgUrl(b.source) });
+        } else if (b.type === 'tool_result') {
+          const c = b.content;
+          const txt = typeof c === 'string' ? c
+            : Array.isArray(c) ? c.filter(x => x && x.type === 'text').map(x => x.text).join('\n')
+            : JSON.stringify(c);
+          const imgs = Array.isArray(c) ? c.filter(x => x && x.type === 'image' && x.source) : [];
+          if (imgs.length && allowImages) {
+            // function_call_output.output is a string, so tool-returned pixels
+            // ride in a follow-up user message -- same shape the OpenAI path
+            // uses for take_canvas_screenshot.
+            toolItems.push({
+              type: 'function_call_output',
+              call_id: b.tool_use_id,
+              output: (txt ? txt + '\n' : '') + `[${imgs.length} image${imgs.length === 1 ? '' : 's'} attached in the following message]`,
+            });
+            toolItems.push({ role: 'user', content: imgs.map(im => ({ type: 'input_image', image_url: imgUrl(im.source) })) });
+          } else if (imgs.length) {
+            toolItems.push({
+              type: 'function_call_output',
+              call_id: b.tool_use_id,
+              output: (txt ? txt + '\n' : '')
+                + '[The image was captured and saved, but THIS MODEL CANNOT RECEIVE IMAGES, so you cannot see it. '
+                + 'Do not describe, guess at, or reason about the page contents from this screenshot. '
+                + 'Use text-based signals instead, or tell the user you cannot see the screen and ask them what is displayed.]',
+            });
+          } else {
+            toolItems.push({ type: 'function_call_output', call_id: b.tool_use_id, output: txt || '' });
+          }
+        }
+      }
+      // Tool outputs must precede the user's new text, same as the OpenAI path.
+      for (const t of toolItems) out.push(t);
+      if (parts.length) out.push({ role: 'user', content: parts });
+    } else if (role === 'assistant') {
+      let text = '';
+      const calls = [];
+      for (const b of content) {
+        if (b.type === 'text') text += b.text || '';
+        else if (b.type === 'tool_use') calls.push({
+          type: 'function_call', call_id: b.id, name: b.name,
+          arguments: JSON.stringify(b.input || {}),
+        });
+        // thinking / reasoning blocks are dropped -- never echoed back as content
+      }
+      if (text) out.push({ role: 'assistant', content: [{ type: 'output_text', text }] });
+      for (const c of calls) out.push(c);
+    }
+  }
+  return out;
+}
+
+// Responses tools are FLAT -- name/description/parameters sit on the tool
+// object itself, not nested under `function` the way chat completions wants.
+function toResponsesTools(tools) {
+  if (!Array.isArray(tools) || !tools.length) return null;
+  return tools.map(t => ({
+    type: 'function',
+    name: t.name,
+    description: t.description || '',
+    parameters: t.input_schema || { type: 'object', properties: {} },
+  }));
+}
+
+function mapResponsesUsage(u) {
+  if (!u) return null;
+  const det = u.input_tokens_details || {};
+  const input = u.input_tokens ?? 0;
+  const output = u.output_tokens ?? 0;
+  return {
+    input_tokens: input,
+    output_tokens: output,
+    total_tokens: u.total_tokens ?? (input + output),
+    cached_input_tokens: det.cached_tokens ?? 0,
+  };
+}
+
+// Responses reports completion via status + incomplete_details, not a
+// finish_reason string. Tool calls win: the agent loop keys off 'tool_use'.
+function mapResponsesStatus(response, sawToolCall) {
+  if (sawToolCall) return 'tool_use';
+  const reason = response?.incomplete_details?.reason;
+  if (reason === 'max_output_tokens') return 'max_tokens';
+  if (reason) return reason;
+  return 'end_turn';
+}
+
+function responsesNoKeyError(ep, base) {
+  return ep
+    ? `No API key for endpoint "${ep.name || base}" -- add one in Settings > AI > Custom inference.`
+    : 'No OpenAI API key -- paste one in Settings > AI > OpenAI.';
+}
+
+// Blocking send against /v1/responses. Returns the same shape as the
+// Anthropic and OpenAI paths.
+async function responsesSend(opts) {
+  const model = opts.model;
+  const ep = opts.endpoint || null;
+  const base = endpointBase(ep);
+  const key = resolveEndpointKey(ep);
+  if (!key) return { ok: false, error: 'no_auth', message: responsesNoKeyError(ep, base) };
+  const messages = Array.isArray(opts.messages) ? opts.messages : [];
+  const system = typeof opts.system === 'string' ? opts.system : null;
+  const maxTokens = Number.isFinite(opts.maxTokens) ? opts.maxTokens : 16384;
+  const vkey = visionKey(base, model);
+  const tools = toResponsesTools(opts.tools);
+  const reasoning = responsesReasoning(opts);
+  const buildBody = (allowImages) => {
+    const b = { model, input: toResponsesInput(messages, allowImages), max_output_tokens: maxTokens, store: false };
+    if (system) b.instructions = system;
+    if (tools) { b.tools = tools; b.tool_choice = 'auto'; }
+    if (reasoning) b.reasoning = reasoning;
+    return applyEndpointSessionRouting(b, ep, opts.sessionAffinity);
+  };
+  const post = (allowImages) => fetch(`${base}/responses`, {
+    method: 'POST',
+    headers: openAIRequestHeaders(ep, key, opts.sessionAffinity),
+    body: JSON.stringify(buildBody(allowImages)),
+  });
+  try {
+    let allowImages = !VISION_UNSUPPORTED.has(vkey);
+    let res = await post(allowImages);
+    if (!res.ok) {
+      const errBody = await res.text();
+      let parsed = null; try { parsed = JSON.parse(errBody); } catch {}
+      if (allowImages && isVisionRejection(res.status, parsed, errBody)) {
+        VISION_UNSUPPORTED.add(vkey);
+        console.log(`[inference] ${model} rejected image input -- treating as text-only for this session`);
+        res = await post(false);
+        if (!res.ok) {
+          const e2 = await res.text();
+          let p2 = null; try { p2 = JSON.parse(e2); } catch {}
+          return { ok: false, status: res.status, error: p2?.error?.type || 'api_error', message: p2?.error?.message || e2.slice(0, 500) };
+        }
+      } else {
+        return { ok: false, status: res.status, error: parsed?.error?.type || 'api_error', message: parsed?.error?.message || errBody.slice(0, 500) };
+      }
+    }
+    const data = await res.json();
+    let text = '';
+    let reasoningText = '';
+    const blocks = [];
+    const toolUses = [];
+    for (const item of (data.output || [])) {
+      if (item.type === 'message') {
+        for (const c of (item.content || [])) {
+          if (c.type === 'output_text' && typeof c.text === 'string') text += c.text;
+        }
+      } else if (item.type === 'reasoning') {
+        for (const s of (item.summary || [])) {
+          if (typeof s?.text === 'string') reasoningText += s.text;
+        }
+      } else if (item.type === 'function_call') {
+        const input = oaSafeJson(item.arguments);
+        toolUses.push({ id: item.call_id || item.id, name: item.name, input });
+      }
+    }
+    if (text) blocks.push({ type: 'text', text });
+    for (const t of toolUses) blocks.push({ type: 'tool_use', id: t.id, name: t.name, input: t.input });
+    return {
+      ok: true, text, reasoning: reasoningText, content: blocks, toolUses,
+      model: data.model,
+      usage: mapResponsesUsage(data.usage),
+      stopReason: mapResponsesStatus(data, toolUses.length > 0),
+    };
+  } catch (e) {
+    return { ok: false, error: 'network', message: e.message };
+  }
+}
+
+// Streaming send against /v1/responses. Emits Anthropic-shaped events via
+// send(), identical to openAIStream, so the renderer cannot tell them apart.
+async function responsesStream(opts, send, abortSignal) {
+  const model = opts.model;
+  const ep = opts.endpoint || null;
+  const base = endpointBase(ep);
+  const key = resolveEndpointKey(ep);
+  if (!key) { send({ type: 'error', error: 'no_auth', message: responsesNoKeyError(ep, base) }); return { ok: false }; }
+  const messages = Array.isArray(opts.messages) ? opts.messages : [];
+  const system = typeof opts.system === 'string' ? opts.system : null;
+  const maxTokens = Number.isFinite(opts.maxTokens) ? opts.maxTokens : 16384;
+  const vkey = visionKey(base, model);
+  const tools = toResponsesTools(opts.tools);
+  const reasoning = responsesReasoning(opts);
+  const buildBody = (allowImages) => {
+    const b = { model, input: toResponsesInput(messages, allowImages), max_output_tokens: maxTokens, store: false, stream: true };
+    if (system) b.instructions = system;
+    if (tools) { b.tools = tools; b.tool_choice = 'auto'; }
+    if (reasoning) b.reasoning = reasoning;
+    return applyEndpointSessionRouting(b, ep, opts.sessionAffinity);
+  };
+  const post = (allowImages) => fetch(`${base}/responses`, {
+    method: 'POST',
+    headers: openAIRequestHeaders(ep, key, opts.sessionAffinity, true),
+    body: JSON.stringify(buildBody(allowImages)),
+    signal: abortSignal,
+  });
+  try {
+    let allowImages = !VISION_UNSUPPORTED.has(vkey);
+    let res = await post(allowImages);
+    if (!res.ok) {
+      const errBody = await res.text();
+      let parsed = null; try { parsed = JSON.parse(errBody); } catch {}
+      let failText = errBody, failParsed = parsed, failStatus = res.status;
+      if (allowImages && isVisionRejection(res.status, parsed, errBody)) {
+        VISION_UNSUPPORTED.add(vkey);
+        console.log(`[inference] ${model} rejected image input -- treating as text-only for this session`);
+        res = await post(false);
+        if (!res.ok) {
+          failText = await res.text();
+          failParsed = null; try { failParsed = JSON.parse(failText); } catch {}
+          failStatus = res.status;
+        }
+      }
+      if (!res.ok) {
+        send({ type: 'error', error: failParsed?.error?.type || 'api_error', message: failParsed?.error?.message || failText.slice(0, 500), status: failStatus });
+        return { ok: false };
+      }
+    }
+    send({ type: 'message_start', message: { role: 'assistant', model } });
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let fullText = '';
+    let textStarted = false;
+    let textIndex = -1;
+    let nextIndex = 0;
+    const toolBlocks = {}; // responses item_id -> { anthIndex, id, name, argsJson, started }
+    let stopReason = null;
+    let usage = null;
+    let finalResponse = null;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop();
+      for (const raw of lines) {
+        const line = raw.trim();
+        // Responses SSE carries `event:` lines too, but every data payload
+        // already names itself via `type`, so dispatch on that alone.
+        if (!line.startsWith('data:')) continue;
+        const payload = line.slice(5).trim();
+        if (!payload || payload === '[DONE]') continue;
+        let ev; try { ev = JSON.parse(payload); } catch { continue; }
+        const t = ev.type;
+        if (t === 'response.output_text.delta') {
+          const d = ev.delta;
+          if (typeof d === 'string' && d.length) {
+            if (!textStarted) { textStarted = true; textIndex = nextIndex++; send({ type: 'block_start', index: textIndex, block: { type: 'text', text: '' } }); }
+            fullText += d;
+            send({ type: 'text_delta', index: textIndex, text: d });
+          }
+        } else if (t === 'response.reasoning_summary_text.delta' || t === 'response.reasoning_text.delta') {
+          // Same contract as the OpenAI path: reasoning is surfaced but NEVER
+          // folded into fullText -- it is not the answer.
+          const d = ev.delta;
+          if (typeof d === 'string' && d.length) send({ type: 'reasoning_delta', text: d });
+        } else if (t === 'response.output_item.added') {
+          const item = ev.item || {};
+          if (item.type === 'function_call') {
+            const kid = item.id || item.call_id;
+            const tb = toolBlocks[kid] = { anthIndex: nextIndex++, id: item.call_id || item.id, name: item.name || '', argsJson: '', started: false };
+            if (tb.name) { tb.started = true; send({ type: 'block_start', index: tb.anthIndex, block: { type: 'tool_use', id: tb.id, name: tb.name, inputJson: '' } }); }
+          }
+        } else if (t === 'response.function_call_arguments.delta') {
+          const kid = ev.item_id;
+          let tb = toolBlocks[kid];
+          if (!tb) tb = toolBlocks[kid] = { anthIndex: nextIndex++, id: kid, name: '', argsJson: '', started: false };
+          const d = ev.delta;
+          if (typeof d === 'string' && d.length) {
+            tb.argsJson += d;
+            if (tb.started) send({ type: 'tool_use_delta', index: tb.anthIndex, partialJson: d });
+          }
+        } else if (t === 'response.output_item.done') {
+          const item = ev.item || {};
+          if (item.type === 'function_call') {
+            const kid = item.id || item.call_id;
+            const tb = toolBlocks[kid];
+            if (tb) {
+              if (item.call_id) tb.id = item.call_id;
+              if (item.name) tb.name = item.name;
+              // A function_call whose name only arrived at item.done never got
+              // a block_start; emit it now with the complete arguments so the
+              // renderer sees a whole block instead of nothing.
+              if (!tb.started && tb.name) {
+                tb.started = true;
+                send({ type: 'block_start', index: tb.anthIndex, block: { type: 'tool_use', id: tb.id, name: tb.name, inputJson: '' } });
+                if (typeof item.arguments === 'string' && item.arguments.length) {
+                  tb.argsJson = item.arguments;
+                  send({ type: 'tool_use_delta', index: tb.anthIndex, partialJson: item.arguments });
+                }
+              }
+            }
+          }
+        } else if (t === 'response.completed' || t === 'response.incomplete' || t === 'response.failed') {
+          finalResponse = ev.response || null;
+          if (finalResponse?.usage) usage = mapResponsesUsage(finalResponse.usage);
+          if (t === 'response.failed') {
+            const err = finalResponse?.error;
+            if (err) send({ type: 'error', error: err.code || 'api_error', message: err.message || 'Response failed' });
+          }
+        } else if (t === 'error') {
+          send({ type: 'error', error: ev.code || 'api_error', message: ev.message || 'Stream error' });
+        }
+      }
+    }
+    if (textStarted) send({ type: 'block_stop', index: textIndex });
+    const toolArr = Object.values(toolBlocks).sort((a, b) => a.anthIndex - b.anthIndex);
+    for (const tb of toolArr) if (tb.started) send({ type: 'block_stop', index: tb.anthIndex });
+    stopReason = mapResponsesStatus(finalResponse, toolArr.some(tb => tb.started));
+    send({ type: 'message_delta', stopReason, usage });
+    const blockArr = [];
+    if (fullText) blockArr.push({ type: 'text', text: fullText });
+    const toolUses = [];
+    for (const tb of toolArr) {
+      if (!tb.started) continue;
+      const input = oaSafeJson(tb.argsJson);
+      const inputInvalid = input === null ? {
+        reason: 'arguments did not parse as JSON',
+        rawLength: (tb.argsJson || '').length,
+        rawTail: (tb.argsJson || '').slice(-160),
+      } : null;
+      blockArr.push({ type: 'tool_use', id: tb.id, name: tb.name, input, inputInvalid });
+      toolUses.push({ id: tb.id, name: tb.name, input, inputInvalid });
+    }
+    send({ type: 'done', result: { ok: true, text: fullText, content: blockArr, toolUses, stopReason, usage } });
+    return { ok: true };
+  } catch (e) {
+    if (e?.name === 'AbortError') {
+      send({ type: 'cancelled' });
+      return { ok: false, cancelled: true };
+    }
+    send({ type: 'error', error: 'network', message: e.message });
+    return { ok: false };
+  }
+}
+
+
 // Blocking send against OpenAI. Returns the same shape as the Anthropic path.
 async function openAISend(opts) {
   const model = opts.model;
@@ -8492,6 +8905,9 @@ ipcMain.handle('inference:send', async (_event, opts = {}) => {
   const model = opts.model || 'claude-opus-4-8';
   // Jul 19: route OpenAI-compatible models (GPT-5.6 Sol/Terra/Luna, etc.)
   // to the OpenAI adapter; the Anthropic path below stays unchanged.
+  // Sep 10 2026: GPT-6 Astra and friends must go through /v1/responses --
+  // checked FIRST because isOpenAIModel() also matches gpt-6-*.
+  if (isResponsesModel(model, opts.endpoint)) return await responsesSend({ ...opts, model });
   if (isOpenAIModel(model) || opts.endpoint) return await openAISend({ ...opts, model });
   // Aug 7 2026: was 4096 while both OpenAI paths defaulted to 16384. The chat
   // agent writes whole source files through write_file, and a single tool call
@@ -8706,6 +9122,13 @@ ipcMain.on('inference:stream', async (event, opts = {}) => {
   }
   const model = opts.model || 'claude-opus-4-8';
   // Jul 19: route OpenAI-compatible models to the streaming OpenAI adapter.
+  // Sep 10 2026: Responses-only models (GPT-6 Astra) before the
+  // chat-completions branch, for the same reason as inference:send.
+  if (isResponsesModel(model, opts.endpoint)) {
+    try { await responsesStream({ ...opts, model }, send, abortCtrl.signal); }
+    finally { clearStream(); }
+    return;
+  }
   if (isOpenAIModel(model) || opts.endpoint) {
     try { await openAIStream({ ...opts, model }, send, abortCtrl.signal); }
     finally { clearStream(); }

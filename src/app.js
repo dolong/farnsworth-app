@@ -287,6 +287,7 @@ function modelToApiId(displayName) {
     'GPT-5.6 Sol': 'gpt-5.6-sol',
     'GPT-5.6 Terra': 'gpt-5.6-terra',
     'GPT-5.6 Luna': 'gpt-5.6-luna',
+    'GPT-6 Astra': 'gpt-6-astra',
   };
   // Custom-endpoint models resolve by display name to their raw apiId.
   for (const ep of (state.settings?.customEndpoints || [])) {
@@ -431,6 +432,7 @@ const CHAT_MODEL_OPTIONS = [
   { provider: 'openai', apiId: 'gpt-5.6-sol', display: 'GPT-5.6 Sol',           effort: null, desc: 'OpenAI · 1.05M context · advanced reasoning' },
   { provider: 'openai', apiId: 'gpt-5.6-terra', display: 'GPT-5.6 Terra',       effort: null, desc: 'OpenAI · 1.05M context · balanced' },
   { provider: 'openai', apiId: 'gpt-5.6-luna', display: 'GPT-5.6 Luna',         effort: null, desc: 'OpenAI · 1.05M context · fast + affordable' },
+  { provider: 'openai', apiId: 'gpt-6-astra', display: 'GPT-6 Astra', effort: null, desc: 'OpenAI · Responses API · frontier reasoning + tools' },
 ];
 
 // Model picker popover — anchored under a dropdown button in Settings → AI.
