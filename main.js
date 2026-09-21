@@ -10363,6 +10363,15 @@ function startClaudeCodeServer() {
       let msg;
       try { msg = JSON.parse(raw.toString()); } catch { return; }
       if (msg.type === 'spawn') {
+        // Sep 21 2026: take the cwd from the SPAWN message, not just the
+        // WS-open init. A restored tab opens its socket at panel mount but
+        // spawns its PTY lazily (when you first click it), which can be long
+        // after a folder switch — the init-time cwd was frozen at the old
+        // project, so claude spawned there AND `--resume` found that
+        // project's JSONL, i.e. an agent reading the previous game's files.
+        // Long hit exactly this Sep 21. The renderer now restates its
+        // state.folder on every spawn; init stays as the fallback.
+        if (typeof msg.cwd === 'string' && msg.cwd.length > 0) cwd = msg.cwd;
         spawnFor(msg.sessionId);
       } else if (term && msg.type === 'data') {
         term.write(msg.data);
@@ -10437,30 +10446,67 @@ ipcMain.handle('claudeCode:close', async (_event, tabId) => {
 // present, restore uses `claude --resume <sessionId>` so the prior
 // conversation continues instead of starting fresh and re-asking the
 // workspace trust prompt.
-ipcMain.handle('claudeCode:listTabs', async () => {
+// ---- Agent panel tabs are per project folder (Sep 21 2026) ---------------
+// Claude Code / Codex tab lists used to be ONE global setting. Long switched
+// Farnsworth to a different game, opened Claude Code, and the agent read
+// files from the previous project. Two reasons, both fixed by scoping:
+//   1. the restored tab belonged to the old project, and
+//   2. `claude --resume <sessionId>` replayed that project's transcript, so
+//      even a correct cwd could not stop it reaching into the old folder.
+// Shape: { byFolder: { "<abs path>": { tabs, activeId } } }. A legacy flat
+// value is migrated once, attributed to the folder that was open when it was
+// written, so nobody loses the tabs they had.
+function readAgentTabState(key, folder) {
+  const raw = db.getSetting(key);
+  let parsed = null;
+  try { parsed = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch { parsed = null; }
+  if (!parsed || typeof parsed !== 'object') parsed = {};
+  if (!parsed.byFolder || typeof parsed.byFolder !== 'object') {
+    const legacyFolder = currentFolderSetting() || '';
+    const migrated = { byFolder: {} };
+    if (legacyFolder && Array.isArray(parsed.tabs) && parsed.tabs.length) {
+      migrated.byFolder[legacyFolder] = {
+        tabs: parsed.tabs,
+        activeId: parsed.activeId || null,
+      };
+    }
+    try { db.setSetting(key, migrated); } catch {}
+    parsed = migrated;
+  }
+  const entry = parsed.byFolder[folder || ''] || null;
+  return {
+    all: parsed,
+    tabs: entry && Array.isArray(entry.tabs) ? entry.tabs : [],
+    activeId: (entry && entry.activeId) || null,
+  };
+}
+
+function writeAgentTabState(key, folder, tabs, activeId) {
+  const state = readAgentTabState(key, folder).all;
+  state.byFolder[folder || ''] = { tabs, activeId: activeId || null };
+  db.setSetting(key, state);
+}
+
+ipcMain.handle('claudeCode:listTabs', async (event, folder) => {
   try {
-    const raw = db.getSetting('claudeCode.tabs');
-    if (!raw) return { ok: true, tabs: [], activeId: null };
-    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
-    return {
-      ok: true,
-      tabs: Array.isArray(parsed.tabs) ? parsed.tabs : [],
-      activeId: parsed.activeId || null,
-    };
+    const target = folder || folderForEvent(event) || '';
+    const { tabs, activeId } = readAgentTabState('claudeCode.tabs', target);
+    return { ok: true, tabs, activeId, folder: target };
   } catch (e) {
     return { ok: false, error: e.message, tabs: [], activeId: null };
   }
 });
 
-ipcMain.handle('claudeCode:saveTabs', async (_event, state) => {
+ipcMain.handle('claudeCode:saveTabs', async (event, state) => {
   try {
     if (!state || !Array.isArray(state.tabs)) {
       return { ok: false, error: 'tabs must be an array' };
     }
-    db.setSetting('claudeCode.tabs', {
-      tabs: state.tabs,
-      activeId: state.activeId || null,
-    });
+    // The renderer may name the folder explicitly: on a folder switch it
+    // flushes the OUTGOING project's tabs after the window's active
+    // workspace has already moved on.
+    const target = state.folder || folderForEvent(event) || '';
+    writeAgentTabState('claudeCode.tabs', target, state.tabs, state.activeId);
     return { ok: true };
   } catch (e) {
     return { ok: false, error: e.message };
@@ -10658,6 +10704,8 @@ function startCodexServer() {
       let msg;
       try { msg = JSON.parse(raw.toString()); } catch { return; }
       if (msg.type === 'spawn') {
+        // Same spawn-time cwd rule as the Claude Code panel above.
+        if (typeof msg.cwd === 'string' && msg.cwd.length > 0) cwd = msg.cwd;
         spawnFor();
       } else if (term && msg.type === 'data') {
         term.write(msg.data);
@@ -10691,30 +10739,23 @@ ipcMain.handle('codex:close', async (_event, tabId) => {
 // sessionId (no resume surface, see the note on startCodexServer).
 // Shape stored at `codex.tabs`:
 //   { tabs: [{ id: 'cx-1', label: 'codex', createdAt: '...' }], activeId: 'cx-1' }
-ipcMain.handle('codex:listTabs', async () => {
+ipcMain.handle('codex:listTabs', async (event, folder) => {
   try {
-    const raw = db.getSetting('codex.tabs');
-    if (!raw) return { ok: true, tabs: [], activeId: null };
-    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
-    return {
-      ok: true,
-      tabs: Array.isArray(parsed.tabs) ? parsed.tabs : [],
-      activeId: parsed.activeId || null,
-    };
+    const target = folder || folderForEvent(event) || '';
+    const { tabs, activeId } = readAgentTabState('codex.tabs', target);
+    return { ok: true, tabs, activeId, folder: target };
   } catch (e) {
     return { ok: false, error: e.message, tabs: [], activeId: null };
   }
 });
 
-ipcMain.handle('codex:saveTabs', async (_event, state) => {
+ipcMain.handle('codex:saveTabs', async (event, state) => {
   try {
     if (!state || !Array.isArray(state.tabs)) {
       return { ok: false, error: 'tabs must be an array' };
     }
-    db.setSetting('codex.tabs', {
-      tabs: state.tabs,
-      activeId: state.activeId || null,
-    });
+    const target = state.folder || folderForEvent(event) || '';
+    writeAgentTabState('codex.tabs', target, state.tabs, state.activeId);
     return { ok: true };
   } catch (e) {
     return { ok: false, error: e.message };

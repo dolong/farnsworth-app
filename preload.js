@@ -343,7 +343,7 @@ contextBridge.exposeInMainWorld('farnsworth', {
 
   claudeCodeClose: (tabId) => ipcRenderer.invoke('claudeCode:close', tabId),
   // Tab persistence — restore the panel's open tabs across restarts.
-  claudeCodeListTabs: () => ipcRenderer.invoke('claudeCode:listTabs'),
+  claudeCodeListTabs: (folder) => ipcRenderer.invoke('claudeCode:listTabs', folder),
   claudeCodeSaveTabs: (state) => ipcRenderer.invoke('claudeCode:saveTabs', state),
 
   // Claude Code panel auth gate — the renderer checks auth before spawning
@@ -375,7 +375,7 @@ contextBridge.exposeInMainWorld('farnsworth', {
   // the panel's own lifecycle calls.
   getCodexWsUrl: () => ipcRenderer.invoke('codex:getWsUrl'),
   codexClose: (tabId) => ipcRenderer.invoke('codex:close', tabId),
-  codexListTabs: () => ipcRenderer.invoke('codex:listTabs'),
+  codexListTabs: (folder) => ipcRenderer.invoke('codex:listTabs', folder),
   codexSaveTabs: (state) => ipcRenderer.invoke('codex:saveTabs', state),
   codexCheckAuth: () => ipcRenderer.invoke('codex:checkAuth'),
   codexRunLogin: () => ipcRenderer.invoke('codex:runLogin'),

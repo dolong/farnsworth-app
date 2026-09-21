@@ -10748,6 +10748,71 @@ async function retargetTerminalsToFolder(folderPath, previousFolder) {
   }
 }
 
+// Sep 21 2026: agent panels now follow the project you opened.
+//
+// Long switched Farnsworth to a different game, opened Claude Code, and the
+// agent read files from the previous project. Three things conspired: the tab
+// list was one GLOBAL setting, a restored tab's PTY spawns lazily (so the cwd
+// captured at socket-open was already stale by the time claude started), and
+// `--resume <sessionId>` then found that old project's transcript. Root cause
+// is fixed at spawn time in main.js; this is the other half — the tabs
+// themselves belong to a folder now.
+//
+// Park the outgoing project's tabs under its own key, tear their PTYs down
+// (claude appends its transcript continuously, so switching back resumes the
+// conversation; only an in-flight response is lost), then restore whatever
+// belongs to the folder just opened.
+async function swapAgentTabsToFolder(folderPath, previousFolder) {
+  const oldName = (previousFolder || '').split('/').filter(Boolean).pop() || 'the previous project';
+  const newName = (folderPath || '').split('/').filter(Boolean).pop() || 'this project';
+
+  const ccParked = claudeCodeSessions.size;
+  if (ccParked) {
+    await persistClaudeCodeTabs(previousFolder);
+    for (const tabId of Array.from(claudeCodeSessions.keys())) {
+      await closeClaudeCodeTab(tabId, { persist: false });
+    }
+    claudeCodePersistedSessionsByTab.clear();
+    activeClaudeCodeTabId = null;
+    renderClaudeCodeTabs();
+  }
+
+  const cxParked = codexSessions.size;
+  if (cxParked) {
+    await persistCodexTabs(previousFolder);
+    for (const tabId of Array.from(codexSessions.keys())) {
+      await closeCodexTab(tabId, { persist: false });
+    }
+    activeCodexTabId = null;
+    renderCodexTabs();
+  }
+
+  // Only re-populate a panel that was actually in use. An untouched panel
+  // keeps its lazy-spawn-on-first-open behaviour.
+  let ccBack = 0;
+  if (ccParked) {
+    const restored = await restoreClaudeCodeTabs(folderPath);
+    ccBack = restored ? claudeCodeSessions.size : 0;
+    if (!restored) addClaudeCodeTab();
+  }
+  let cxBack = 0;
+  if (cxParked) {
+    const restored = await restoreCodexTabs(folderPath);
+    cxBack = restored ? codexSessions.size : 0;
+    if (!restored) addCodexTab();
+  }
+
+  if (ccParked || cxParked) {
+    const parked = ccParked + cxParked;
+    const back = ccBack + cxBack;
+    showToast('Agent tabs: ' + parked + ' parked in ' + oldName +
+      (back ? ' \u00b7 ' + back + ' restored for ' + newName
+            : ' \u00b7 fresh session in ' + newName));
+    console.log('[folder switch] agent tabs parked=' + parked + ' restored=' + back +
+      ' folder=' + folderPath);
+  }
+}
+
 // Keeps the chat thread on the project you are actually looking at. Compares
 // the active conversation's own workspace_path against the folder being
 // opened rather than just "did the folder change", so it fixes the boot path
@@ -10806,6 +10871,12 @@ async function handleFolderPicked(folderPath) {
   // the currentFolder setting is written so main's fallback agrees with us.
   if (previousFolder && previousFolder !== folderPath) {
     retargetTerminalsToFolder(folderPath, previousFolder);
+    // Sep 21: Claude Code / Codex tabs belong to a project. Park the old
+    // project's sessions and bring up this project's instead, so no agent is
+    // left running (or resumable) against the folder you just left.
+    swapAgentTabsToFolder(folderPath, previousFolder).catch((e) => {
+      console.warn('[folder switch] agent tab swap failed:', e?.message || e);
+    });
   }
   // Aug 5: the chat used to carry the previous project's conversation across
   // a folder switch. chat_conversations rows are workspace-scoped already;
@@ -14708,11 +14779,23 @@ const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 function isValidUuid(s) {
   return typeof s === 'string' && uuidRe.test(s);
 }
+// The folder this window is actually on. state.folder is the live truth;
+// __farnsworthCurrentFolder mirrors it for main-process pollers and covers
+// the sliver of boot before state.folder is restored. Never hand main a null
+// cwd if either one knows the answer — a null makes main fall back to $HOME,
+// which is how three stray `claude` PTYs ended up running in /Users/long.
+function currentWorkspaceFolder() {
+  return state.folder || window.__farnsworthCurrentFolder || null;
+}
+
 let saveClaudeCodeTabsTimeout = null;
-function persistClaudeCodeTabs() {
+// `folderOverride` names the project the tabs belong to. On a folder switch
+// the outgoing project's tabs are flushed AFTER the window's active workspace
+// has already moved, so the caller has to say which folder is being saved.
+function persistClaudeCodeTabs(folderOverride) {
   if (!window.farnsworth?.claudeCodeSaveTabs) return;
   clearTimeout(saveClaudeCodeTabsTimeout);
-  saveClaudeCodeTabsTimeout = setTimeout(() => {
+  const save = () => {
     const tabs = Array.from(claudeCodeSessions.entries())
       .sort((a, b) => a[1].createdAt - b[1].createdAt)
       .map(([id, sess]) => ({
@@ -14731,21 +14814,26 @@ function persistClaudeCodeTabs() {
           return isValidUuid(cand) ? cand : null;
         })(),
       }));
-    window.farnsworth.claudeCodeSaveTabs({
+    return window.farnsworth.claudeCodeSaveTabs({
       tabs,
       activeId: activeClaudeCodeTabId,
+      folder: folderOverride || currentWorkspaceFolder(),
     }).catch(() => {});
-  }, 200);
+  };
+  // An explicit folder means "flush now" — the caller is mid-switch and the
+  // debounce would fire after the new project's tabs are already loaded.
+  if (folderOverride) return save();
+  saveClaudeCodeTabsTimeout = setTimeout(save, 200);
 }
 
 // Read saved tabs on startup. Returns the list and the active id; the
 // caller decides when to actually spawn each PTY (we restore tab pills
 // immediately so the user sees them, but only init PTYs for the active
 // tab + on tab switch).
-async function loadPersistedClaudeCodeTabs() {
+async function loadPersistedClaudeCodeTabs(folder) {
   if (!window.farnsworth?.claudeCodeListTabs) return { tabs: [], activeId: null };
   try {
-    const r = await window.farnsworth.claudeCodeListTabs();
+    const r = await window.farnsworth.claudeCodeListTabs(folder || currentWorkspaceFolder());
     if (!r || !r.ok) return { tabs: [], activeId: null };
     return { tabs: r.tabs || [], activeId: r.activeId || null };
   } catch {
@@ -15466,7 +15554,7 @@ async function initClaudeCode(tabId) {
     // time, which lags behind state.folder if the panel mounted before a
     // folder was opened (verified Jul 5 ~23:55 ET: state.folder was null at
     // mount, currentFolder was set later, captured cwd stayed as homedir).
-    ws.send(JSON.stringify({ type: 'init', cwd: state.folder || null }));
+    ws.send(JSON.stringify({ type: 'init', cwd: currentWorkspaceFolder() }));
     // Tell main to spawn the claude PTY for this tab with the persisted
     // sessionId (so prior conversations resume across restarts). If the
     // tab doesn't have a sessionId yet, main generates a deterministic
@@ -15474,7 +15562,16 @@ async function initClaudeCode(tabId) {
     // message — we persist it from there. Long asked for this Jun 28
     // ~16:30 ET so Claude Code sessions don't start fresh every restart.
     const persistedSessionId = claudeCodePersistedSessionsByTab.get(tabId) || null;
-    ws.send(JSON.stringify({ type: 'spawn', sessionId: persistedSessionId, tabId }));
+    // Restate the folder at spawn time (Sep 21): the PTY can spawn long
+    // after this socket opened (restored tabs spawn lazily on first click),
+    // and main's init-time cwd would still name the project we have since
+    // left. See main.js § spawn-time cwd.
+    ws.send(JSON.stringify({
+      type: 'spawn',
+      sessionId: persistedSessionId,
+      tabId,
+      cwd: currentWorkspaceFolder(),
+    }));
     ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
   };
 
@@ -15587,7 +15684,10 @@ async function initClaudeCode(tabId) {
   });
   resizeObserver.observe(paneEl);
 
-  claudeCodeSessions.set(tabId, { term, fit, ws, paneEl, label, createdAt: Date.now(), ptyTabId });
+  // Record the folder this session belongs to. A claude PTY's cwd is fixed
+  // for the process lifetime, so this is what tells us later that a live tab
+  // is pointed at a project we have since left.
+  claudeCodeSessions.set(tabId, { term, fit, ws, paneEl, label, createdAt: Date.now(), ptyTabId, cwd: currentWorkspaceFolder() });
   activeClaudeCodeTabId = tabId;
   renderClaudeCodeTabs();
   for (const [id, sess] of claudeCodeSessions.entries()) {
@@ -15641,7 +15741,7 @@ function switchClaudeCodeTab(tabId) {
   }, 30);
 }
 
-async function closeClaudeCodeTab(tabId) {
+async function closeClaudeCodeTab(tabId, opts = {}) {
   const sess = claudeCodeSessions.get(tabId);
   if (!sess) return;
   try { await window.farnsworth.claudeCodeClose(sess.ptyTabId || tabId); } catch {}
@@ -15663,7 +15763,10 @@ async function closeClaudeCodeTab(tabId) {
     }
   }
   renderClaudeCodeTabs();
-  persistClaudeCodeTabs();
+  // A folder switch tears tabs down after their list is already saved under
+  // the outgoing project — persisting here would overwrite it with an empty
+  // list and lose those sessions.
+  if (opts.persist !== false) persistClaudeCodeTabs();
 }
 
 // ============================================================================
@@ -15685,24 +15788,27 @@ let activeCodexTabId = null;
 let codexTabCounter = 0;
 
 let saveCodexTabsTimeout = null;
-function persistCodexTabs() {
+function persistCodexTabs(folderOverride) {
   if (!window.farnsworth?.codexSaveTabs) return;
   clearTimeout(saveCodexTabsTimeout);
-  saveCodexTabsTimeout = setTimeout(() => {
+  const save = () => {
     const tabs = Array.from(codexSessions.entries())
       .sort((a, b) => a[1].createdAt - b[1].createdAt)
       .map(([id, sess]) => ({ id, label: sess.label, createdAt: sess.createdAt }));
-    window.farnsworth.codexSaveTabs({
+    return window.farnsworth.codexSaveTabs({
       tabs,
       activeId: activeCodexTabId,
+      folder: folderOverride || currentWorkspaceFolder(),
     }).catch(() => {});
-  }, 200);
+  };
+  if (folderOverride) return save();
+  saveCodexTabsTimeout = setTimeout(save, 200);
 }
 
-async function loadPersistedCodexTabs() {
+async function loadPersistedCodexTabs(folder) {
   if (!window.farnsworth?.codexListTabs) return { tabs: [], activeId: null };
   try {
-    const r = await window.farnsworth.codexListTabs();
+    const r = await window.farnsworth.codexListTabs(folder || currentWorkspaceFolder());
     if (!r || !r.ok) return { tabs: [], activeId: null };
     return { tabs: r.tabs || [], activeId: r.activeId || null };
   } catch {
@@ -15927,8 +16033,8 @@ async function initCodex(tabId) {
     // Same init protocol as the Claude Code panel: send the renderer's
     // state.folder before spawn so the PTY lands in the project folder
     // (see the Jul 5 cwd bug — mirrored here from day one).
-    ws.send(JSON.stringify({ type: 'init', cwd: state.folder || null }));
-    ws.send(JSON.stringify({ type: 'spawn', tabId }));
+    ws.send(JSON.stringify({ type: 'init', cwd: currentWorkspaceFolder() }));
+    ws.send(JSON.stringify({ type: 'spawn', tabId, cwd: currentWorkspaceFolder() }));
     ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
   };
   ws.onmessage = (e) => {
@@ -15956,7 +16062,7 @@ async function initCodex(tabId) {
   });
   resizeObserver.observe(paneEl);
 
-  codexSessions.set(tabId, { term, fit, ws, paneEl, label, createdAt: Date.now(), ptyTabId });
+  codexSessions.set(tabId, { term, fit, ws, paneEl, label, createdAt: Date.now(), ptyTabId, cwd: currentWorkspaceFolder() });
   activeCodexTabId = tabId;
   renderCodexTabs();
   for (const [id, sess] of codexSessions.entries()) {
@@ -16010,7 +16116,7 @@ function switchCodexTab(tabId) {
   }, 30);
 }
 
-async function closeCodexTab(tabId) {
+async function closeCodexTab(tabId, opts = {}) {
   const sess = codexSessions.get(tabId);
   if (!sess) return;
   try { await window.farnsworth.codexClose(sess.ptyTabId || tabId); } catch {}
@@ -16032,14 +16138,14 @@ async function closeCodexTab(tabId) {
     }
   }
   renderCodexTabs();
-  persistCodexTabs();
+  if (opts.persist !== false) persistCodexTabs();
 }
 
 // Restore Codex tabs that were open at last shutdown. Same flow as
 // restoreClaudeCodeTabs minus sessionId seeding (fresh codex session per
 // restored tab; labels survive).
-async function restoreCodexTabs() {
-  const { tabs, activeId } = await loadPersistedCodexTabs();
+async function restoreCodexTabs(folder) {
+  const { tabs, activeId } = await loadPersistedCodexTabs(folder);
   if (!tabs.length) return false;
   for (const t of tabs) {
     const m = /^cx-(\d+)$/.exec(t.id);
@@ -16284,8 +16390,8 @@ function switchLeftPanel(tab) {
 // creates visual tab pills for the others (PTYs spawn lazily when the
 // user clicks them). Returns true if any tabs were restored, false if
 // the persisted list was empty (caller can fall back to fresh-spawn).
-async function restoreClaudeCodeTabs() {
-  const { tabs, activeId } = await loadPersistedClaudeCodeTabs();
+async function restoreClaudeCodeTabs(folder) {
+  const { tabs, activeId } = await loadPersistedClaudeCodeTabs(folder);
   if (!tabs.length) return false;
   // Bump the counter past the highest persisted id so future tabs get a
   // unique number. Each persisted id has the form 'cc-<n>'.
