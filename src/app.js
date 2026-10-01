@@ -272,6 +272,8 @@ function modelToApiId(displayName) {
   const discovered = (state.settings?.providerModels || []).find((row) => row && (row.display === displayName || row.apiId === displayName));
   if (discovered?.apiId) return discovered.apiId;
   const map = {
+    'Opus 5.5': 'claude-opus-5-5',
+    'Opus 5.5 High': 'claude-opus-5-5',
     'Opus 5': 'claude-opus-5',
     'Opus 5 High': 'claude-opus-5',
     'Opus 4.8': 'claude-opus-4-8',
@@ -420,8 +422,10 @@ function routedModelApiId(id) {
 // popover below. API ids come from modelToApiId() so the picker can stay in
 // display-name space.
 const CHAT_MODEL_OPTIONS = [
-  { provider: 'anthropic', apiId: 'claude-opus-5', display: 'Opus 5 High',   effort: 'high', desc: '1M context · newest flagship · adaptive thinking' },
-  { provider: 'anthropic', apiId: 'claude-opus-5', display: 'Opus 5',        effort: 'medium', desc: '1M context · newest flagship' },
+  { provider: 'anthropic', apiId: 'claude-opus-5-5', display: 'Opus 5.5 High', effort: 'high', desc: '1M context · newest flagship · adaptive thinking' },
+  { provider: 'anthropic', apiId: 'claude-opus-5-5', display: 'Opus 5.5',      effort: 'medium', desc: '1M context · newest flagship' },
+  { provider: 'anthropic', apiId: 'claude-opus-5', display: 'Opus 5 High',   effort: 'high', desc: '1M context · previous flagship · adaptive thinking' },
+  { provider: 'anthropic', apiId: 'claude-opus-5', display: 'Opus 5',        effort: 'medium', desc: '1M context · previous flagship' },
   { provider: 'anthropic', apiId: 'claude-opus-4-8', display: 'Opus 4.8 High', effort: 'high', desc: '1M context · most capable · adaptive thinking' },
   { provider: 'anthropic', apiId: 'claude-opus-4-8', display: 'Opus 4.8',      effort: 'medium', desc: '1M context · most capable' },
   { provider: 'anthropic', apiId: 'claude-sonnet-5', display: 'Sonnet 5',      effort: 'high', desc: '1M context · fast · new' },

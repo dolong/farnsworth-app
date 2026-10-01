@@ -4349,6 +4349,8 @@ async function spawnTestRunner(testPath, runnerEnv) {
 // and full API ids. Returns null when the setting is unset (runner default:
 // claude-sonnet-4-5).
 const MODEL_DISPLAY_TO_API = {
+  'Opus 5.5': 'claude-opus-5-5',
+  'Opus 5.5 High': 'claude-opus-5-5',
   'Opus 5': 'claude-opus-5',
   'Opus 5 High': 'claude-opus-5',
   'Opus 4.8': 'claude-opus-4-8',
