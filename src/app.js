@@ -4897,8 +4897,19 @@ function renderPostView() {
   // Read the emulator's Reddit store once per session; the load callback
   // re-renders Post View when the data lands. Deferred so the first paint is
   // never blocked on an IPC round trip.
-  if (!state.emulatorFeed.loadedAt && !state.emulatorFeed.loading) {
-    setTimeout(() => loadEmulatorFeed(), 0);
+  // Re-read whenever the running dev server changes (Go Live after Post View
+  // was already open), and retry a failed read every few seconds, so a stale
+  // "no server" result can't stick for the whole session.
+  {
+    const ef = state.emulatorFeed;
+    const devKey = state.farnsworthDev && state.farnsworthDev.available
+      ? `${state.farnsworthDev.url}|${state.farnsworthDev.pid || ''}` : '';
+    const devChanged = ef.loadedForDev !== devKey;
+    const retryDue = ef.error && ef.loadedAt && (Date.now() - ef.loadedAt > 5000);
+    if (!ef.loading && (!ef.loadedAt || devChanged || retryDue)) {
+      ef.loadedForDev = devKey;
+      setTimeout(() => loadEmulatorFeed({ force: true }), 0);
+    }
   }
   const activeMock = emulatorActivePost();
 
@@ -5101,9 +5112,13 @@ function renderPostView() {
 
   if (f.error) {
     const errText = f.error === 'admin_unreachable'
-      ? (f.hint || 'The dev server is running without the emulator admin surface. Restart Go Live.')
+      ? (state.farnsworthDev && state.farnsworthDev.available
+        ? "The preview is live, but this project's Devvit server isn't running, so there's no comment store. Its Go Live script only starts the client preview."
+        : (f.hint || 'The dev server is running without the emulator admin surface. Restart Go Live.'))
       : (f.error === 'no_dev_metadata'
-        ? 'No dev server is running. Hit Go Live to start the emulator, then comment.'
+        ? (state.farnsworthDev && state.farnsworthDev.available
+          ? "The preview is live, but this project's Devvit server isn't running, so there's no comment store. Its Go Live script only starts the client preview."
+          : 'No dev server is running. Hit Go Live to start the emulator, then comment.')
         : `Comment store unavailable (${f.error}).`);
     comments.appendChild(el('div', { class: 'post-view__comments-error' }, errText));
   }
