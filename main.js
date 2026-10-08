@@ -1784,7 +1784,69 @@ function sandboxGrantArgs() {
   for (const d of toolchainReadDirs()) args.push('--read', d);
   for (const f of gitConfigReadFiles()) args.push('--read-file', f);
   for (const d of devvitStateDirs()) args.push('--allow', d);
+  const ghDir = githubSandboxConfigDir();
+  if (ghDir) args.push('--allow', ghDir);
   return args;
+}
+
+// GitHub as the user (Oct 8). The profiles deny ~/.config/gh, so the agent's
+// `gh repo create` died on "open ~/.config/gh/config.yml: operation not
+// permitted" and `git push` had no credentials -- the agent could build a
+// project but never publish it. Same reasoning and same accepted trade as the
+// devvit token above: creating repos and pushing is the job, so the agent gets
+// the user's GitHub authority. Farnsworth (unsandboxed) resolves the token and
+// hands it over as env; ~/.config/gh itself stays denied.
+//   token source: GH_TOKEN/GITHUB_TOKEN in Farnsworth's env, else `gh auth
+//   token`, else the github.com entry git already stores (osxkeychain).
+//   gh: GH_TOKEN + an empty Farnsworth-owned GH_CONFIG_DIR it can read/write.
+//   git: a github.com credential helper that answers from $GH_TOKEN, with the
+//   existing helpers cleared for github.com so osxkeychain can't EPERM first.
+let _ghTokenCache = { value: null, at: 0 };
+function resolveGithubToken() {
+  const now = Date.now();
+  if (_ghTokenCache.at && now - _ghTokenCache.at < 10 * 60 * 1000) return _ghTokenCache.value;
+  const { execFileSync } = require('child_process');
+  const env = { ...process.env, PATH: composeChildPath(), GIT_TERMINAL_PROMPT: '0', GH_PROMPT_DISABLED: '1' };
+  let token = (process.env.GH_TOKEN || process.env.GITHUB_TOKEN || '').trim();
+  if (!token) {
+    try {
+      token = execFileSync('gh', ['auth', 'token', '--hostname', 'github.com'],
+        { env, timeout: 5000, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    } catch {}
+  }
+  if (!token) {
+    try {
+      const out = execFileSync('git', ['credential', 'fill'],
+        { env, timeout: 5000, encoding: 'utf8', input: 'protocol=https\nhost=github.com\n\n', stdio: ['pipe', 'pipe', 'ignore'] });
+      const m = out.match(/^password=(.+)$/m);
+      if (m) token = m[1].trim();
+    } catch {}
+  }
+  _ghTokenCache = { value: token || null, at: now };
+  return _ghTokenCache.value;
+}
+
+function githubSandboxConfigDir() {
+  try {
+    const dir = path.join(app.getPath('userData'), 'gh-sandbox');
+    require('fs').mkdirSync(dir, { recursive: true });
+    return dir;
+  } catch { return null; }
+}
+
+function githubAuthEnv() {
+  const token = resolveGithubToken();
+  if (!token) return {};
+  const env = { GH_TOKEN: token, GITHUB_TOKEN: token, GH_PROMPT_DISABLED: '1' };
+  const ghDir = githubSandboxConfigDir();
+  if (ghDir) env.GH_CONFIG_DIR = ghDir;
+  const base = Number(process.env.GIT_CONFIG_COUNT) || 0;
+  env.GIT_CONFIG_COUNT = String(base + 2);
+  env[`GIT_CONFIG_KEY_${base}`] = 'credential.https://github.com.helper';
+  env[`GIT_CONFIG_VALUE_${base}`] = '';
+  env[`GIT_CONFIG_KEY_${base + 1}`] = 'credential.https://github.com.helper';
+  env[`GIT_CONFIG_VALUE_${base + 1}`] = '!f() { test "$1" = get && echo username=x-access-token && echo "password=$GH_TOKEN"; }; f';
+  return env;
 }
 
 let _npmBinCache;
@@ -10428,7 +10490,7 @@ function startClaudeCodeServer() {
           cols: 80,
           rows: 24,
           cwd,
-          env: { ...process.env, TERM: 'xterm-256color', PATH: newPath },
+          env: { ...process.env, ...githubAuthEnv(), TERM: 'xterm-256color', PATH: newPath },
         });
       } catch (e) {
         send({ type: 'error', message: 'claude pty.spawn failed: ' + e.message + ' — is `claude` on PATH? Run `npm i -g @anthropic-ai/claude-code` if not.' });
@@ -11290,7 +11352,7 @@ async function runSandboxedCommand(nonoBin, profileName, command, folder, timeou
         // chat agent sees `command -v node` return nothing even though Node is
         // installed. Prepend the Homebrew + /usr/local bins. Same class of fix
         // as the terminal PTY PATH fix (Jul 4) — this call site never got it.
-        env: { ...process.env, PATH: composeChildPath() },
+        env: { ...process.env, ...githubAuthEnv(), PATH: composeChildPath() },
       }
     );
     child.stdout.on('data', d => { stdout += d.toString(); });
