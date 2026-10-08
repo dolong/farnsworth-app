@@ -100,11 +100,37 @@ If the client calls tRPC, Hono, Redis-backed APIs, `@devvit/web/server`, `@devvi
 
 Inspect `src/server` and choose the entry that actually starts the project's HTTP app. Set `DEVVIT_EMULATOR_SERVER_ENTRY` when the default `src/server/index.ts` is not correct. Bind the server to the allocated server port and point the Vite proxy at that same port.
 
-Record `serverPid`, `serverUrl`, and `serverLog` in preview metadata. This lets Farnsworth stop the process and lets `devvit_emulator_status` diagnose it.
+Record `serverPid`, `serverPort`, `serverUrl`, and `serverLog` in preview metadata. This lets Farnsworth stop the process, find the emulator admin listener (server port + 100), and lets `devvit_emulator_status` diagnose it.
+
+**Always start the server.** A launcher that starts only the Vite harness looks healthy because the preview renders, but Post View comments, mock posts, post types, and every `/api` call fail. Go Live reports `missing_server_runner` when a project has `src/server` and the metadata has no `serverPid`. Fixing the launcher comes before any other debugging.
 
 Do not stack the old emulator loader hook with `tsx`. Server code should run through `server-runner.mjs`, which bundles the server against Farnsworth's emulator implementations.
 
 A local `/api/trpc` 502, 503, 504, `ECONNREFUSED`, failed save, or missing server-derived identity means runtime health first. Call `devvit_emulator_status`. If the server is unavailable, inspect `serverLogTail` and repair or restart the launcher before inventing a client fallback.
+
+## Post types contract
+
+A Devvit app can create several kinds of custom post: different entrypoints (`devvit.json` `post.entrypoints`) and different `postData`. Post View's **+ New post** picker discovers them each time it opens:
+
+1. **From the app:** `devvit.json` menu items with `location` `subreddit` and an `/internal/...` endpoint. Farnsworth POSTs to the endpoint on the emulator-backed server, so the app's real `submitCustomPost({ title, entry, postData })` decides the post's type.
+2. **Presets:** `.farnsworth/config.json`:
+
+```json
+{
+  "postTypes": [
+    { "id": "daily", "label": "Daily run", "title": "Daily Run #12", "entry": "default", "postData": { "mode": "daily" } }
+  ]
+}
+```
+
+3. **Entrypoints:** every `post.entrypoints` key appears as a toggle on the active post (for example `default` / `game`).
+
+The Post View iframe URL is `/?view=post&postId=<t3_id>&entry=<entry>&mode=inline|expanded&postData=<base64url JSON>`. The project's development shim must:
+
+- Expose `postId` and decoded `postData` as `context.postId` / `context.postData`.
+- Route `?view=post` by `entry` to the matching client module.
+- Add an `x-farnsworth-post-id` header to same-origin `/api` requests, so the server-runner sets `context.postId` / `context.postData` per request.
+- Implement `requestExpandedMode(event, entry)` as `window.parent.postMessage({ type: 'devvit:requestExpandedMode', entry }, '*')`.
 
 ## Port contract
 

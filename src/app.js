@@ -83,6 +83,16 @@ const state = {
     busy: false,
     draft: '',
     refocusComposer: false,
+    // Post types discovered from the project (devvit.json menu actions,
+    // .farnsworth/config.json postTypes presets, entrypoints). Re-read every
+    // time the picker opens; typesFor is the folder they were read for.
+    postTypes: null,
+    typesFor: null,
+    typesMenuOpen: false,
+    // Which entrypoint the active post is showing. null = the post's own
+    // entry. Set by the entry toggle or by the app calling
+    // requestExpandedMode inside the iframe.
+    viewEntry: null,
   },
   farnsworthBooting: false,
   // 'installing' while Go Live's dependency preflight runs npm install,
@@ -4247,7 +4257,11 @@ async function bootFarnsworthDev() {
     const res = await window.farnsworth.devFarnsworthBoot(type, state.folder);
     if (res?.ok) {
       state.farnsworthDev = { available: true, type: res.type, url: res.url, pid: res.pid, startedAt: res.startedAt };
-      showToast?.(`${type} dev server live at ${res.url}`);
+      if (res.warning === 'missing_server_runner') {
+        showToast?.("Preview is live, but this project's Go Live script didn't start its Devvit server. Comments, mock posts, and /api calls won't work until the launcher starts the server-runner. Ask the agent to fix it.");
+      } else {
+        showToast?.(`${type} dev server live at ${res.url}`);
+      }
     } else {
       state.farnsworthDev = { available: false };
       showToast?.(res?.message || 'Failed to start dev server.');
@@ -4771,15 +4785,20 @@ function emulatorActivePost() {
   return f.posts.slice().sort((a, b) => (b.createdUtc || 0) - (a.createdUtc || 0))[0];
 }
 
-async function createMockPost(title, body) {
+async function createMockPost(title, body, extra = {}) {
   const f = state.emulatorFeed;
   if (f.busy) return null;
   f.busy = true;
   emulatorFeedRerender();
   try {
-    const res = await window.farnsworth.devvitEmulatorSubmitPost({ title, body });
+    const payload = { title, body };
+    if (extra.entry) payload.entry = extra.entry;
+    if (extra.postData !== undefined) payload.postData = extra.postData;
+    if (extra.postType) payload.postType = extra.postType;
+    const res = await window.farnsworth.devvitEmulatorSubmitPost(payload);
     if (res && res.ok) {
       f.activePostId = res.id || null;
+      f.viewEntry = null;
       await loadEmulatorFeed({ force: true });
       return res.id || null;
     }
@@ -4806,6 +4825,105 @@ async function ensureActiveMockPost() {
   const title = (lc.postName && lc.postName.trim()) || projectLabel;
   return await createMockPost(title, '');
 }
+
+// Post types: discovery, creation, and the iframe URL that hands a post's
+// entry + postData to the project's harness.
+async function loadPostTypes({ force = false } = {}) {
+  const f = state.emulatorFeed;
+  if (!state.folder || !window.farnsworth?.devvitPostTypes) return null;
+  if (!force && f.postTypes && f.typesFor === state.folder) return f.postTypes;
+  try {
+    const res = await window.farnsworth.devvitPostTypes(state.folder);
+    f.postTypes = res && res.ok ? res : { ok: false, entrypoints: [], menuItems: [], presets: [] };
+  } catch {
+    f.postTypes = { ok: false, entrypoints: [], menuItems: [], presets: [] };
+  }
+  f.typesFor = state.folder;
+  emulatorFeedRerender();
+  return f.postTypes;
+}
+
+async function createPostOfType(type) {
+  const f = state.emulatorFeed;
+  f.typesMenuOpen = false;
+  if (type.source === 'menu') {
+    if (f.busy) return;
+    f.busy = true;
+    emulatorFeedRerender();
+    try {
+      const res = await window.farnsworth.devvitRunMenuAction({ endpoint: type.endpoint });
+      if (res && res.ok) {
+        f.activePostId = res.id;
+        f.viewEntry = null;
+        f.error = null;
+        f.hint = null;
+      } else {
+        f.error = (res && res.error) || 'menu_action_failed';
+        f.hint = (res && res.hint) || null;
+      }
+    } finally {
+      f.busy = false;
+    }
+    await loadEmulatorFeed({ force: true });
+    return;
+  }
+  const lc = state.liveConfig || {};
+  const base = type.title
+    || `${(lc.postName && lc.postName.trim()) || type.label || 'Mock post'}`.replace(/\s*#\d+\s*$/, '');
+  const title = type.title ? base : `${base} #${f.posts.length + 1}`;
+  await createMockPost(title, '', {
+    entry: type.entry && type.entry !== 'default' ? type.entry : (type.source === 'preset' ? 'default' : undefined),
+    postData: type.postData,
+    postType: type.postType,
+  });
+}
+
+function postTypeLabel(p) {
+  if (!p) return '';
+  if (p.farnsworthPostType) return p.farnsworthPostType;
+  if (p.kind === 'custom') return p.entry && p.entry !== 'default' ? `Custom · ${p.entry}` : 'Custom post';
+  return '';
+}
+
+function encodePostData(data) {
+  try {
+    const json = JSON.stringify(data);
+    return btoa(unescape(encodeURIComponent(json))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  } catch { return ''; }
+}
+
+// The harness reads these params into its @devvit/web/client shim:
+//   postId, entry (devvit.json entrypoint), postData (base64url JSON),
+//   mode=inline|expanded. Templates that ignore them still render.
+function postViewIframeSrc(post) {
+  const f = state.emulatorFeed;
+  const params = ['view=post'];
+  if (post) {
+    params.push('postId=' + encodeURIComponent(post.id));
+    const entry = f.viewEntry || post.entry || 'default';
+    params.push('entry=' + encodeURIComponent(entry));
+    params.push('mode=' + (f.viewEntry && f.viewEntry !== (post.entry || 'default') ? 'expanded' : 'inline'));
+    if (post.postData !== undefined) {
+      const enc = encodePostData(post.postData);
+      if (enc) params.push('postData=' + enc);
+    }
+  } else if (f.viewEntry) {
+    params.push('entry=' + encodeURIComponent(f.viewEntry));
+    params.push('mode=expanded');
+  }
+  return state.farnsworthDev.url + '/?' + params.join('&');
+}
+
+// The harness shim forwards requestExpandedMode(event, entry) to the IDE, the
+// way Reddit opens a post's expanded entrypoint.
+window.addEventListener('message', (ev) => {
+  const d = ev && ev.data;
+  if (!d || typeof d !== 'object' || d.type !== 'devvit:requestExpandedMode') return;
+  const frame = document.querySelector('.post-view__embed-iframe');
+  if (!frame || ev.source !== frame.contentWindow) return;
+  state.emulatorFeed.viewEntry = typeof d.entry === 'string' && d.entry ? d.entry : 'game';
+  emulatorFeedRerender();
+});
 
 async function submitPostViewComment(text) {
   const f = state.emulatorFeed;
@@ -4911,6 +5029,10 @@ function renderPostView() {
       setTimeout(() => loadEmulatorFeed({ force: true }), 0);
     }
   }
+  if (state.folder && state.emulatorFeed.typesFor !== state.folder) {
+    state.emulatorFeed.typesFor = state.folder;
+    setTimeout(() => loadPostTypes({ force: true }), 0);
+  }
   const activeMock = emulatorActivePost();
 
   const root = el('div', { class: 'post-view' });
@@ -5008,14 +5130,44 @@ function renderPostView() {
   // area and visually overlays the Reddit post. Skip the iframe for
   // lastdraft (or any project without a compact splash view); the static
   // background-image still shows the embed look.
-  const embed = el('div', { class: 'post-view__embed' });
+  // Post type + entrypoint toggle. The entry buttons come from devvit.json
+  // post.entrypoints, so "splash vs game" (or any other entry) is one click.
+  {
+    const pt = state.emulatorFeed.postTypes;
+    const entries = (pt && pt.entrypoints) || [];
+    const ownEntry = (activeMock && activeMock.entry) || 'default';
+    const shown = state.emulatorFeed.viewEntry || ownEntry;
+    const typeLabel = postTypeLabel(activeMock);
+    if (typeLabel || entries.length > 1) {
+      const bar = el('div', { class: 'post-view__typebar' });
+      if (typeLabel) bar.appendChild(el('span', { class: 'post-view__type-chip' }, typeLabel));
+      if (entries.length > 1) {
+        const seg = el('div', { class: 'post-view__entry-seg' });
+        entries.forEach((name) => {
+          seg.appendChild(el('button', {
+            class: 'post-view__entry-btn' + (name === shown ? ' is-active' : ''),
+            title: name === ownEntry ? `This post's entrypoint (${name})` : `Open the ${name} entrypoint`,
+            onclick: () => {
+              state.emulatorFeed.viewEntry = name === ownEntry ? null : name;
+              emulatorFeedRerender();
+            },
+          }, name));
+        });
+        bar.appendChild(seg);
+      }
+      content.appendChild(bar);
+    }
+  }
+
+  const expanded = !!(state.emulatorFeed.viewEntry
+    && state.emulatorFeed.viewEntry !== ((activeMock && activeMock.entry) || 'default'));
+  const embed = el('div', { class: 'post-view__embed' + (expanded ? ' post-view__embed--expanded' : '') });
   if (state.farnsworthDev?.available) {
     embed.appendChild(el('iframe', {
       class: 'post-view__embed-iframe',
-      // postId lets a project's harness render the specific mock post the
-      // IDE has selected. Harmless for templates that ignore the param.
-      src: state.farnsworthDev.url + '/?view=post'
-        + (activeMock ? '&postId=' + encodeURIComponent(activeMock.id) : ''),
+      // postId, entry, and postData let a project's harness render the
+      // specific mock post the IDE has selected, as that post's type.
+      src: postViewIframeSrc(activeMock),
       title: 'Live Reddit post preview',
     }));
   }
@@ -5119,7 +5271,9 @@ function renderPostView() {
         ? (state.farnsworthDev && state.farnsworthDev.available
           ? "The preview is live, but this project's Devvit server isn't running, so there's no comment store. Its Go Live script only starts the client preview."
           : 'No dev server is running. Hit Go Live to start the emulator, then comment.')
-        : `Comment store unavailable (${f.error}).`);
+        : (f.error === 'no_post_created' || f.error === 'menu_action_failed' || f.error === 'server_unreachable'
+          ? (f.hint || `The app action didn't create a post (${f.error}).`)
+          : `Comment store unavailable (${f.error}).`));
     comments.appendChild(el('div', { class: 'post-view__comments-error' }, errText));
   }
 
@@ -5157,23 +5311,54 @@ function renderPostView() {
   const more = el('div', { class: 'post-view__more' });
   const moreHead = el('div', { class: 'post-view__more-head' });
   moreHead.appendChild(el('span', {}, others.length ? 'More posts' : 'Mock posts'));
-  moreHead.appendChild(el('button', {
+  const newWrap = el('div', { class: 'post-view__new-wrap' });
+  newWrap.appendChild(el('button', {
     class: 'post-view__more-new',
     disabled: f.busy ? '' : null,
     onclick: async () => {
-      // Strip any trailing "#N" from the source label so a config postName of
-      // "Katsu Curry Run #1" yields "Katsu Curry Run #2", not "... #1 #2".
-      const label = ((lc.postName && lc.postName.trim()) || projectLabel || 'Mock post')
-        .replace(/\s*#\d+\s*$/, '');
-      const n = f.posts.length + 1;
-      await createMockPost(`${label} #${n}`, '');
+      f.typesMenuOpen = !f.typesMenuOpen;
+      emulatorFeedRerender();
+      // Re-read every open so a new preset or menu item shows up immediately.
+      if (f.typesMenuOpen) await loadPostTypes({ force: true });
     },
-  }, f.busy ? 'Working…' : '+ New mock post'));
+  }, f.busy ? 'Working…' : '+ New post ▾'));
+  if (f.typesMenuOpen) {
+    const pt = f.postTypes || { menuItems: [], presets: [], entrypoints: [] };
+    const menu = el('div', { class: 'post-view__types-menu' });
+    const section = (label) => menu.appendChild(el('div', { class: 'post-view__types-section' }, label));
+    const item = (type, sub) => {
+      const b = el('button', { class: 'post-view__types-item', onclick: () => createPostOfType(type) });
+      b.appendChild(el('span', { class: 'post-view__types-label' }, type.label));
+      if (sub) b.appendChild(el('span', { class: 'post-view__types-sub' }, sub));
+      menu.appendChild(b);
+    };
+    if (pt.menuItems && pt.menuItems.length) {
+      section('From the app');
+      pt.menuItems.forEach((m) => item(m, m.description || m.endpoint));
+    }
+    if (pt.presets && pt.presets.length) {
+      section('Post types');
+      pt.presets.forEach((t) => item(t, t.entry && t.entry !== 'default' ? `entry: ${t.entry}` : (t.description || '')));
+    }
+    section('Blank');
+    const blankLabel = ((lc.postName && lc.postName.trim()) || projectLabel || 'Mock post');
+    item({ source: 'blank', label: 'Blank post', title: '' , postData: undefined, entry: undefined }, blankLabel);
+    menu.appendChild(el('button', {
+      class: 'post-view__types-item post-view__types-edit',
+      onclick: async () => {
+        f.typesMenuOpen = false;
+        emulatorFeedRerender();
+        if (pt.configPath && typeof openFileByPath === 'function') await openFileByPath(pt.configPath);
+      },
+    }, 'Edit post types… (.farnsworth/config.json)'));
+    newWrap.appendChild(menu);
+  }
+  moreHead.appendChild(newWrap);
   more.appendChild(moreHead);
   others.forEach((p) => {
     const card = el('div', {
       class: 'post-view__mock-card',
-      onclick: () => { f.activePostId = p.id; emulatorFeedRerender(); },
+      onclick: () => { f.activePostId = p.id; f.viewEntry = null; emulatorFeedRerender(); },
     });
     const meta = el('div', { class: 'post-view__mock-meta' });
     meta.appendChild(el('span', {}, subLabel));
@@ -5182,6 +5367,8 @@ function renderPostView() {
     card.appendChild(meta);
     card.appendChild(el('div', { class: 'post-view__mock-title' }, p.title || '(untitled)'));
     const foot = el('div', { class: 'post-view__mock-foot' });
+    const tl = postTypeLabel(p);
+    if (tl) foot.appendChild(el('span', { class: 'post-view__type-chip' }, tl));
     foot.appendChild(el('span', {}, `${p.score ?? 1} upvote${(p.score ?? 1) === 1 ? '' : 's'}`));
     const n = emulatorCommentsFor(p.id).length;
     foot.appendChild(el('span', {}, `${n} comment${n === 1 ? '' : 's'}`));
@@ -14236,6 +14423,8 @@ async function sendChatMessage(opts) {
           '- The preview metadata URL is authoritative. Never assume Vite is always 5174 or the server is always 3000. Projects that declare package.json.farnsworth.ports receive FARNSWORTH_PORT_<ROLE> values and must bind those exact ports with strict-port behavior.',
           '- Farnsworth injects FARNSWORTH_DEVVIT_RUNNER, DEVVIT_EMULATOR_CONFIG, DEVVIT_EMULATOR_STATE, and VITE_DEVVIT_EMULATOR_CONFIG_JSON. Never hardcode a Farnsworth source-checkout path. The installed app owns where its runner lives.',
           '- The canvas requests /?view=post, /?view=mobile, and /?view=desktop from the project-published preview URL. Post is not routed by devvit.json and Farnsworth does not load dist/client directly.',
+          "- ALWAYS START THE SERVER: if the project has src/server (or any tRPC/Hono/Redis/@devvit/web/server code), its farnsworth:<appType> launcher MUST start FARNSWORTH_DEVVIT_RUNNER alongside the Vite harness and record serverPid, serverPort, serverUrl, and serverLog in the preview metadata. A launcher that only starts Vite is broken even though the preview looks fine: Post View comments, mock posts, post types, and every /api call fail. Check this whenever you open, adapt, or repair a project, and fix the launcher before anything else. Go Live warns with missing_server_runner when it is absent.",
+          "- Post types: Post View's '+ New post' picker discovers them dynamically from (1) devvit.json menu items with /internal/ endpoints, run against the emulator so the app's real submitCustomPost decides entry + postData, (2) .farnsworth/config.json \"postTypes\": [{ id, label, title?, entry?, postData? }] presets, and (3) devvit.json post.entrypoints as an entry toggle. The Post View iframe gets ?view=post&postId=&entry=&mode=inline|expanded&postData=<base64url JSON>. The project's client shim must expose those as context.postId / context.postData, route by entry, send x-farnsworth-post-id on /api requests, and forward requestExpandedMode(event, entry) as window.parent.postMessage({ type: 'devvit:requestExpandedMode', entry }, '*'). When the user asks to add a post type, add a preset to .farnsworth/config.json (or a real menu item if the app should create it).",
           "- Project FARNSWORTH.md files are optional, repository-specific context and may be stale. Farnsworth's built-in guide and live runtime tools are authoritative for IDE architecture.",
           '',
           '## Devvit emulator runtime rules',

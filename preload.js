@@ -34,6 +34,8 @@ contextBridge.exposeInMainWorld('farnsworth', {
   devvitEmulatorState: () => ipcRenderer.invoke('devvit:emulatorState'),
   devvitEmulatorSubmitPost: (payload) => ipcRenderer.invoke('devvit:emulatorSubmitPost', payload),
   devvitEmulatorSubmitComment: (payload) => ipcRenderer.invoke('devvit:emulatorSubmitComment', payload),
+  devvitPostTypes: (repoRoot) => ipcRenderer.invoke('devvit:postTypes', repoRoot),
+  devvitRunMenuAction: (payload) => ipcRenderer.invoke('devvit:runMenuAction', payload),
   // Go Live progress (Aug 5 2026): the boot handler now runs a dependency
   // preflight, so the button needs to say "Installing…" instead of sitting on
   // "Starting…" for a minute on a fresh clone.

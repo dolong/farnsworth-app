@@ -223,6 +223,10 @@ export class RedditAPIClientEmulator {
       isGallery: p.kind === 'gallery',
       isTextPost: !p.kind || p.kind === 'self' || p.kind === 'text',
       isLinkPost: p.kind === 'link',
+      entry: p.entry,
+      postData: p.postData,
+      getPostData: async () => this._posts.get(p.id)?.postData,
+      setPostData: async (data) => this.setPostData(p.id, data),
     };
   }
 
@@ -334,9 +338,37 @@ export class RedditAPIClientEmulator {
     return this._wrapPost(post);
   }
 
-  async submitCustomPost(options) {
-    // Phase 1: same shape as submitPost — experience post metadata ignored
-    return this.submitPost(options);
+  async submitCustomPost(options = {}) {
+    // A custom (interactive) post is where a Devvit app's "post types" live:
+    // the entrypoint it opens with (`entry`, a key of devvit.json
+    // post.entrypoints) and the `postData` the client reads back from
+    // context.postData. Both are recorded so Farnsworth's Post View can show
+    // and reopen each post exactly as the app created it.
+    const wrapped = await this.submitPost(options);
+    const post = this._posts.get(wrapped.id);
+    if (post) {
+      post.kind = 'custom';
+      post.entry = typeof options.entry === 'string' && options.entry ? options.entry : 'default';
+      if (options.postData !== undefined) post.postData = options.postData;
+      // Farnsworth-only label for the IDE's type badge. Never read by app code.
+      if (typeof options.farnsworthPostType === 'string' && options.farnsworthPostType) {
+        post.farnsworthPostType = options.farnsworthPostType;
+      }
+      this._schedulePersist();
+    }
+    return post ? this._wrapPost(post) : wrapped;
+  }
+
+  async getPostData(postId) {
+    const p = this._posts.get(postId);
+    return p ? p.postData : undefined;
+  }
+
+  async setPostData(postId, postData) {
+    const p = this._posts.get(postId);
+    if (!p) throw new Error(`devvit-emulator: no post ${postId}`);
+    p.postData = postData;
+    this._schedulePersist();
   }
 
   async getPostsByUser(options) {

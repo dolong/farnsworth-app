@@ -1319,7 +1319,12 @@ async function resolveEmulatorAdminBase() {
   let meta = null;
   try { meta = JSON.parse(await fs.readFile(metaPath, 'utf8')); } catch {}
   if (!meta) return { ok: false, error: 'no_dev_metadata' };
-  const serverPort = Number(meta.serverPort || 3000);
+  // serverPort, else the port in serverUrl, else the legacy default. Launchers
+  // that bind a non-default server port (dontdie uses 3001) only publish it
+  // inside serverUrl, and guessing 3000 there pointed at the wrong admin port.
+  let urlPort = null;
+  try { if (meta.serverUrl) urlPort = Number(new URL(meta.serverUrl).port) || null; } catch {}
+  const serverPort = Number(meta.serverPort || urlPort || 3000);
   const adminPort = Number(process.env.DEVVIT_EMULATOR_ADMIN_PORT || serverPort + 100);
   return { ok: true, base: `http://127.0.0.1:${adminPort}`, adminPort, serverPort, repoRoot: meta.repoRoot || null };
 }
@@ -1362,6 +1367,113 @@ ipcMain.handle('devvit:emulatorState', async () => emulatorAdminRequest('/emulat
 
 ipcMain.handle('devvit:emulatorSubmitPost', async (_event, payload = {}) =>
   emulatorAdminRequest('/emulator/post', { method: 'POST', body: payload, timeoutMs: 5000 }));
+
+// ---- Post types (Oct 8) ------------------------------------------------
+// A Devvit app can create several kinds of custom post: different entrypoints
+// and different postData. Farnsworth discovers them from the project itself
+// every time the picker opens, so nothing is hardcoded per game:
+//   1. App actions: devvit.json menu items whose endpoint creates a post. Run
+//      against the emulator-backed server, they execute the app's REAL
+//      submitCustomPost code, so the resulting post carries whatever entry
+//      and postData the app chooses.
+//   2. Presets: .farnsworth/config.json "postTypes", for kinds no menu item
+//      reaches (scheduled daily posts, challenge posts, etc.):
+//        { "id": "daily", "label": "Daily run", "title": "Daily Run #12",
+//          "entry": "default", "postData": { "mode": "daily" } }
+//   3. Entrypoints: every devvit.json post.entrypoints key, so a bare post can
+//      be opened straight into any entry.
+async function readJsonSafe(p) {
+  try { return JSON.parse(await fs.readFile(p, 'utf8')); } catch { return null; }
+}
+
+ipcMain.handle('devvit:postTypes', async (_event, repoRoot) => {
+  if (!repoRoot || typeof repoRoot !== 'string') return { ok: false, error: 'no_workspace' };
+  const devvitJson = await readJsonSafe(path.join(repoRoot, 'devvit.json'));
+  const fwConfig = await readJsonSafe(path.join(repoRoot, '.farnsworth', 'config.json'));
+  const entrypoints = Object.keys(devvitJson?.post?.entrypoints || {});
+  const menuItems = (Array.isArray(devvitJson?.menu?.items) ? devvitJson.menu.items : [])
+    .filter((m) => m && typeof m.endpoint === 'string' && m.endpoint.startsWith('/internal/'))
+    .filter((m) => {
+      const loc = Array.isArray(m.location) ? m.location : [m.location];
+      return loc.includes('subreddit');
+    })
+    .map((m) => ({
+      source: 'menu',
+      id: 'menu:' + m.endpoint,
+      label: String(m.label || m.endpoint),
+      description: m.description ? String(m.description) : '',
+      endpoint: m.endpoint,
+      forUserType: m.forUserType || null,
+    }));
+  const presets = (Array.isArray(fwConfig?.postTypes) ? fwConfig.postTypes : [])
+    .filter((t) => t && (t.id || t.label))
+    .map((t, i) => ({
+      source: 'preset',
+      id: 'preset:' + String(t.id || i),
+      label: String(t.label || t.id),
+      description: t.description ? String(t.description) : '',
+      title: t.title ? String(t.title) : '',
+      entry: t.entry ? String(t.entry) : 'default',
+      postData: t.postData,
+      postType: String(t.label || t.id),
+    }));
+  return {
+    ok: true,
+    entrypoints,
+    menuItems,
+    presets,
+    configPath: path.join(repoRoot, '.farnsworth', 'config.json'),
+    hasDevvitJson: !!devvitJson,
+  };
+});
+
+// Run one of the app's own menu endpoints against the emulator-backed server.
+// The body mirrors the shape Devvit sends a subreddit-scoped menu action.
+ipcMain.handle('devvit:runMenuAction', async (_event, payload = {}) => {
+  const endpoint = String(payload.endpoint || '');
+  if (!endpoint.startsWith('/internal/')) return { ok: false, error: 'bad_endpoint' };
+  const resolved = await resolveEmulatorAdminBase();
+  if (!resolved.ok) return resolved;
+  const before = await emulatorAdminRequest('/emulator/state');
+  const beforeIds = new Set(((before && before.posts) || []).map((p) => p.id));
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10000);
+  let status = 0;
+  let json = null;
+  try {
+    const res = await fetch(`http://127.0.0.1:${resolved.serverPort}${endpoint}`, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ location: 'subreddit', targetId: 't5_emulator' }),
+    });
+    status = res.status;
+    const text = await res.text();
+    try { json = text ? JSON.parse(text) : null; } catch {}
+  } catch (e) {
+    return {
+      ok: false,
+      error: 'server_unreachable',
+      detail: e?.name === 'AbortError' ? 'timeout' : String(e?.message || e),
+      hint: "The project's Devvit server isn't answering. Restart Go Live; the launcher must start the server-runner.",
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+  const after = await emulatorAdminRequest('/emulator/state');
+  const created = ((after && after.posts) || []).filter((p) => !beforeIds.has(p.id));
+  created.sort((a, b) => (b.createdUtc || 0) - (a.createdUtc || 0));
+  if (status >= 400 || !created.length) {
+    return {
+      ok: false,
+      error: status >= 400 ? 'menu_action_failed' : 'no_post_created',
+      status,
+      response: json,
+      hint: json && json.showToast ? String(json.showToast) : null,
+    };
+  }
+  return { ok: true, id: created[0].id, createdIds: created.map((p) => p.id), response: json };
+});
 
 ipcMain.handle('devvit:emulatorSubmitComment', async (_event, payload = {}) =>
   emulatorAdminRequest('/emulator/comment', { method: 'POST', body: payload, timeoutMs: 5000 }));
@@ -2106,7 +2218,16 @@ ipcMain.handle('dev:farnsworth:boot', async (_event, appType = 'devvit', repoRoo
           metaPath,
           repoRoot,
         });
-        resolve({ ok: true, type, url: meta.url, pid: meta.pid, startedAt: meta.startedAt });
+        // A project with server code needs its server-runner. Launchers
+        // copied from older templates start only the Vite client, which
+        // previews fine but silently breaks comments, mock posts, post types,
+        // and every /api call. Say so at Go Live instead of later.
+        let warning = null;
+        if (type === 'devvit' && !meta.serverPid
+          && fs.existsSync(path.join(repoRoot, 'src', 'server'))) {
+          warning = 'missing_server_runner';
+        }
+        resolve({ ok: true, type, url: meta.url, pid: meta.pid, startedAt: meta.startedAt, warning });
       } catch {
         resolve({ ok: true, type, url: `http://localhost:5174` });
       }

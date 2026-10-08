@@ -7889,3 +7889,52 @@ body.density-compact .msg__body { font-size: 12.5px; }
 .provider-model-toggle.is-on { background: var(--accent-blurple); }
 .provider-model-toggle.is-on i { transform: translateX(14px); background: #fff; }
 .provider-model-toggle:disabled { cursor: not-allowed; opacity: .38; }
+
+/* Post types (Oct 8): type chip, entrypoint toggle, and the New post picker */
+.post-view__typebar {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin: 2px 0 6px;
+}
+.post-view__type-chip {
+  display: inline-flex; align-items: center;
+  font-size: 11px; font-weight: 600;
+  color: #d7dadc;
+  background: #272729;
+  border-radius: 999px;
+  padding: 2px 8px;
+}
+.post-view__entry-seg {
+  display: inline-flex; gap: 2px;
+  background: #1a1a1b; border: 1px solid #343536;
+  border-radius: 999px; padding: 2px;
+}
+.post-view__entry-btn {
+  border: 0; background: transparent; color: #818384;
+  font-size: 11px; font-weight: 600;
+  padding: 2px 10px; border-radius: 999px; cursor: pointer;
+}
+.post-view__entry-btn.is-active { background: #343536; color: #fff; }
+.post-view__embed--expanded { aspect-ratio: 9 / 16; max-height: 78vh; }
+.post-view__new-wrap { position: relative; }
+.post-view__types-menu {
+  position: absolute; right: 0; top: calc(100% + 6px); z-index: 20;
+  min-width: 240px; max-width: 320px;
+  background: #1a1a1b; border: 1px solid #343536; border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+  padding: 6px; display: flex; flex-direction: column; gap: 2px;
+  text-transform: none; letter-spacing: 0;
+}
+.post-view__types-section {
+  font-size: 10.5px; font-weight: 700; color: #818384;
+  text-transform: uppercase; letter-spacing: 0.04em;
+  padding: 6px 8px 2px;
+}
+.post-view__types-item {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 1px;
+  border: 0; background: transparent; color: #d7dadc;
+  text-align: left; padding: 6px 8px; border-radius: 6px; cursor: pointer;
+}
+.post-view__types-item:hover { background: #272729; }
+.post-view__types-label { font-size: 13px; font-weight: 600; }
+.post-view__types-sub { font-size: 11px; color: #818384; font-weight: 400; }
+.post-view__types-edit { font-size: 11.5px; color: #4f9cff; border-top: 1px solid #272729; margin-top: 4px; border-radius: 0 0 6px 6px; }

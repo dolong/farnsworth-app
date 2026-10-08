@@ -35,7 +35,8 @@
 
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, resolve as pathResolve } from 'node:path';
-import { writeFileSync, readFileSync } from 'node:fs';
+import { writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -49,7 +50,31 @@ if (!repoRoot) {
 
 // Resolve esbuild from the user's project node_modules (it's a Devvit
 // transitive dep). Farnsworth's own project doesn't ship esbuild.
-const esbuildPath = pathResolve(repoRoot, 'node_modules/esbuild/lib/main.js');
+// Oct 8: newer projects (Devvit 0.13 + Vite 8, which bundles with rolldown)
+// no longer hoist esbuild to the top level; it only exists nested under
+// @devvit/build-pack. Look in the usual places before giving up, so Go Live
+// doesn't silently lose the server on every new project.
+function findEsbuild() {
+  const candidates = [
+    pathResolve(repoRoot, 'node_modules/esbuild/lib/main.js'),
+    pathResolve(repoRoot, 'node_modules/@devvit/build-pack/node_modules/esbuild/lib/main.js'),
+    pathResolve(repoRoot, 'node_modules/@devvit/start/node_modules/esbuild/lib/main.js'),
+    pathResolve(repoRoot, 'node_modules/vite/node_modules/esbuild/lib/main.js'),
+    pathResolve(repoRoot, 'node_modules/tsx/node_modules/esbuild/lib/main.js'),
+    pathResolve(__dirname, '..', 'node_modules/esbuild/lib/main.js'),
+  ];
+  for (const c of candidates) if (existsSync(c)) return c;
+  try {
+    const req = createRequire(pathResolve(repoRoot, 'package.json'));
+    return req.resolve('esbuild');
+  } catch {}
+  return null;
+}
+const esbuildPath = findEsbuild();
+if (!esbuildPath) {
+  console.error('[server-runner] FATAL: esbuild not found in ' + repoRoot + '/node_modules (checked top-level and nested Devvit/Vite copies). Run npm install, or add esbuild as a devDependency.');
+  process.exit(1);
+}
 const { build } = await import(pathToFileURL(esbuildPath).href);
 
 // Entry override: default is the Devvit production entry (src/server/index.ts),
@@ -161,6 +186,7 @@ ${stripImports(redditEmulatorSource)}
 import { createServer as _nodeHttpCreateServer } from 'node:http';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { AsyncLocalStorage } from 'node:async_hooks';
 
 const _seed = ${se};
 const _redis = new RedisClientEmulator('INSTALLATION', _seed.statePath, null);
@@ -178,9 +204,30 @@ const _ctx = {
   appName: 'devvit-emulator',
   appVersion: '0.0.0',
 };
+// Per-request post context. Real Devvit gives every request the context of
+// the post it came from (context.postId / context.postData). The preview
+// harness identifies the post with an x-farnsworth-post-id header, and each
+// request runs inside its own AsyncLocalStorage store so concurrent requests
+// from different mock posts never see each other's post.
+const _reqCtx = new AsyncLocalStorage();
 const context = new Proxy(_ctx, {
+  get(t, k) {
+    const store = _reqCtx.getStore();
+    if (store && Object.prototype.hasOwnProperty.call(store, k)) return store[k];
+    return t[k];
+  },
   set() { throw new Error('devvit-emulator: context is read-only'); },
 });
+function _withPostContext(listener) {
+  if (typeof listener !== 'function') return listener;
+  return (req, res) => {
+    const h = req.headers || {};
+    const postId = h['x-farnsworth-post-id'] || h['devvit-post-id'];
+    if (!postId) return listener(req, res);
+    const p = _reddit._posts.get(String(postId));
+    return _reqCtx.run({ postId: String(postId), postData: p ? p.postData : undefined }, () => listener(req, res));
+  };
+}
 
 // Inline @hono/node-server adapter — small enough to drop in directly,
 // avoids the external module dependency during bundling.
@@ -208,7 +255,7 @@ function createServer(serverOptions, listener) {
   // The listener is already a pre-built Node-style request listener that
   // wraps the Hono app's fetch handler. We just create an http.Server with
   // serverOptions + listener.
-  return _nodeHttpCreateServer(serverOptions || {}, listener);
+  return _nodeHttpCreateServer(serverOptions || {}, _withPostContext(listener));
 }
 function getServerPort() {
   return ${port};
@@ -255,11 +302,22 @@ const _adminServer = _nodeHttpCreateServer(async (req, res) => {
       if (!b.title || !String(b.title).trim()) {
         return _adminSend(res, 400, { ok: false, error: 'title_required' });
       }
-      const p = await _reddit.submitPost({
-        title: String(b.title),
-        text: b.body ? String(b.body) : undefined,
-        subredditName: b.subredditName || undefined,
-      });
+      // A post with an entry, postData, or type label is a custom post, the
+      // same thing the app's own submitCustomPost would create.
+      const isCustom = b.entry || b.postData !== undefined || b.postType;
+      const p = isCustom
+        ? await _reddit.submitCustomPost({
+          title: String(b.title),
+          subredditName: b.subredditName || undefined,
+          entry: b.entry ? String(b.entry) : undefined,
+          postData: b.postData,
+          farnsworthPostType: b.postType ? String(b.postType) : undefined,
+        })
+        : await _reddit.submitPost({
+          title: String(b.title),
+          text: b.body ? String(b.body) : undefined,
+          subredditName: b.subredditName || undefined,
+        });
       return _adminSend(res, 200, { ok: true, id: p.id, post: _reddit.adminSnapshot().posts.find((x) => x.id === p.id) || null });
     }
     if (u.pathname === '/emulator/comment' && req.method === 'POST') {
