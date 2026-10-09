@@ -200,7 +200,10 @@ const _reddit = new RedditAPIClientEmulator({
 const _ctx = {
   subredditName: _seed.currentSubredditName,
   postId: undefined,
-  userId: 'dev-user',
+  // Each emulator user gets their own identity, like real Devvit: the selected
+  // user's seeded t2_ id and bare username (not a shared 'dev-user').
+  userId: ((_seed.seedUsers.find((u) => u.username === _seed.currentUsername) || {}).id || ('t2_' + String(_seed.currentUsername || 'dev-user').split('u/').pop())),
+  username: String(_seed.currentUsername || 'dev-user').split('u/').pop(),
   appName: 'devvit-emulator',
   appVersion: '0.0.0',
 };

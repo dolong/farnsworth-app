@@ -429,7 +429,7 @@ export class RedisClientEmulator {
 
   _sortedSet(entry) {
     if (!entry || entry.type !== 'zset') return [];
-    return [...entry.value].sort((a, b) => a.score - b.score || a.member.localeCompare(b.member));
+    return [...entry.value].sort((a, b) => a.score - b.score || (a.member < b.member ? -1 : a.member > b.member ? 1 : 0));
   }
 
   async zAdd(key, ...members) {
@@ -460,15 +460,66 @@ export class RedisClientEmulator {
   }
 
   async zRange(key, start, stop, options) {
+    // Real ZRANGE semantics: rank (default), BYSCORE, BYLEX, REV, LIMIT.
+    // Bounds/limit behavior mirrors @devvit/redis's own RedisMock.
     const entry = this._ensureFresh(this._key(key));
     const sorted = this._sortedSet(entry);
-    if (options?.reverse) sorted.reverse();
-    const len = sorted.length;
-    const s = typeof start === 'string' ? parseInt(start, 10) : start;
-    const e = typeof stop === 'string' ? parseInt(stop, 10) : stop;
-    const normStart = s < 0 ? Math.max(len + s, 0) : s;
-    const normEnd = e < 0 ? len + e : Math.min(e, len - 1);
-    return sorted.slice(normStart, normEnd + 1).map((x) => ({ member: x.member, score: x.score }));
+    const by = options?.by || 'rank';
+    const rev = !!options?.reverse;
+    const limit = options?.limit;
+    if (limit && by === 'rank') {
+      throw new Error("zRange parsing error: 'limit' only allowed when 'options.by' is 'lex' or 'score'");
+    }
+    const pick = (x) => ({ member: x.member, score: x.score });
+    if (by === 'rank') {
+      if (rev) sorted.reverse();
+      const len = sorted.length;
+      const s = typeof start === 'string' ? parseInt(start, 10) : start;
+      const e = typeof stop === 'string' ? parseInt(stop, 10) : stop;
+      const normStart = s < 0 ? Math.max(len + s, 0) : s;
+      const normEnd = e < 0 ? len + e : Math.min(e, len - 1);
+      return sorted.slice(normStart, normEnd + 1).map(pick);
+    }
+    // BYSCORE bounds are always (min, max); a reversed BYLEX range is (max, min).
+    const lexRev = rev && by === 'lex';
+    const lo = lexRev ? stop : start;
+    const hi = lexRev ? start : stop;
+    let inRange;
+    if (by === 'score') {
+      const bound = (v) => {
+        if (typeof v === 'number') return { v, ex: false };
+        const str = String(v).trim();
+        const ex = str.startsWith('(');
+        const t = ex ? str.slice(1) : str;
+        if (/^-inf$/i.test(t)) return { v: -Infinity, ex };
+        if (/^\+?inf$/i.test(t)) return { v: Infinity, ex };
+        return { v: parseFloat(t), ex };
+      };
+      const a = bound(lo);
+      const b = bound(hi);
+      inRange = (x) => (a.ex ? x.score > a.v : x.score >= a.v) && (b.ex ? x.score < b.v : x.score <= b.v);
+    } else {
+      const bound = (v) => {
+        const str = String(v);
+        if (str === '-') return { min: true };
+        if (str === '+') return { max: true };
+        if (str.startsWith('(')) return { s: str.slice(1), ex: true };
+        if (str.startsWith('[')) return { s: str.slice(1), ex: false };
+        return { s: str, ex: false };
+      };
+      const a = bound(lo);
+      const b = bound(hi);
+      const geA = (m) => a.min || (!a.max && (a.ex ? m > a.s : m >= a.s));
+      const leB = (m) => b.max || (!b.min && (b.ex ? m < b.s : m <= b.s));
+      inRange = (x) => geA(x.member) && leB(x.member);
+    }
+    let out = sorted.filter(inRange);
+    if (rev) out.reverse();
+    // Devvit sends offset 0 / count 1000 when no limit is given.
+    const offset = limit ? limit.offset : 0;
+    const count = limit ? limit.count : 1000;
+    out = count < 0 ? out.slice(offset) : out.slice(offset, offset + count);
+    return out.map(pick);
   }
 
   async zRem(key, members) {
@@ -487,7 +538,8 @@ export class RedisClientEmulator {
 
   async zRemRangeByLex(key, min, max) {
     // Simplified: assume standard lexicographic range with [ or ( prefix
-    const entry = this._ensureFresh(this._key(key));
+    const fullKey = this._key(key);
+    const entry = this._ensureFresh(fullKey);
     if (!entry || entry.type !== 'zset') return 0;
     const minInclusive = min.startsWith('[');
     const maxInclusive = max.startsWith('[');
@@ -507,7 +559,8 @@ export class RedisClientEmulator {
   }
 
   async zRemRangeByRank(key, start, stop) {
-    const entry = this._ensureFresh(this._key(key));
+    const fullKey = this._key(key);
+    const entry = this._ensureFresh(fullKey);
     if (!entry || entry.type !== 'zset') return 0;
     const sorted = this._sortedSet(entry);
     const len = sorted.length;
@@ -524,10 +577,11 @@ export class RedisClientEmulator {
   }
 
   async zRemRangeByScore(key, min, max) {
-    const entry = this._ensureFresh(this._key(key));
+    const fullKey = this._key(key);
+    const entry = this._ensureFresh(fullKey);
     if (!entry || entry.type !== 'zset') return 0;
     const before = entry.value.length;
-    entry.value = entry.value.filter((x) => x.score >= min && x.score <= max);
+    entry.value = entry.value.filter((x) => !(x.score >= min && x.score <= max));
     const removed = before - entry.value.length;
     if (entry.value.length === 0) this._store.delete(fullKey);
     else this._store.set(fullKey, entry);
