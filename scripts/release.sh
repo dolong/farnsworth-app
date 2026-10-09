@@ -42,7 +42,7 @@ say()  { printf '%s\n' "$*" | tee -a "$LOG"; }
 ok()   { step=$((step+1)); printf '  [%02d] OK    %s\n' "$step" "$*" | tee -a "$LOG"; }
 info() { printf '             %s\n' "$*" | tee -a "$LOG"; }
 die()  { printf '\n  FAIL  %s\n  log:  %s\n' "$*" "$LOG" | tee -a "$LOG"; exit 1; }
-run()  { echo "+ $*" >> "$LOG"; "$@" >> "$LOG" 2>&1; }
+run()  { local c="$*"; [ -n "${TOKEN:-}" ] && c="${c//$TOKEN/***}"; echo "+ $c" >> "$LOG"; "$@" 2>&1 | { if [ -n "${TOKEN:-}" ]; then sed "s#$TOKEN#***#g"; else cat; fi; } >> "$LOG"; return ${PIPESTATUS[0]}; }
 
 say "=== Farnsworth release ==="
 say "log: $LOG"
