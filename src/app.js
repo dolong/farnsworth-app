@@ -2135,6 +2135,9 @@ function syncCanvasViewBounds() {
   if (!window.farnsworth?.canvasUpdateViewBounds) return;
   const vpEl = document.getElementById('canvas-viewport');
   const vpR = vpEl?.getBoundingClientRect();
+  const barEl = vpEl?.querySelector('.canvas__overlay-bar');
+  const barR = barEl && !barEl.hidden ? barEl.getBoundingClientRect() : null;
+  const barBottom = barR && barR.height > 0 ? Math.round(barR.bottom) + 6 : 0;
   document.querySelectorAll('[data-canvas-view-id]').forEach(el => {
     const viewId = el.dataset.canvasViewId;
     if (!viewId) return;
@@ -2147,6 +2150,10 @@ function syncCanvasViewBounds() {
       right = Math.min(right, Math.round(vpR.right));
       bottom = Math.min(bottom, Math.round(vpR.bottom));
     }
+    // The overlay bar floats over the top of the viewport. A WebContentsView
+    // always composites above DOM, so a tall or scrolled artboard would cover
+    // the mode toggles, Live pill, and user pill. Keep the view below the bar.
+    if (barBottom > y) y = Math.min(barBottom, bottom);
     window.farnsworth.canvasUpdateViewBounds(viewId, {
       x, y, width: Math.max(0, right - x), height: Math.max(0, bottom - y),
     });
@@ -3657,6 +3664,8 @@ function fitOverlayBar() {
   // tiers settle, so a bar that wrapped to two rows reports its real height.
   const vp = document.getElementById('canvas-viewport');
   if (vp) vp.style.setProperty('--fw-overlay-bar-h', bar.offsetHeight + 'px');
+  // The bar's height can change (wrap tier); native views clip to its bottom.
+  syncCanvasViewBounds();
 }
 
 function scheduleOverlayFit() {
