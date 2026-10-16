@@ -17701,4 +17701,147 @@ async function init() {
   wireRelay();
 }
 
-init();
+// ---------------------------------------------------------------------------
+// Express (Oct 16 2026). handleExpressCall answers main's questions only this
+// renderer can (models, folder) and does what only it can (switch folder,
+// stop). A hidden lane (index.html?expressAgent=1) skips init() and runs
+// delegated chat tasks through the same sendChatMessage loop the composer
+// uses, continuing an existing conversation or starting an [Express] one.
+// ---------------------------------------------------------------------------
+async function handleExpressCall(msg) {
+  const api = window.farnsworth;
+  const reply = (ok, result, error) => api?.expressReply?.({ id: msg?.id, ok, result, error }).catch(() => {});
+  try {
+    const args = msg?.args || {};
+    let result = null;
+    if (msg?.method === 'models') {
+      result = {
+        models: getAllModelOptions().map((m) => ({ id: m.display, label: m.display, desc: m.desc || '', effort: m.effort || null })),
+        current: state.settings?.defaultModel || null,
+      };
+    } else if (msg?.method === 'folder') {
+      result = { folder: state.folder || null };
+    } else if (msg?.method === 'switchFolder') {
+      await handleFolderPicked(String(args.path || ''));
+      result = { folder: state.folder || null };
+    } else if (msg?.method === 'stop') {
+      await stopChatTurn();
+      result = { ok: true };
+    } else {
+      return reply(false, null, { code: 'unknown_method', message: `Unknown method ${msg?.method}` });
+    }
+    reply(true, result);
+  } catch (error) {
+    reply(false, null, { code: 'renderer_error', message: String(error?.message || error) });
+  }
+}
+
+function expressUsageFrom(messages) {
+  try {
+    const agents = (messages || []).filter((m) => m.role === 'agent');
+    for (let i = agents.length - 1; i >= 0; i--) {
+      const chips = agents[i].chips || [];
+      for (let j = chips.length - 1; j >= 0; j--) {
+        const m = /^([\d,]+)\s*→\s*([\d,]+)\s*tok(?:\s*\(([\d,]+) cached\))?$/.exec(chips[j].label || '');
+        if (!m) continue;
+        return {
+          inputTokens: parseInt(m[1].replace(/,/g, ''), 10) || 0,
+          outputTokens: parseInt(m[2].replace(/,/g, ''), 10) || 0,
+          cachedTokens: m[3] ? (parseInt(m[3].replace(/,/g, ''), 10) || 0) : 0,
+        };
+      }
+    }
+  } catch {}
+  return null;
+}
+
+async function runExpressOffer(offer) {
+  const api = window.farnsworth;
+  const accepted = await api.expressAgentAccept(offer?.id);
+  if (!accepted?.ok) return;
+  const task = accepted.task;
+  const previousModel = state.settings?.defaultModel;
+  let progressTimer = null;
+  let lastSig = '';
+  try {
+    state.folder = task.folder || null;
+    await api?.setActiveWorkspace?.(state.folder);
+    if (task.model) state.settings.defaultModel = task.model;
+    if (task.conversationId) {
+      const conv = await api.chatConvLoad(task.conversationId);
+      if (!conv) throw new Error(`Conversation ${task.conversationId} not found`);
+      state.chatActiveId = conv.id;
+      state.chatMessages = Array.isArray(conv.messages) ? conv.messages : [];
+      if (conv.title) state.chatGeneratedTitles[conv.id] = conv.title;
+    } else {
+      const title = `[Express] ${task.title}`;
+      const created = await api.chatConvCreate({ id: `express-${task.id}`, title, messages: [] });
+      state.chatActiveId = created.id;
+      state.chatMessages = [];
+      state.chatGeneratedTitles[created.id] = title;
+    }
+    state.memoryLoadedForConv = null;
+    state.memoryInjectedSlugs = new Set();
+    await api.expressAgentStarted({ taskId: task.id, conversationId: state.chatActiveId });
+    progressTimer = setInterval(() => {
+      try {
+        const last = [...(state.chatMessages || [])].reverse().find((m) => m.role === 'agent');
+        if (!last) return;
+        const tools = (last.chips || []).map((c) => ({ label: c.label || '', kind: c.kind || '' }));
+        const sig = `${(last.text || '').length}|${last.workingLabel || ''}|${tools.length}`;
+        if (sig === lastSig) return;
+        lastSig = sig;
+        api.expressAgentProgress({ taskId: task.id, text: last.text || '', working: last.working ? (last.workingLabel || 'Working') : null, tools }).catch(() => {});
+      } catch {}
+    }, 1500);
+    await sendChatMessage({ text: task.text });
+    clearInterval(progressTimer); progressTimer = null;
+    await saveActiveConversation();
+    const persisted = await api.chatConvLoad(state.chatActiveId);
+    const messages = Array.isArray(persisted?.messages) ? persisted.messages : [];
+    if (!persisted || messages.length < 2) throw new Error('Express conversation did not persist');
+    const finalAgent = [...messages].reverse().find((m) => m.role === 'agent' && !m.working);
+    const status = finalAgent?.stopped ? 'stopped' : (!!finalAgent && !finalAgent.error ? 'succeeded' : 'failed');
+    await api.expressAgentComplete({
+      taskId: task.id,
+      status,
+      conversationId: state.chatActiveId,
+      resultText: finalAgent?.text || '',
+      error: status === 'failed' ? (finalAgent?.text || 'Agent turn failed') : null,
+      model: state.settings?.defaultModel || null,
+      usage: expressUsageFrom(messages),
+    });
+  } catch (error) {
+    if (progressTimer) clearInterval(progressTimer);
+    await api.expressAgentComplete({
+      taskId: task.id,
+      status: 'failed',
+      conversationId: state.chatActiveId || null,
+      error: String(error?.message || error),
+      model: state.settings?.defaultModel || null,
+    }).catch(() => {});
+  } finally {
+    if (state.settings) state.settings.defaultModel = previousModel;
+    state.folder = null;
+    api?.setActiveWorkspace?.(null).catch(() => {});
+  }
+}
+
+async function initExpressAgent() {
+  document.documentElement.dataset.expressAgent = 'true';
+  document.body.style.display = 'none';
+  await loadSettings();
+  await detectAuth();
+  let running = false;
+  window.farnsworth?.onExpressOffer?.(async (offer) => {
+    if (running || isChatTurnActive()) return;
+    running = true;
+    try { await runExpressOffer(offer); } finally { running = false; }
+  });
+  await window.farnsworth?.expressAgentReady?.();
+}
+
+window.farnsworth?.onExpressCall?.(handleExpressCall);
+const IS_EXPRESS_LANE = new URLSearchParams(location.search).get('expressAgent') === '1';
+if (IS_EXPRESS_LANE) initExpressAgent();
+else init();

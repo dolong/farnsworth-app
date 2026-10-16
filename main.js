@@ -103,6 +103,21 @@ function scopedSettingKey(key) {
 // describes only whichever opened a folder last, so every agent action in the
 // other window ran in the wrong repo. The renderer announces its folder on
 // every open/close via workspace:setActive; main keys it by webContents id.
+// Express (Oct 16 2026): background chat lanes. Each lane is one hidden
+// renderer running the real sendChatMessage loop for a task the Express hub
+// delegated. Farnsworth has no scheduler, so the pool is Express-only and
+// lazy: no lane exists until a task arrives, idle lanes close after 10 min.
+// scheduler-lanes.js + conversation-transcript.js are copied from Citadel;
+// express-control.js + express-bridge.js are identical copies of
+// dolong/express hub/lib/.
+const { createChatTurnRegistry, createSchedulerLanePool } = require('./scheduler-lanes');
+const { buildTranscript } = require('./conversation-transcript');
+const { createControlServer } = require('./express-control');
+const { createExpressBridge, createRendererCaller } = require('./express-bridge');
+const expressLanes = createSchedulerLanePool({ maxLanes: 2 });
+const expressTurns = createChatTurnRegistry({ maxConcurrent: 2, uuid: () => crypto.randomUUID() });
+function isExpressLaneWindow(win) { return !!win && !!expressLanes.byWindow(win); }
+
 const windowWorkspaces = new Map(); // webContents.id -> folder path
 
 // The folder for the window that made THIS request. Falls back to the global
@@ -117,6 +132,7 @@ ipcMain.handle('workspace:setActive', async (event, folder) => {
   const id = event && event.sender ? event.sender.id : null;
   if (id == null) return { ok: false, error: 'no_sender' };
   if (folder) windowWorkspaces.set(id, folder);
+  else if (expressLanes.byWebContents(id) || expressLanes.byWindow(BrowserWindow.fromWebContents(event.sender))) windowWorkspaces.set(id, null);
   else windowWorkspaces.delete(id);
   return { ok: true };
 });
@@ -1039,7 +1055,7 @@ function createWindow({ fresh = false } = {}) {
       // meant closing any one window killed every other open window with it,
       // which made multi-window unusable the moment you used it.
       const others = BrowserWindow.getAllWindows()
-        .filter((w) => w !== win && !w.isDestroyed());
+        .filter((w) => w !== win && !w.isDestroyed() && !isExpressLaneWindow(w));
       if (others.length === 0) app.quit();
       else { try { win.destroy(); } catch { /* already gone */ } }
     }
@@ -10166,8 +10182,9 @@ app.whenReady().then(async () => {
   // Dock via LaunchServices, so hiding Electron's Dock icon doesn't
   // change the visual outcome but does break focus/activation. Keep
   // the Dock icon visible so Dock clicks can activate the window.
+  startExpressControl();
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    if (BrowserWindow.getAllWindows().filter((w) => !w.isDestroyed() && !isExpressLaneWindow(w)).length === 0) createWindow();
   });
 });
 
@@ -11185,6 +11202,7 @@ ipcMain.handle('account:unpair', async () => {
 
 // Relay IPC: renderer → main → relay
 ipcMain.handle('relay:send', async (_event, msg) => {
+  if (_event && expressLanes.byWebContents(_event.sender.id)) return { ok: true, skipped: 'express_lane' };
   const rc = getRelayClient();
   return rc.send(msg);
 });
@@ -11547,4 +11565,129 @@ ipcMain.handle('credential:deleteSecret', async (_event, { service, account } = 
   } catch (e) {
     return { ok: false, error: e.message || 'delete_failed' };
   }
+});
+
+
+// ============================================================================
+// Express control (Oct 16 2026) -- see the lane note near windowWorkspaces.
+// ============================================================================
+const EXPRESS_LANE_IDLE_MS = 10 * 60 * 1000;
+let expressControl = null;
+let expressBridge = null;
+let expressReaper = null;
+const expressRenderer = createRendererCaller();
+
+function expressTick() {
+  try { expressBridge && expressBridge.tick(); } catch (e) { console.warn('[express] tick failed:', e.message); }
+}
+
+function createExpressLaneWindow() {
+  const lane = expressLanes.create(null);
+  if (!lane) return null;
+  const win = new BrowserWindow({
+    width: 1000, height: 800, show: false, backgroundColor: '#1e1f22',
+    webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: false, webviewTag: false },
+  });
+  lane.win = win;
+  const laneWebContentsId = win.webContents.id;
+  win.loadFile(path.join(__dirname, 'index.html'), { query: { expressAgent: '1' } });
+  win.on('closed', () => {
+    lane.ready = false;
+    try { expressBridge && expressBridge.laneClosed(lane); } catch {}
+    expressLanes.clearLane(lane);
+    expressTurns.release(null, laneWebContentsId);
+    expressLanes.remove(lane.id);
+    setTimeout(expressTick, 100);
+  });
+  return lane;
+}
+
+function acquireExpressLane() {
+  const free = expressLanes.freeLane();
+  if (free) return free;
+  // A lane still booting with no work is already "ours" for the next task.
+  const booting = expressLanes.list().find((lane) => !lane.ready && !lane.offer && !lane.run);
+  if (booting) return booting;
+  if (!expressLanes.canGrow()) return null;
+  return createExpressLaneWindow();
+}
+
+function sendExpressOffer(lane) {
+  if (!lane || !lane.offer || !lane.ready || !lane.win || lane.win.isDestroyed()) return false;
+  try { lane.win.webContents.send('express:agent:offer', { ...lane.offer }); return true; } catch { return false; }
+}
+
+function expressOpenFolders() {
+  const folders = new Set();
+  for (const [id, folder] of windowWorkspaces) {
+    if (!folder || expressLanes.byWebContents(id)) continue;
+    folders.add(folder);
+  }
+  return folders;
+}
+
+function expressReadConversation(input = {}) {
+  const convId = String(input.conversationId || '').trim();
+  if (!convId) return { ok: false, error: 'bad_input', message: 'Provide conversationId.' };
+  const conversation = db.getConversation(convId);
+  if (!conversation) return { ok: false, error: 'not_found', message: `No conversation with id ${convId}.` };
+  try { return buildTranscript({ conversation, run: null, options: input }); }
+  catch (error) { return { ok: false, error: 'read_failed', message: String(error?.message || error) }; }
+}
+
+function startExpressControl() {
+  if (expressControl) return;
+  try {
+    expressControl = createControlServer({ app: 'farnsworth', version: app.getVersion() });
+    expressBridge = createExpressBridge({
+      app: 'farnsworth',
+      rawDb: () => db.getRawDb(),
+      readConversation: expressReadConversation,
+      recentFolders: (limit) => db.getRecentFolders(limit),
+      openFolders: expressOpenFolders,
+      callMainRenderer: (method, args) => expressRenderer.call(mainWindow && !mainWindow.isDestroyed() ? mainWindow : null, method, args),
+      callRenderer: (win, method, args) => expressRenderer.call(win, method, args),
+      lanes: expressLanes,
+      acquireLane: acquireExpressLane,
+      sendOffer: sendExpressOffer,
+      chatTurns: expressTurns,
+      releaseTurn: (token, webContentsId) => expressTurns.release(token, webContentsId),
+      afterLaneFree: () => setTimeout(expressTick, 100),
+      scheduledRuns: () => [],
+      emit: (topic, data) => expressControl && expressControl.emit(topic, data),
+    });
+    expressControl.addTools(expressBridge.tools);
+    expressControl.start().catch((e) => console.warn('[express] control server failed:', e.message));
+    expressReaper = setInterval(() => {
+      expressTick();
+      for (const lane of expressLanes.list()) {
+        if (!expressLanes.isFree(lane)) continue;
+        const idleSince = lane.lastUsedAt || lane.createdAt;
+        if (Date.now() - idleSince > EXPRESS_LANE_IDLE_MS && lane.win && !lane.win.isDestroyed()) {
+          try { lane.win.destroy(); } catch {}
+        }
+      }
+    }, 30000);
+    if (expressReaper.unref) expressReaper.unref();
+  } catch (e) {
+    console.warn('[express] control init failed:', e.message);
+  }
+}
+
+ipcMain.handle('express:reply', (_event, payload) => expressRenderer.reply(payload || {}));
+ipcMain.handle('express:agent:ready', (event) => {
+  const lane = expressLanes.byWindow(BrowserWindow.fromWebContents(event.sender));
+  if (!lane) return { ok: false, error: 'wrong_renderer' };
+  expressLanes.markReady(lane.id, event.sender.id);
+  lane.lastUsedAt = Date.now();
+  setTimeout(expressTick, 0);
+  return { ok: true, lane: lane.id };
+});
+ipcMain.handle('express:agent:accept', (event, offerId) => (expressBridge ? expressBridge.accept(event.sender.id, offerId) : { ok: false, error: 'not_ready' }));
+ipcMain.handle('express:agent:started', (event, payload) => (expressBridge ? expressBridge.started(event.sender.id, payload || {}) : { ok: false }));
+ipcMain.handle('express:agent:progress', (event, payload) => (expressBridge ? expressBridge.progress(event.sender.id, payload || {}) : { ok: false }));
+ipcMain.handle('express:agent:complete', (event, payload) => (expressBridge ? expressBridge.complete(event.sender.id, payload || {}) : { ok: false, error: 'not_ready' }));
+app.on('before-quit', () => {
+  try { expressControl && expressControl.stop(); } catch {}
+  if (expressReaper) clearInterval(expressReaper);
 });

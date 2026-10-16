@@ -49,6 +49,10 @@ files:
   # must ALSO be in asarUnpack below.
   - nono-profiles/**/*
   - db.js
+  - scheduler-lanes.js
+  - conversation-transcript.js
+  - express-control.js
+  - express-bridge.js
   - pair-device.js
   - relay-client.js
   - check_ipcs.mjs

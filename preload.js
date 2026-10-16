@@ -470,6 +470,23 @@ contextBridge.exposeInMainWorld('farnsworth', {
 
   // Relay — outbound WS to farnsworth-relay for companion app connectivity
   relaySend: (msg) => ipcRenderer.invoke('relay:send', msg),
+  // Express (Oct 16 2026): background chat lanes + main -> renderer calls.
+  expressAgentReady: () => ipcRenderer.invoke('express:agent:ready'),
+  onExpressOffer: (callback) => {
+    const handler = (_e, payload) => { try { callback(payload); } catch (err) { console.error('[express:agent:offer]', err); } };
+    ipcRenderer.on('express:agent:offer', handler);
+    return () => ipcRenderer.removeListener('express:agent:offer', handler);
+  },
+  expressAgentAccept: (offerId) => ipcRenderer.invoke('express:agent:accept', offerId),
+  expressAgentStarted: (payload) => ipcRenderer.invoke('express:agent:started', payload || {}),
+  expressAgentProgress: (payload) => ipcRenderer.invoke('express:agent:progress', payload || {}),
+  expressAgentComplete: (payload) => ipcRenderer.invoke('express:agent:complete', payload || {}),
+  expressReply: (payload) => ipcRenderer.invoke('express:reply', payload || {}),
+  onExpressCall: (callback) => {
+    const handler = (_e, payload) => { try { callback(payload); } catch (err) { console.error('[express:call]', err); } };
+    ipcRenderer.on('express:call', handler);
+    return () => ipcRenderer.removeListener('express:call', handler);
+  },
   relayStatus: () => ipcRenderer.invoke('relay:status'),
   onRelayMessage: (handler) => {
     ipcRenderer.on('relay:message', (_e, data) => handler(data));
