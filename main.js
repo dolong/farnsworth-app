@@ -2830,6 +2830,55 @@ async function listTestRecordings(folder, limit = 25) {
   return { ok: true, dir, recordings: out.slice(0, Math.max(1, Number(limit) || 25)) };
 }
 
+// Uploads a recording to Farnsworth Cloud (POST {API}/api/media, authed with
+// the paired device token) so chat can show it as a player that also works in
+// the Companion and in any pasted link. Unpaired desktops get a clear error.
+const SHARE_MAX_BYTES = 95 * 1024 * 1024; // matches the Worker's cap
+async function shareTestRecording(folder, target) {
+  let filePath = target;
+  if (!filePath) {
+    const list = await listTestRecordings(folder, 1);
+    if (!list.ok) return list;
+    if (!list.recordings.length) {
+      return { ok: false, error: 'no_recordings', message: `No recordings yet in ${list.dir}. Run a test with recording on first.` };
+    }
+    filePath = list.recordings[0].path;
+  }
+  if (!/\.(mp4|webm|mov)$/i.test(filePath)) {
+    return { ok: false, error: 'bad_type', message: 'Only .mp4, .webm or .mov recordings can be shared.' };
+  }
+  let stat;
+  try { stat = await fs.stat(filePath); } catch { return { ok: false, error: 'not_found', path: filePath }; }
+  if (stat.size > SHARE_MAX_BYTES) {
+    return { ok: false, error: 'too_large', message: `Recording is ${Math.round(stat.size / 1048576)} MB; the share limit is 95 MB.` };
+  }
+  const token = getRelayClient().deviceToken;
+  if (!token) {
+    return { ok: false, error: 'not_paired', message: 'This Farnsworth is not paired to an account, so it cannot upload. Pair it in Settings → Account, then try again.' };
+  }
+  const name = path.basename(filePath);
+  const body = await fs.readFile(filePath);
+  let res, json;
+  try {
+    res = await fetch(`${devicePairing.API}/api/media?name=${encodeURIComponent(name)}`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': /\.webm$/i.test(name) ? 'video/webm' : /\.mov$/i.test(name) ? 'video/quicktime' : 'video/mp4',
+      },
+      body,
+      signal: AbortSignal.timeout(120000),
+    });
+    json = await res.json().catch(() => ({}));
+  } catch (e) {
+    return { ok: false, error: 'upload_failed', message: `Upload failed: ${e.message}` };
+  }
+  if (!res.ok || !json.ok) {
+    return { ok: false, error: json.error || `http_${res.status}`, message: json.message || `Upload failed (HTTP ${res.status})` };
+  }
+  return { ok: true, url: json.url, name, path: filePath, bytes: stat.size, contentType: json.contentType };
+}
+
 // Opens a recording (or the recordings folder) in the OS. `/usr/bin/open -R`
 // for a file so Finder reveals it without tripping the AppleEvents TCC prompt
 // that shell.showItemInFolder() raises; shell.openPath for a bare folder.
@@ -7367,6 +7416,16 @@ const AGENT_TOOLS = [
     }
   },
   {
+    name: 'share_recording',
+    description: 'Upload a test-run recording to Farnsworth Cloud and post it in this chat as an inline video player that also plays in the Companion app (app.farnsworth.tv) and anywhere the link is pasted (Slack, a browser). Returns a public link (unguessable URL, no login needed to watch). Omit `path` to share the newest recording in this workspace. Use when the user asks to send, share, upload or show a recording, or to see a run from their phone. Requires this Farnsworth to be paired to an account (Settings → Account).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Optional absolute path to a recording (.mp4 or .webm). Omit to share the most recent recording in the workspace.' }
+      }
+    }
+  },
+  {
     name: 'set_test_recording',
     description: 'Turn the default test-run video recording on or off. This is the same toggle as the Record button in Test View and applies to every later run until changed. Use for "stop recording my test runs" or "record all test runs from now on". For a single run, pass `record` to test_run instead.',
     input_schema: {
@@ -7879,6 +7938,9 @@ async function executeAgentTool(name, input, folderOverride) {
       path: typeof input?.path === 'string' && input.path.trim() ? input.path.trim() : null,
       reveal: true,
     });
+  }
+  if (name === 'share_recording') {
+    return await shareTestRecording(folder, typeof input?.path === 'string' && input.path.trim() ? input.path.trim() : null);
   }
   if (name === 'set_test_recording') {
     if (typeof input?.enabled !== 'boolean') {

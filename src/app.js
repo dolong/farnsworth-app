@@ -1660,6 +1660,35 @@ function renderMessage(m) {
       (tl || []).filter(e => e.type === 'surface').map(e => e.surfaceId)
     );
     const trailingSurfaces = (m.surfaces || []).filter(s => !tlSurfaceIds.has(s.surfaceId));
+    // Shared media (share_recording): an inline player per uploaded video,
+    // rendered outside the chip groups so it never hides in a collapsed pill.
+    if (Array.isArray(m.media) && m.media.length) {
+      const mediaWrap = el('div', { class: 'msg__media' });
+      for (const md of m.media) {
+        if (!md || !md.url) continue;
+        const fig = el('div', { class: 'msg__media-item' });
+        const v = document.createElement('video');
+        v.className = 'msg__media-video';
+        v.controls = true;
+        v.preload = 'metadata';
+        v.playsInline = true;
+        v.src = md.url;
+        fig.appendChild(v);
+        const cap = el('div', { class: 'msg__media-cap' });
+        cap.appendChild(el('span', { class: 'msg__media-name' }, md.name || 'recording'));
+        const copyBtn = el('button', { class: 'msg__media-btn', type: 'button' }, 'Copy link');
+        copyBtn.addEventListener('click', async () => {
+          try { await navigator.clipboard.writeText(md.url); copyBtn.textContent = 'Copied'; setTimeout(() => { copyBtn.textContent = 'Copy link'; }, 1200); } catch {}
+        });
+        const openBtn = el('button', { class: 'msg__media-btn', type: 'button' }, 'Open');
+        openBtn.addEventListener('click', () => { window.farnsworth?.openExternal?.(md.url); });
+        cap.appendChild(copyBtn);
+        cap.appendChild(openBtn);
+        fig.appendChild(cap);
+        mediaWrap.appendChild(fig);
+      }
+      body.appendChild(mediaWrap);
+    }
     if (trailingSurfaces.length && window.FarnsworthSurfaces) {
       const surfacesWrap = el('div', { class: 'msg__surfaces' });
       for (const surface of trailingSurfaces) {
@@ -2980,6 +3009,13 @@ function companionChipLabelIsLossy(c, d) {
   return bare !== d.text;                            // command longer than the chip shows
 }
 
+// Shared videos (share_recording) as plain {kind,url,name} for the Companion.
+function companionMediaView(m) {
+  return (Array.isArray(m.media) ? m.media : [])
+    .filter(md => md && typeof md.url === 'string' && /^https:\/\//.test(md.url))
+    .map(md => ({ kind: md.kind || 'video', url: md.url, name: md.name || '' }));
+}
+
 function companionChipView(c, m) {
   const view = { label: c.label, kind: c.kind };
   const d = companionChipDetail(c, m);
@@ -3066,6 +3102,7 @@ function syncChatProgressToCompanions(agentMsg) {
       timeline: companionTimelineView(agentMsg),
       text: [agentMsg.preambleText, agentMsg.responseText].filter(Boolean).join('\n\n') || agentMsg.text || '',
       chips: (agentMsg.chips || []).filter(c => !c._superseded).slice(-30).map(c => companionChipView(c, agentMsg)),
+      media: companionMediaView(agentMsg),
     });
   } catch (e) {
     console.warn('[chat-sync] chat:progress failed:', e.message);
@@ -3108,6 +3145,7 @@ function companionMessageView(m, opts) {
         .filter(c => !c._superseded)
         .slice(-30)
         .map(c => companionChipView(c, m)),
+      media: companionMediaView(m),
     };
   }
   if (m.role === 'user') return m.text ? { role: 'user', text: m.text } : null;
@@ -3128,6 +3166,7 @@ function companionMessageView(m, opts) {
         .filter(c => !c._superseded)
         .slice(-30)
         .map(c => companionChipView(c, m)),
+      media: companionMediaView(m),
     };
   }
   return null;
@@ -14413,6 +14452,7 @@ async function sendChatMessage(opts) {
           '- test_recordings_list(limit?) — list recorded run videos for this workspace (newest first) from .farnsworth/recordings/',
           '- open_recordings_folder(path?) — reveal the recordings folder in Finder, or one specific recording',
           '- set_test_recording(enabled) — turn default test-run recording on or off (same toggle as the Record button in Test View)',
+          '- share_recording(path?) — upload a recording (newest if omitted) and post it in this chat as a video player that also plays in the Companion app; returns a shareable link. Use when the user asks to send/share/show a recording, especially from the Companion.',
           '',
           '**Recording test runs:** a recorded run returns a `video` object with the video path — an .mp4 (H.264, plays in QuickTime/Slack/Drive), or a .webm with a `transcodeError` when ffmpeg is unavailable on the machine. The video has a burned-in overlay showing each step number, action, selector, elapsed time and pass/fail state, so it is a real artifact — ALWAYS give the user the full path when one comes back, and offer to reveal it with open_recordings_folder. Recording only works on the Node runner path: tests containing `switchUser` or `llm-step` run under Python and cannot be recorded, so say so plainly instead of claiming a video exists. Recording needs an active Test View / mobile / desktop game preview to capture.',
           '',
@@ -14770,6 +14810,9 @@ async function sendChatMessage(opts) {
             : `No recordings yet in ${toolRes.dir}`;
         } else if (tu.name === 'open_recordings_folder') {
           resultContent = `Revealed ${toolRes.path} in Finder`;
+        } else if (tu.name === 'share_recording') {
+          resultContent = `Uploaded ${toolRes.name} (${Math.round((toolRes.bytes || 0) / 1024)}KB). Link: ${toolRes.url}\nIt now plays inline in this chat on the desktop and in the Companion. Include the link in your reply so the user can paste it elsewhere.`;
+          updateAgentMsg({ media: [...(agentMsg.media || []), { kind: 'video', url: toolRes.url, name: toolRes.name }] });
         } else if (tu.name === 'set_test_recording') {
           resultContent = `Test-run recording is now ${toolRes.enabled ? 'ON' : 'OFF'}${toolRes.note ? ' — ' + toolRes.note : ''}`;
         } else if (tu.name === 'test_read') {
@@ -14943,6 +14986,7 @@ async function sendChatMessage(opts) {
     // blob the moment the turn finished. (Aug 8 2026)
     timeline: companionTimelineView(agentMsg),
     chips: (agentMsg.chips || []).filter(c => !c._superseded).slice(-30).map(c => companionChipView(c, agentMsg)),
+    media: companionMediaView(agentMsg),
   });
 }
 
