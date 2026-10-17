@@ -11638,7 +11638,7 @@ function expressReadConversation(input = {}) {
 function startExpressControl() {
   if (expressControl) return;
   try {
-    expressControl = createControlServer({ app: 'farnsworth', version: app.getVersion() });
+    expressControl = createControlServer({ app: 'farnsworth', version: app.getVersion(), instance: INSTANCE_NAME, describe: () => ({ folder: currentFolderSetting() || null }) });
     expressBridge = createExpressBridge({
       app: 'farnsworth',
       rawDb: () => db.getRawDb(),

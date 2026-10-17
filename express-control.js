@@ -6,8 +6,10 @@
 // Transport: MCP JSON-RPC 2.0 over HTTP POST /mcp on 127.0.0.1 (random port),
 // bearer token. Server-pushed events (chat stream, task progress) go out on
 // GET /events as Server-Sent Events. Discovery: writes
-// ~/.express/apps/<app>.json {app, port, token, pid, version, startedAt}
-// (mode 0600) and removes it on stop. CommonJS + node builtins only so it
+// ~/.express/apps/<app>.json (default instance) or <app>@<instance>.json
+// (a second copy launched with --instance=<name>) holding
+// {app, instance, folder, port, token, pid, version, startedAt} (mode 0600),
+// refreshed every 5s so the folder stays current, removed on stop. CommonJS + node builtins only so it
 // loads in Electron main without a build step.
 
 const http = require('node:http');
@@ -20,10 +22,25 @@ const PROTOCOL_VERSION = '2025-06-18';
 const DIR = process.env.EXPRESS_HOME || path.join(os.homedir(), '.express');
 const MAX_BODY = 8 * 1024 * 1024;
 
-function createControlServer({ app, version = '0.0.0', tools = {}, log = console } = {}) {
+// Instance name: explicit option, else --instance=<name> on argv, else the
+// app's own <APP>_INSTANCE env. 'default' (or empty) = the plain file.
+function resolveInstance(app, explicit) {
+  const arg = process.argv.find((a) => a.startsWith('--instance='));
+  const raw = explicit || (arg ? arg.slice('--instance='.length) : '') || process.env[`${app.toUpperCase()}_INSTANCE`] || '';
+  const clean = String(raw).trim().toLowerCase().replace(/[^a-z0-9._-]/g, '-').slice(0, 40);
+  return clean && clean !== 'default' ? clean : 'default';
+}
+
+function createControlServer({ app, version = '0.0.0', tools = {}, log = console, instance, describe } = {}) {
   if (!app) throw new Error('express-control: app is required');
   const token = crypto.randomBytes(24).toString('hex');
-  const file = path.join(DIR, 'apps', `${app}.json`);
+  const inst = resolveInstance(app, instance);
+  const file = path.join(DIR, 'apps', inst === 'default' ? `${app}.json` : `${app}@${inst}.json`);
+  const startedAt = Date.now();
+  let lastFolder;
+  function info() {
+    try { const d = typeof describe === 'function' ? describe() : null; return d && typeof d === 'object' ? d : {}; } catch { return {}; }
+  }
   const sseClients = new Set();
   let server = null;
   let port = null;
@@ -122,12 +139,32 @@ function createControlServer({ app, version = '0.0.0', tools = {}, log = console
     for (const res of sseClients) { try { res.write(frame); } catch {} }
   }
 
-  function writeDiscovery() {
-    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-    const tmp = `${file}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify({ app, port, token, pid: process.pid, version, startedAt: Date.now() }), { mode: 0o600 });
-    fs.renameSync(tmp, file);
+  // Never clobber a discovery file another LIVE instance owns (a release boot
+  // test launched beside the real app used to steal it and then die, leaving
+  // the hub pointing at a dead pid). A heartbeat re-claims the file whenever
+  // it is missing or its owner is gone.
+  function ownerAlive(pid) {
+    if (!pid || pid === process.pid) return false;
+    try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
   }
+  function writeDiscovery({ force = false } = {}) {
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    if (!force) {
+      try {
+        const cur = JSON.parse(fs.readFileSync(file, 'utf8'));
+        if (cur.pid === process.pid && cur.port === port && cur.folder === (info().folder || null)) return true;
+        if (ownerAlive(cur.pid) && process.env.EXPRESS_CLAIM !== '1') return false;
+      } catch {}
+    }
+    const tmp = `${file}.${process.pid}.tmp`;
+    const folder = info().folder || null;
+    if (lastFolder !== undefined && folder !== lastFolder) emit('instance', { instance: inst, folder });
+    lastFolder = folder;
+    fs.writeFileSync(tmp, JSON.stringify({ app, instance: inst, folder, port, token, pid: process.pid, version, startedAt }), { mode: 0o600 });
+    fs.renameSync(tmp, file);
+    return true;
+  }
+  let claimTimer = null;
 
   function removeDiscovery() {
     try {
@@ -138,6 +175,7 @@ function createControlServer({ app, version = '0.0.0', tools = {}, log = console
 
   return {
     get port() { return port; },
+    get instance() { return inst; },
     emit,
     addTools(more) { Object.assign(tools, more); },
     start() {
@@ -146,13 +184,16 @@ function createControlServer({ app, version = '0.0.0', tools = {}, log = console
         server.on('error', reject);
         server.listen(0, '127.0.0.1', () => {
           port = server.address().port;
-          writeDiscovery();
-          log.log?.(`[express-control] ${app} listening on 127.0.0.1:${port}`);
+          if (!writeDiscovery()) log.warn?.(`[express-control] ${app}: another live instance owns the discovery file; will claim it when it exits`);
+          claimTimer = setInterval(() => { try { writeDiscovery(); } catch {} }, 5000);
+          claimTimer.unref?.();
+          log.log?.(`[express-control] ${app}${inst === 'default' ? '' : `@${inst}`} listening on 127.0.0.1:${port}`);
           resolve(port);
         });
       });
     },
     stop() {
+      clearInterval(claimTimer);
       removeDiscovery();
       for (const res of sseClients) { try { res.end(); } catch {} }
       sseClients.clear();
@@ -167,4 +208,4 @@ function toolError(code, message, details) {
   const e = new Error(message); e.code = code; if (details) e.details = details; return e;
 }
 
-module.exports = { createControlServer, toolError, PROTOCOL_VERSION };
+module.exports = { createControlServer, toolError, resolveInstance, PROTOCOL_VERSION };
