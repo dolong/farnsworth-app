@@ -5115,7 +5115,7 @@ async function memoryStageInference(stage, system, user, maxTokens = 512, meta =
   try {
     const res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST', headers, signal: controller.signal,
-      body: JSON.stringify({ model, max_tokens: maxTokens, system, messages: [{ role: 'user', content: user }] }),
+      body: JSON.stringify(withAnthropicCache({ model, max_tokens: maxTokens, system, messages: [{ role: 'user', content: user }] })),
     });
     const ms = Date.now() - t0;
     if (!res.ok) {
@@ -8407,12 +8407,80 @@ function oaSafeJson(s) {
   }
 }
 
+// Oct 17 2026: Anthropic prompt caching on every Messages call. Without it
+// each tool round re-bills the whole system prompt + tool list + history at
+// full input price (Opus 5.5 turns were ~1M+ uncached input each). Three
+// breakpoints (limit is 4): end of system, end of tools, and the newest
+// cacheable message block, so the next round/turn reads everything before
+// it at the cached rate. Prompts under the model's cache minimum are a
+// silent no-op. Never mutates the caller's arrays.
+const ANTHROPIC_CACHE = { type: 'ephemeral' };
+const ANTHROPIC_CACHEABLE = new Set(['text', 'tool_result', 'tool_use', 'image', 'document']);
+function withAnthropicCache(body) {
+  if (!body || typeof body !== 'object') return body;
+  try {
+    if (typeof body.system === 'string' && body.system.trim()) {
+      body.system = [{ type: 'text', text: body.system, cache_control: ANTHROPIC_CACHE }];
+    } else if (Array.isArray(body.system) && body.system.length && !body.system.some((b) => b && b.cache_control)) {
+      const i = body.system.length - 1;
+      body.system = body.system.map((b, j) => (j === i && b && b.type === 'text' && b.text ? { ...b, cache_control: ANTHROPIC_CACHE } : b));
+    }
+    if (Array.isArray(body.tools) && body.tools.length) {
+      const i = body.tools.length - 1;
+      body.tools = body.tools.map((t, j) => (j === i && t && !t.cache_control ? { ...t, cache_control: ANTHROPIC_CACHE } : t));
+    }
+    const msgs = Array.isArray(body.messages) ? body.messages : null;
+    if (msgs && msgs.length && !msgs.some((m) => Array.isArray(m?.content) && m.content.some((b) => b && b.cache_control))) {
+      for (let i = msgs.length - 1; i >= 0 && i >= msgs.length - 3; i--) {
+        const m = msgs[i];
+        if (!m) continue;
+        if (typeof m.content === 'string') {
+          if (!m.content.trim()) continue;
+          body.messages = msgs.slice();
+          body.messages[i] = { ...m, content: [{ type: 'text', text: m.content, cache_control: ANTHROPIC_CACHE }] };
+          break;
+        }
+        if (!Array.isArray(m.content)) continue;
+        let k = -1;
+        for (let j = m.content.length - 1; j >= 0; j--) {
+          const b = m.content[j];
+          if (b && ANTHROPIC_CACHEABLE.has(b.type) && !(b.type === 'text' && !String(b.text || '').trim())) { k = j; break; }
+        }
+        if (k < 0) continue;
+        body.messages = msgs.slice();
+        const content = m.content.slice();
+        content[k] = { ...content[k], cache_control: ANTHROPIC_CACHE };
+        body.messages[i] = { ...m, content };
+        break;
+      }
+    }
+  } catch (e) { console.warn('[inference] cache markers skipped:', e.message); }
+  return body;
+}
+
+// Anthropic reports cached prompt tokens OUTSIDE input_tokens. Fold them back
+// so input_tokens stays "whole prompt" (usage chips, context meter, Express
+// spend tracking) and expose the cache read as cached_input_tokens.
+function normalizeAnthropicUsage(u) {
+  if (!u || typeof u !== 'object') return u;
+  const read = Number(u.cache_read_input_tokens) || 0;
+  const write = Number(u.cache_creation_input_tokens) || 0;
+  const fresh = Number(u.input_tokens) || 0;
+  return { ...u, input_tokens: fresh + read + write, uncached_input_tokens: fresh, cached_input_tokens: read, cache_write_input_tokens: write };
+}
+
 function mapOpenAIUsage(u) {
   if (!u) return null;
+  // Oct 17 2026 (ported from Citadel): pass through provider-reported cached
+  // prompt tokens (OpenAI/Fireworks prompt_tokens_details.cached_tokens,
+  // DeepSeek prompt_cache_hit_tokens, bare cached_tokens).
+  const det = u.prompt_tokens_details || {};
+  const cached = det.cached_tokens ?? u.cached_tokens ?? u.prompt_cache_hit_tokens ?? 0;
   return {
     input_tokens: u.prompt_tokens ?? 0,
     output_tokens: u.completion_tokens ?? 0,
     total_tokens: u.total_tokens ?? 0,
+    cached_input_tokens: cached || 0,
   };
 }
 
@@ -9203,6 +9271,7 @@ ipcMain.handle('inference:send', async (_event, opts = {}) => {
   const body = { model, max_tokens: maxTokens, messages };
   if (system) body.system = system;
   if (Array.isArray(opts.tools) && opts.tools.length) body.tools = opts.tools;
+  withAnthropicCache(body);
 
   try {
     const res = await fetch('https://api.anthropic.com/v1/messages', {
@@ -9237,7 +9306,7 @@ ipcMain.handle('inference:send', async (_event, opts = {}) => {
       content: blocks,
       toolUses,
       model: data.model,
-      usage: data.usage,
+      usage: normalizeAnthropicUsage(data.usage),
       stopReason: data.stop_reason,
     };
   } catch (e) {
@@ -9425,6 +9494,7 @@ ipcMain.on('inference:stream', async (event, opts = {}) => {
   const body = { model, max_tokens: maxTokens, messages, stream: true };
   if (system) body.system = system;
   if (Array.isArray(opts.tools) && opts.tools.length) body.tools = opts.tools;
+  withAnthropicCache(body);
 
   try {
     const res = await fetch('https://api.anthropic.com/v1/messages', {
@@ -9476,6 +9546,7 @@ ipcMain.on('inference:stream', async (event, opts = {}) => {
         try { parsed = JSON.parse(data); } catch { continue; }
 
         if (eventType === 'message_start') {
+          if (parsed.message?.usage) usage = { ...parsed.message.usage, ...(usage || {}) };
           send({ type: 'message_start', message: parsed.message });
         } else if (eventType === 'content_block_start') {
           const idx = parsed.index;
@@ -9539,7 +9610,7 @@ ipcMain.on('inference:stream', async (event, opts = {}) => {
         } else if (eventType === 'message_delta') {
           stopReason = parsed.delta?.stop_reason || stopReason;
           if (parsed.usage) usage = { ...(usage || {}), ...parsed.usage };
-          send({ type: 'message_delta', stopReason, usage });
+          send({ type: 'message_delta', stopReason, usage: normalizeAnthropicUsage(usage) });
         } else if (eventType === 'message_stop') {
           // end of message
         }
@@ -9568,7 +9639,7 @@ ipcMain.on('inference:stream', async (event, opts = {}) => {
       input: b.inputInvalid ? null : (b.input || {}),
       inputInvalid: b.inputInvalid || null,
     }));
-    const result = { ok: true, text, content: blockArr, toolUses, stopReason, usage };
+    const result = { ok: true, text, content: blockArr, toolUses, stopReason, usage: normalizeAnthropicUsage(usage) };
     send({ type: 'done', result });
     return { ok: true, requestId };
   } catch (e) {
