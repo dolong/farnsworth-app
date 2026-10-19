@@ -230,6 +230,13 @@ function createExpressBridge(deps) {
       if (!row) throw err('not_found', `No conversation ${conversationId}`);
       if (!args.folder && row.workspace_path) args.folder = row.workspace_path;
     }
+    if (!str(args.folder) && !conversationId) {
+      // A delegated job with no folder runs in the folder open in the main
+      // window, like a chat typed there would. Without this the hidden lane
+      // starts with no workspace and every project tool fails.
+      const main = await callMainRenderer('folder', {}).catch(() => null);
+      args.folder = main?.folder || [...(openFolders() || [])][0] || null;
+    }
     const folder = str(args.folder) || null;
     if (folder && !fs.existsSync(folder)) throw err('bad_input', `Folder does not exist: ${folder}`);
     const id = `xt-${crypto.randomUUID()}`;
