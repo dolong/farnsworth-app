@@ -7963,3 +7963,5 @@ body.density-compact .msg__body { font-size: 12.5px; }
 .devvit-form__actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px; }
 .devvit-form__btn { padding: 7px 14px; border-radius: 6px; border: 1px solid var(--border, #33353a); background: transparent; color: inherit; font: inherit; cursor: pointer; }
 .devvit-form__btn--primary { background: var(--accent, #ff6a2b); border-color: var(--accent, #ff6a2b); color: #fff; font-weight: 600; }
+
+.post-view__types-menu--up { top: auto; bottom: calc(100% + 6px); overflow-y: auto; }

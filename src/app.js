@@ -5520,6 +5520,28 @@ function renderPostView() {
       },
     }, 'Edit post types… (.farnsworth/config.json)'));
     newWrap.appendChild(menu);
+    // The button sits near the bottom of the Post View frame, so a menu that
+    // drops down is clipped. Open upward when there's more room above, and
+    // otherwise scroll it into view.
+    requestAnimationFrame(() => {
+      if (!menu.isConnected) return;
+      let clip = menu.parentElement;
+      while (clip && clip !== document.body) {
+        const ov = getComputedStyle(clip);
+        if (/(auto|scroll|hidden|clip)/.test(ov.overflowY + ov.overflow)) break;
+        clip = clip.parentElement;
+      }
+      const bounds = (clip && clip !== document.body) ? clip.getBoundingClientRect() : { top: 0, bottom: window.innerHeight };
+      const r = menu.getBoundingClientRect();
+      const btn = newWrap.getBoundingClientRect();
+      if (r.bottom > bounds.bottom && (btn.top - bounds.top) > (bounds.bottom - btn.bottom)) {
+        menu.classList.add('post-view__types-menu--up');
+        const up = menu.getBoundingClientRect();
+        if (up.top < bounds.top) menu.style.maxHeight = `${Math.max(160, btn.top - bounds.top - 12)}px`;
+      } else if (r.bottom > bounds.bottom) {
+        menu.scrollIntoView({ block: 'nearest' });
+      }
+    });
   }
   moreHead.appendChild(newWrap);
   more.appendChild(moreHead);
