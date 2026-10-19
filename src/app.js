@@ -3855,7 +3855,7 @@ async function openDevvitUserMenu() {
     <div class="devvit-user-menu-title">Switch devvit user</div>
     ${users.map((u) => `
       <button class="devvit-user-menu-item ${u.id === activeId ? 'is-active' : ''}" data-user-id="${u.id}">
-        <span class="devvit-user-menu-username">${escapeHtml(u.username)}</span>
+        <span class="devvit-user-menu-username">${escapeHtml(u.username)}${u.is_moderator ? ' <span class="devvit-user-menu-mod">mod</span>' : ''}</span>
         <span class="devvit-user-menu-karma">${(u.link_karma || 0) + (u.comment_karma || 0)} karma</span>
       </button>
     `).join('')}
@@ -3965,6 +3965,7 @@ async function openDevvitConfig() {
           <div class="devvit-config-list-item" data-user-id="${u.id}">
             <span class="devvit-config-list-name">${escapeHtml(u.username)}</span>
             <span class="devvit-config-list-meta">${(u.link_karma || 0) + (u.comment_karma || 0)} karma${u.is_employee ? ' · employee' : ''}</span>
+            <button class="devvit-config-mod-toggle ${u.is_moderator ? 'is-on' : ''}" data-mod-user="${u.id}" data-mod-on="${u.is_moderator ? 1 : 0}" title="${u.is_moderator ? 'Moderator of the emulated subreddit. Click to remove.' : 'Make a moderator of the emulated subreddit'}">Mod</button>
             <button class="devvit-config-list-del" data-del-user="${u.id}" title="Remove user">×</button>
           </div>
         `).join('')}
@@ -4021,6 +4022,28 @@ async function openDevvitConfig() {
       showAllCanvasViews();
       pop.remove();
       openDevvitConfig(); // re-render
+    });
+  });
+  // Mod toggle: flips the flag, rewrites the loader config and restarts the
+  // dev server so the game's getModerators() sees it right away.
+  pop.querySelectorAll('[data-mod-user]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const id = Number(btn.getAttribute('data-mod-user'));
+      const on = btn.getAttribute('data-mod-on') !== '1';
+      const name = btn.closest('.devvit-config-list-item')?.querySelector('.devvit-config-list-name')?.textContent || 'User';
+      try {
+        await window.farnsworth.devvitSetUserModerator(id, on);
+        await window.farnsworth.devvitSetProjectSettings(state.folder, settings?.current_user_id || null, settings?.current_subreddit_id || null);
+        showAllCanvasViews();
+        pop.remove();
+        openDevvitConfig(); // re-render
+        showToast?.(`${name} is ${on ? 'now a moderator' : 'no longer a moderator'}. Restarting dev server…`);
+        await stopFarnsworthDev();
+        await bootFarnsworthDev();
+        await refreshDevvitUserPill();
+      } catch (e) {
+        showToast?.('Failed to change moderator.');
+      }
     });
   });
   pop.querySelectorAll('[data-del-sub]').forEach((btn) => {

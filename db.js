@@ -122,6 +122,7 @@ CREATE TABLE IF NOT EXISTS devvit_users (
   link_karma INTEGER DEFAULT 0,
   comment_karma INTEGER DEFAULT 0,
   is_employee INTEGER DEFAULT 0,
+  is_moderator INTEGER DEFAULT 0,
   created_at TEXT DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
@@ -354,6 +355,16 @@ function init(userDataPath, electronSafeStorage) {
   // silently skipped fresh installs -- PRAGMA table_info on a table that
   // doesn't exist yet returns nothing, the `cols.length` guard treats that
   // as "nothing to migrate", and the column was never created.
+  // Devvit emulator moderators (Oct 19 2026). Older databases get the column
+  // here; u/long becomes a moderator once, the way the dev is a mod of their
+  // own test subreddit on real Reddit.
+  try {
+    const cols = db.prepare('PRAGMA table_info(devvit_users)').all().map(r => r.name);
+    if (cols.length && !cols.includes('is_moderator')) {
+      db.exec('ALTER TABLE devvit_users ADD COLUMN is_moderator INTEGER DEFAULT 0');
+      db.prepare("UPDATE devvit_users SET is_moderator = 1 WHERE username = 'u/long'").run();
+    }
+  } catch (_) {}
   for (const [table, col] of [['memory_buffer', 'workspace_path'], ['memory_archive', 'workspace_path'], ['memory_concepts', 'workspace_path']]) {
     try {
       const cols = db.prepare(`PRAGMA table_info(${table})`).all().map(r => r.name);
@@ -808,7 +819,7 @@ function clearLiveGameCache(gameId) {
 // fresh Farnsworth install boots without a "no users" empty state.
 
 const DEVVIT_DEFAULT_USERS = [
-  { reddit_id: 't2_long001', username: 'u/long',     snoovatar_url: null, link_karma: 12500, comment_karma: 42000, is_employee: 0 },
+  { reddit_id: 't2_long001', username: 'u/long',     snoovatar_url: null, link_karma: 12500, comment_karma: 42000, is_employee: 0, is_moderator: 1 },
   { reddit_id: 't2_alice01', username: 'u/alice',   snoovatar_url: null, link_karma: 12,    comment_karma: 8,     is_employee: 0 },
   { reddit_id: 't2_bob001',  username: 'u/bob',     snoovatar_url: null, link_karma: 340,   comment_karma: 1200,  is_employee: 0 },
   { reddit_id: 't2_carol01', username: 'u/carol',   snoovatar_url: null, link_karma: 8900,  comment_karma: 31000, is_employee: 0 },
@@ -824,10 +835,10 @@ function devvitSeedDefaults() {
   const userCount = db.prepare('SELECT COUNT(*) AS n FROM devvit_users').get().n;
   if (userCount === 0) {
     const ins = db.prepare(`
-      INSERT INTO devvit_users (reddit_id, username, snoovatar_url, link_karma, comment_karma, is_employee)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO devvit_users (reddit_id, username, snoovatar_url, link_karma, comment_karma, is_employee, is_moderator)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
     `);
-    const tx = db.transaction((rows) => { for (const r of rows) ins.run(r.reddit_id, r.username, r.snoovatar_url, r.link_karma, r.comment_karma, r.is_employee); });
+    const tx = db.transaction((rows) => { for (const r of rows) ins.run(r.reddit_id, r.username, r.snoovatar_url, r.link_karma, r.comment_karma, r.is_employee, r.is_moderator ? 1 : 0); });
     tx(DEVVIT_DEFAULT_USERS);
   }
   const subCount = db.prepare('SELECT COUNT(*) AS n FROM devvit_subreddits').get().n;
@@ -843,27 +854,41 @@ function devvitSeedDefaults() {
 
 function devvitListUsers() {
   if (!db) return [];
-  return db.prepare('SELECT id, reddit_id, username, snoovatar_url, link_karma, comment_karma, is_employee, created_at, updated_at FROM devvit_users ORDER BY username ASC').all();
+  return db.prepare('SELECT id, reddit_id, username, snoovatar_url, link_karma, comment_karma, is_employee, is_moderator, created_at, updated_at FROM devvit_users ORDER BY username ASC').all();
 }
 
 function devvitUpsertUser(user) {
   if (!db || !user || !user.reddit_id || !user.username) return { ok: false, error: 'missing_reddit_id_or_username' };
   try {
     db.prepare(`
-      INSERT INTO devvit_users (reddit_id, username, snoovatar_url, link_karma, comment_karma, is_employee, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+      INSERT INTO devvit_users (reddit_id, username, snoovatar_url, link_karma, comment_karma, is_employee, is_moderator, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
       ON CONFLICT(reddit_id) DO UPDATE SET
         username = excluded.username,
         snoovatar_url = excluded.snoovatar_url,
         link_karma = excluded.link_karma,
         comment_karma = excluded.comment_karma,
         is_employee = excluded.is_employee,
+        is_moderator = COALESCE(?, is_moderator),
         updated_at = CURRENT_TIMESTAMP
     `).run(
       user.reddit_id, user.username, user.snoovatar_url ?? null,
       Number(user.link_karma) || 0, Number(user.comment_karma) || 0,
-      user.is_employee ? 1 : 0
+      user.is_employee ? 1 : 0,
+      user.is_moderator ? 1 : 0,
+      // Upserts that don't mention is_moderator keep the existing flag.
+      user.is_moderator === undefined ? null : (user.is_moderator ? 1 : 0)
     );
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+function devvitSetUserModerator(id, on) {
+  if (!db || !id) return { ok: false };
+  try {
+    db.prepare('UPDATE devvit_users SET is_moderator = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(on ? 1 : 0, id);
     return { ok: true };
   } catch (e) {
     return { ok: false, error: e.message };
@@ -2202,7 +2227,7 @@ module.exports = {
   putOAuthState, consumeOAuthState, getOAuthState, cleanupOAuthState,
   getLiveTickets, saveLiveTickets, clearLiveTickets,
   getLiveGameCache, saveLiveGameCache, clearLiveGameCache,
-  devvitSeedDefaults, devvitListUsers, devvitUpsertUser, devvitDeleteUser,
+  devvitSeedDefaults, devvitListUsers, devvitUpsertUser, devvitDeleteUser, devvitSetUserModerator,
   devvitListSubreddits, devvitUpsertSubreddit, devvitDeleteSubreddit,
   devvitGetProjectSettings, devvitSetProjectSettings, devvitInitDefaultsForProject,
   memoryListEssentials, memoryGetEssential, memorySetEssential, memoryDeleteEssential,

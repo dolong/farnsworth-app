@@ -152,6 +152,7 @@ contextBridge.exposeInMainWorld('farnsworth', {
   devvitListUsers: () => ipcRenderer.invoke('devvit:list-users'),
   devvitUpsertUser: (user) => ipcRenderer.invoke('devvit:upsert-user', user),
   devvitDeleteUser: (id) => ipcRenderer.invoke('devvit:delete-user', id),
+  devvitSetUserModerator: (id, on) => ipcRenderer.invoke('devvit:set-user-moderator', id, on),
   devvitListSubreddits: () => ipcRenderer.invoke('devvit:list-subreddits'),
   devvitUpsertSubreddit: (sub) => ipcRenderer.invoke('devvit:upsert-subreddit', sub),
   devvitDeleteSubreddit: (id) => ipcRenderer.invoke('devvit:delete-subreddit', id),

@@ -2668,6 +2668,7 @@ ipcMain.handle('workspace:saveConfig', async (_event, folderPath, config) => {
 ipcMain.handle('devvit:list-users', async () => db.devvitListUsers());
 ipcMain.handle('devvit:upsert-user', async (_event, user) => db.devvitUpsertUser(user));
 ipcMain.handle('devvit:delete-user', async (_event, id) => db.devvitDeleteUser(id));
+ipcMain.handle('devvit:set-user-moderator', async (_event, id, on) => db.devvitSetUserModerator(id, on));
 ipcMain.handle('devvit:list-subreddits', async () => db.devvitListSubreddits());
 ipcMain.handle('devvit:upsert-subreddit', async (_event, sub) => db.devvitUpsertSubreddit(sub));
 ipcMain.handle('devvit:delete-subreddit', async (_event, id) => db.devvitDeleteSubreddit(id));

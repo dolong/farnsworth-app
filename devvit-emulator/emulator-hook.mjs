@@ -58,6 +58,7 @@ const seedUsers = (cfg.users || []).map((u) => ({
   linkKarma: u.link_karma || 0,
   commentKarma: u.comment_karma || 0,
   isEmployee: !!u.is_employee,
+  isModerator: !!u.is_moderator,
 }));
 const seedSubreddits = (cfg.subreddits || []).map((s) => ({
   id: s.reddit_id,

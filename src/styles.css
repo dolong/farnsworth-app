@@ -7972,3 +7972,16 @@ body.density-compact .msg__body { font-size: 12.5px; }
 .devvit-form__btn--primary { background: var(--accent, #ff6a2b); border-color: var(--accent, #ff6a2b); color: #fff; font-weight: 600; }
 
 .post-view__types-menu--up { top: auto; bottom: calc(100% + 6px); overflow-y: auto; }
+
+/* Devvit emulator moderator toggle (Oct 19 2026) */
+.devvit-config-mod-toggle {
+  background: transparent; border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px; color: #777; cursor: pointer;
+  font-size: 10px; line-height: 1; padding: 3px 7px;
+}
+.devvit-config-mod-toggle:hover { color: #ccc; border-color: rgba(255, 255, 255, 0.25); }
+.devvit-config-mod-toggle.is-on { color: #4ade80; border-color: rgba(74, 222, 128, 0.45); background: rgba(74, 222, 128, 0.08); }
+.devvit-user-menu-mod {
+  margin-left: 6px; padding: 1px 5px; border-radius: 8px;
+  font-size: 9px; color: #4ade80; border: 1px solid rgba(74, 222, 128, 0.45);
+}

@@ -63,6 +63,10 @@ export class RedditAPIClientEmulator {
 
     if (this._persistPath) {
       this._hydrate();
+      // The user library in Farnsworth is the source of truth for user
+      // fields (moderator flag, karma). Re-apply it over users hydrated from
+      // an older state file so a stale snapshot can't undo a setting.
+      if (Array.isArray(options.seedUsers)) this._ingestUsers(options.seedUsers);
       this._hookExitFlush();
     }
   }
@@ -155,6 +159,7 @@ export class RedditAPIClientEmulator {
         linkKarma: u.linkKarma ?? 0,
         commentKarma: u.commentKarma ?? 0,
         isEmployee: !!u.isEmployee,
+        isModerator: !!u.isModerator,
       };
       this._users.set(norm.username, norm);
       this._usersById.set(norm.id, norm);
@@ -188,6 +193,9 @@ export class RedditAPIClientEmulator {
       linkKarma: u.linkKarma,
       commentKarma: u.commentKarma,
       isEmployee: u.isEmployee,
+      // Moderators are set per user in Farnsworth's Devvit users panel and
+      // moderate every emulated subreddit.
+      getModPermissionsForSubreddit: async () => (u.isModerator ? ['all'] : []),
     };
   }
 
@@ -494,16 +502,22 @@ export class RedditAPIClientEmulator {
   // Tier 2 — Mod actions (Phase 1 minimal — used by the-last-draft admin)
   // ----------------------------------------------------------------------
 
-  async getApprovedUsers(options) {
+  // Listing methods are synchronous in Devvit (callers chain .all() directly).
+  getApprovedUsers(options) {
     return this._listing([]);
   }
 
-  async getBannedUsers(options) {
+  getBannedUsers(options) {
     return this._listing([]);
   }
 
-  async getModerators(options) {
-    return this._listing([]);
+  getModerators(options = {}) {
+    const want = options.username ? String(options.username).replace(/^u\//i, '').toLowerCase() : null;
+    const mods = Array.from(this._users.values())
+      .filter((u) => u.isModerator)
+      .filter((u) => !want || u.username.replace(/^u\//i, '').toLowerCase() === want)
+      .map((u) => ({ ...this._wrapUser(u), date: new Date((u.createdUtc || 0) * 1000), moderatorInfo: { permissions: ['all'] } }));
+    return this._listing(mods);
   }
 
   // ----------------------------------------------------------------------
