@@ -4786,7 +4786,7 @@ async function loadEmulatorFeed({ force = false } = {}) {
       f.error = null;
       f.hint = null;
       // Drop a stale selection (e.g. after the emulator state was cleared).
-      if (f.activePostId && !f.posts.some((p) => p.id === f.activePostId)) f.activePostId = null;
+      if (f.activePostId && f.activePostId !== MAIN_POST_ID && !f.posts.some((p) => p.id === f.activePostId)) f.activePostId = null;
     } else {
       f.posts = [];
       f.comments = [];
@@ -4823,9 +4823,13 @@ function emulatorCommentsFor(postId) {
     .sort((a, b) => (a.createdUtc || 0) - (b.createdUtc || 0));
 }
 
+// The project's regular post (Live config title, default entry) is not an
+// emulator post. It stays selectable as this sentinel once mock posts exist.
+const MAIN_POST_ID = '__main__';
+
 function emulatorActivePost() {
   const f = state.emulatorFeed;
-  if (!f.posts.length) return null;
+  if (!f.posts.length || f.activePostId === MAIN_POST_ID) return null;
   if (f.activePostId) {
     const found = f.posts.find((p) => p.id === f.activePostId);
     if (found) return found;
@@ -4836,10 +4840,10 @@ function emulatorActivePost() {
 function setActiveMockPost(id) {
   // Remember where we came from so the post's back arrow can return there.
   const f = state.emulatorFeed;
-  const cur = emulatorActivePost();
-  if (cur && cur.id !== id) {
-    f.backStack = (f.backStack || []).filter((x) => x !== cur.id && x !== id);
-    f.backStack.push(cur.id);
+  const curId = (emulatorActivePost() || {}).id || MAIN_POST_ID;
+  if (curId !== id) {
+    f.backStack = (f.backStack || []).filter((x) => x !== curId && x !== id);
+    f.backStack.push(curId);
   }
   f.activePostId = id || null;
   f.viewEntry = null;
@@ -4847,14 +4851,11 @@ function setActiveMockPost(id) {
 
 function mockPostBack() {
   const f = state.emulatorFeed;
-  const cur = emulatorActivePost();
-  const stack = (f.backStack || []).filter((x) => f.posts.some((p) => p.id === x) && (!cur || x !== cur.id));
+  const curId = (emulatorActivePost() || {}).id || MAIN_POST_ID;
+  const stack = (f.backStack || []).filter((x) => x !== curId
+    && (x === MAIN_POST_ID || f.posts.some((p) => p.id === x)));
   let target = stack.pop();
-  if (!target) {
-    const other = f.posts.filter((p) => !cur || p.id !== cur.id)
-      .sort((a, b) => (a.createdUtc || 0) - (b.createdUtc || 0))[0];
-    target = other && other.id;
-  }
+  if (!target && curId !== MAIN_POST_ID) target = MAIN_POST_ID;
   f.backStack = stack;
   if (!target) return;
   f.activePostId = target;
@@ -5307,7 +5308,7 @@ function renderPostView() {
   {
     const back = credit.querySelector('.post-view__credit-back');
     const fe = state.emulatorFeed;
-    if (back && fe.posts && fe.posts.length > 1) {
+    if (back && fe.posts && fe.posts.length > 0) {
       back.classList.add('is-live');
       back.title = 'Back to the previous post';
       back.addEventListener('click', (e) => { e.stopPropagation(); mockPostBack(); });
@@ -5514,7 +5515,7 @@ function renderPostView() {
     .sort((a, b) => (b.createdUtc || 0) - (a.createdUtc || 0));
   const more = el('div', { class: 'post-view__more' });
   const moreHead = el('div', { class: 'post-view__more-head' });
-  moreHead.appendChild(el('span', {}, others.length ? 'More posts' : 'Mock posts'));
+  moreHead.appendChild(el('span', {}, (others.length || activeMock) ? 'More posts' : 'Mock posts'));
   const newWrap = el('div', { class: 'post-view__new-wrap' });
   newWrap.appendChild(el('button', {
     class: 'post-view__more-new',
@@ -5581,6 +5582,22 @@ function renderPostView() {
   }
   moreHead.appendChild(newWrap);
   more.appendChild(moreHead);
+  if (activeMock) {
+    const card = el('div', {
+      class: 'post-view__mock-card',
+      onclick: () => { setActiveMockPost(MAIN_POST_ID); emulatorFeedRerender(); },
+    });
+    const meta = el('div', { class: 'post-view__mock-meta' });
+    meta.appendChild(el('span', {}, subLabel));
+    meta.appendChild(el('span', { class: 'post-view__comment-dot' }, '·'));
+    meta.appendChild(el('span', {}, authorLabel));
+    card.appendChild(meta);
+    card.appendChild(el('div', { class: 'post-view__mock-title' }, titleLabel || 'Main post'));
+    const foot = el('div', { class: 'post-view__mock-foot' });
+    foot.appendChild(el('span', { class: 'post-view__type-chip' }, 'Regular post'));
+    card.appendChild(foot);
+    more.appendChild(card);
+  }
   others.forEach((p) => {
     const card = el('div', {
       class: 'post-view__mock-card',
