@@ -2270,7 +2270,7 @@ pre:hover .code-copy { opacity: 1; }
   background: #000;
   margin-top: 4px;
   box-shadow: 0 4px 12px rgba(0,0,0,0.4);
-  aspect-ratio: 732 / 512;
+  aspect-ratio: 700 / 512;
   background-image: url('assets/reddit/farnsworth-offline-wide.png');
   background-size: cover;
   background-position: center;
@@ -7917,6 +7917,11 @@ body.density-compact .msg__body { font-size: 12.5px; }
 }
 .post-view__entry-btn.is-active { background: #343536; color: #fff; }
 .post-view__embed--expanded { aspect-ratio: 9 / 16; max-height: 78vh; }
+.post-view__embed-iframe--native {
+  position: absolute; top: 0; left: 0;
+  width: 700px; height: 512px;
+  transform-origin: top left;
+}
 .post-view__new-wrap { position: relative; }
 .post-view__types-menu {
   position: absolute; right: 0; top: calc(100% + 6px); z-index: 20;

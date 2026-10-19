@@ -5091,6 +5091,10 @@ function encodePostData(data) {
 // The harness reads these params into its @devvit/web/client shim:
 //   postId, entry (devvit.json entrypoint), postData (base64url JSON),
 //   mode=inline|expanded. Templates that ignore them still render.
+// Reddit's desktop inline post webview size (measured on live Reddit, Oct 18).
+const POST_INLINE_W = 700;
+const POST_INLINE_H = 512;
+
 function postViewIframeSrc(post) {
   const f = state.emulatorFeed;
   const params = ['view=post'];
@@ -5368,13 +5372,25 @@ function renderPostView() {
     && state.emulatorFeed.viewEntry !== ((activeMock && activeMock.entry) || 'default'));
   const embed = el('div', { class: 'post-view__embed' + (expanded ? ' post-view__embed--expanded' : '') });
   if (state.farnsworthDev?.available) {
-    embed.appendChild(el('iframe', {
-      class: 'post-view__embed-iframe',
+    const frame = el('iframe', {
+      class: 'post-view__embed-iframe' + (expanded ? '' : ' post-view__embed-iframe--native'),
       // postId, entry, and postData let a project's harness render the
       // specific mock post the IDE has selected, as that post's type.
       src: postViewIframeSrc(activeMock),
       title: 'Live Reddit post preview',
-    }));
+    });
+    embed.appendChild(frame);
+    // Reddit renders the inline post at a fixed size, so games lay out for
+    // exactly that. Render at the native size and scale it to the panel,
+    // instead of handing the game a smaller viewport that clips it.
+    if (!expanded) {
+      const fit = () => {
+        const w = embed.clientWidth;
+        if (w > 0) frame.style.transform = `scale(${w / POST_INLINE_W})`;
+      };
+      new ResizeObserver(fit).observe(embed);
+      requestAnimationFrame(fit);
+    }
   }
   content.appendChild(embed);
 
