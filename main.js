@@ -1448,13 +1448,27 @@ ipcMain.handle('devvit:postTypes', async (_event, repoRoot) => {
     presets,
     configPath: path.join(repoRoot, '.farnsworth', 'config.json'),
     hasDevvitJson: !!devvitJson,
+    // devvit.json "forms": name -> /internal/ endpoint. A menu action that
+    // answers { showForm: { name, form } } is submitted to forms[name].
+    forms: (devvitJson && devvitJson.forms && typeof devvitJson.forms === 'object') ? devvitJson.forms : {},
   };
 });
 
 // Run one of the app's own menu endpoints against the emulator-backed server.
 // The body mirrors the shape Devvit sends a subreddit-scoped menu action.
+// Devvit's showToast is either a string or { text, appearance }.
+function devvitToastText(t) {
+  if (!t) return null;
+  if (typeof t === 'string') return t;
+  if (typeof t === 'object' && t.text) return String(t.text);
+  return null;
+}
+
+// Also used to submit a Devvit form: payload.body is the form values object,
+// posted to the devvit.json forms[name] endpoint exactly like Reddit does.
 ipcMain.handle('devvit:runMenuAction', async (_event, payload = {}) => {
   const endpoint = String(payload.endpoint || '');
+  const isFormSubmit = !!(payload.body && typeof payload.body === 'object');
   if (!endpoint.startsWith('/internal/')) return { ok: false, error: 'bad_endpoint' };
   const resolved = await resolveEmulatorAdminBase();
   if (!resolved.ok) return resolved;
@@ -1469,7 +1483,7 @@ ipcMain.handle('devvit:runMenuAction', async (_event, payload = {}) => {
       method: 'POST',
       signal: controller.signal,
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ location: 'subreddit', targetId: 't5_emulator' }),
+      body: JSON.stringify(isFormSubmit ? payload.body : { location: 'subreddit', targetId: 't5_emulator' }),
     });
     status = res.status;
     const text = await res.text();
@@ -1487,16 +1501,22 @@ ipcMain.handle('devvit:runMenuAction', async (_event, payload = {}) => {
   const after = await emulatorAdminRequest('/emulator/state');
   const created = ((after && after.posts) || []).filter((p) => !beforeIds.has(p.id));
   created.sort((a, b) => (b.createdUtc || 0) - (a.createdUtc || 0));
+  const toast = devvitToastText(json && json.showToast);
+  // The app asked for a form first (date pickers, vote options, ...). Hand it
+  // to the renderer; the post gets created when the form is submitted.
+  if (status < 400 && !created.length && json && json.showForm && json.showForm.form) {
+    return { ok: true, form: json.showForm, toast, response: json };
+  }
   if (status >= 400 || !created.length) {
     return {
       ok: false,
       error: status >= 400 ? 'menu_action_failed' : 'no_post_created',
       status,
       response: json,
-      hint: json && json.showToast ? String(json.showToast) : null,
+      hint: toast,
     };
   }
-  return { ok: true, id: created[0].id, createdIds: created.map((p) => p.id), response: json };
+  return { ok: true, id: created[0].id, createdIds: created.map((p) => p.id), toast, response: json };
 });
 
 ipcMain.handle('devvit:emulatorSubmitComment', async (_event, payload = {}) =>

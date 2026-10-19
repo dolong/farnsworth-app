@@ -226,6 +226,21 @@ function _withPostContext(listener) {
   return (req, res) => {
     const h = req.headers || {};
     const postId = h['x-farnsworth-post-id'] || h['devvit-post-id'];
+    // Real Devvit stamps every request with identity headers; apps that read
+    // the player from them (e.g. request.headers.get('devvit-user')) would
+    // otherwise see no user in the emulator. Never overwrite a sent value.
+    // Hono's node adapter reads rawHeaders, so add to both.
+    const _addHeader = (k, v) => {
+      if (h[k] || v == null || v === '') return;
+      req.headers[k] = String(v);
+      if (Array.isArray(req.rawHeaders)) req.rawHeaders.push(k, String(v));
+    };
+    if (req.headers) {
+      _addHeader('devvit-user', _ctx.userId);
+      _addHeader('devvit-user-name', _ctx.username);
+      _addHeader('devvit-subreddit-name', _ctx.subredditName ? String(_ctx.subredditName).split('r/').pop() : '');
+      if (postId) _addHeader('devvit-post-id', postId);
+    }
     if (!postId) return listener(req, res);
     const p = _reddit._posts.get(String(postId));
     return _reqCtx.run({ postId: String(postId), postData: p ? p.postData : undefined }, () => listener(req, res));

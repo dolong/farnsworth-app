@@ -7947,3 +7947,19 @@ body.density-compact .msg__body { font-size: 12.5px; }
 .msg__media-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .msg__media-btn { background: #202225; color: #c8ccd2; border: 1px solid #16171a; border-radius: 5px; padding: 2px 7px; font: inherit; cursor: pointer; }
 .msg__media-btn:hover { background: #2a2c30; }
+
+/* Devvit forms opened from Post View "+ New post" (Oct 18 2026) */
+.devvit-form__backdrop { position: fixed; inset: 0; z-index: 10000; background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center; }
+.devvit-form { width: min(460px, 92vw); max-height: 86vh; overflow: auto; background: var(--bg-elevated, #1e1f22); color: var(--fg, #e6e6e6); border: 1px solid var(--border, #33353a); border-radius: 10px; padding: 18px 18px 14px; box-shadow: 0 18px 50px rgba(0,0,0,.5); font-size: 13px; }
+.devvit-form__title { font-size: 15px; font-weight: 600; margin-bottom: 6px; }
+.devvit-form__desc { color: var(--fg-muted, #a0a3a8); margin-bottom: 12px; line-height: 1.4; }
+.devvit-form__group { margin: 12px 0 6px; font-weight: 600; color: var(--fg-muted, #a0a3a8); text-transform: uppercase; font-size: 11px; letter-spacing: .04em; }
+.devvit-form__row { display: flex; flex-direction: column; gap: 5px; margin-bottom: 12px; }
+.devvit-form__row--check { flex-direction: row; align-items: center; gap: 8px; }
+.devvit-form__label { font-weight: 500; }
+.devvit-form__input { background: var(--bg, #141517); color: inherit; border: 1px solid var(--border, #33353a); border-radius: 6px; padding: 7px 9px; font: inherit; }
+.devvit-form__input:focus { outline: none; border-color: var(--accent, #ff6a2b); }
+.devvit-form__help { color: var(--fg-muted, #a0a3a8); font-size: 12px; }
+.devvit-form__actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px; }
+.devvit-form__btn { padding: 7px 14px; border-radius: 6px; border: 1px solid var(--border, #33353a); background: transparent; color: inherit; font: inherit; cursor: pointer; }
+.devvit-form__btn--primary { background: var(--accent, #ff6a2b); border-color: var(--accent, #ff6a2b); color: #fff; font-weight: 600; }

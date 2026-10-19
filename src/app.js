@@ -4899,15 +4899,35 @@ async function createPostOfType(type) {
     f.busy = true;
     emulatorFeedRerender();
     try {
-      const res = await window.farnsworth.devvitRunMenuAction({ endpoint: type.endpoint });
-      if (res && res.ok) {
+      let res = await window.farnsworth.devvitRunMenuAction({ endpoint: type.endpoint });
+      // A menu action may answer with a form (and a form submit with another
+      // form). Show each one; submitting posts the values to devvit.json
+      // forms[name], which is where the app actually creates the post.
+      for (let hops = 0; res && res.ok && res.form && hops < 5; hops++) {
+        const spec = res.form;
+        const forms = (f.postTypes && f.postTypes.forms) || {};
+        const formEndpoint = forms[spec.name];
+        if (!formEndpoint) {
+          res = { ok: false, error: 'unknown_form', hint: `devvit.json has no "forms" entry named "${spec.name}".` };
+          break;
+        }
+        f.busy = false;
+        emulatorFeedRerender();
+        const values = await showDevvitFormDialog(spec.form, spec.data);
+        if (!values) { res = null; break; }
+        f.busy = true;
+        emulatorFeedRerender();
+        res = await window.farnsworth.devvitRunMenuAction({ endpoint: formEndpoint, body: values });
+      }
+      if (res && res.ok && res.id) {
         f.activePostId = res.id;
         f.viewEntry = null;
         f.error = null;
         f.hint = null;
-      } else {
-        f.error = (res && res.error) || 'menu_action_failed';
-        f.hint = (res && res.hint) || null;
+        if (res.toast) showToast(res.toast);
+      } else if (res) {
+        f.error = res.error || 'menu_action_failed';
+        f.hint = res.hint || null;
       }
     } finally {
       f.busy = false;
@@ -4923,6 +4943,106 @@ async function createPostOfType(type) {
     entry: type.entry && type.entry !== 'default' ? type.entry : (type.source === 'preset' ? 'default' : undefined),
     postData: type.postData,
     postType: type.postType,
+  });
+}
+
+// Renders a Devvit form ({ title, description, fields, acceptLabel,
+// cancelLabel }) as a modal and resolves with the values object Devvit would
+// POST (select -> string[], number -> number, boolean -> bool), or null on
+// cancel. Groups are flattened; image fields fall back to a URL input.
+function showDevvitFormDialog(form, data) {
+  return new Promise((resolve) => {
+    const initial = (data && typeof data === 'object') ? data : {};
+    const getters = [];
+    const flat = [];
+    const walk = (fields) => (Array.isArray(fields) ? fields : []).forEach((fd) => {
+      if (!fd) return;
+      if (fd.type === 'group') { flat.push({ type: '__group', label: fd.label }); walk(fd.fields); return; }
+      flat.push(fd);
+    });
+    walk(form && form.fields);
+
+    const backdrop = el('div', { class: 'devvit-form__backdrop' });
+    const box = el('form', { class: 'devvit-form' });
+    box.appendChild(el('div', { class: 'devvit-form__title' }, (form && form.title) || 'Form'));
+    if (form && form.description) box.appendChild(el('div', { class: 'devvit-form__desc' }, String(form.description)));
+
+    flat.forEach((fd, i) => {
+      if (fd.type === '__group') {
+        if (fd.label) box.appendChild(el('div', { class: 'devvit-form__group' }, String(fd.label)));
+        return;
+      }
+      const id = `devvit-form-f${i}`;
+      const def = Object.prototype.hasOwnProperty.call(initial, fd.name) ? initial[fd.name] : fd.defaultValue;
+      const row = el('div', { class: 'devvit-form__row' });
+      const label = el('label', { class: 'devvit-form__label', for: id }, String(fd.label || fd.name) + (fd.required ? ' *' : ''));
+      let input;
+      if (fd.type === 'boolean') {
+        input = el('input', { type: 'checkbox', id, class: 'devvit-form__check' });
+        input.checked = !!def;
+        row.classList.add('devvit-form__row--check');
+        row.appendChild(input);
+        row.appendChild(label);
+        getters.push([fd.name, () => input.checked]);
+      } else if (fd.type === 'select') {
+        input = el('select', { id, class: 'devvit-form__input' });
+        if (fd.multiSelect) input.multiple = true;
+        const defs = new Set((Array.isArray(def) ? def : (def != null ? [def] : [])).map(String));
+        if (!fd.multiSelect && !fd.required && !defs.size) input.appendChild(el('option', { value: '' }, '—'));
+        (fd.options || []).forEach((o) => {
+          const opt = el('option', { value: String(o.value) }, String(o.label ?? o.value));
+          if (defs.has(String(o.value))) opt.selected = true;
+          input.appendChild(opt);
+        });
+        row.appendChild(label);
+        row.appendChild(input);
+        getters.push([fd.name, () => Array.from(input.selectedOptions).map((o) => o.value).filter((v) => v !== '')]);
+      } else if (fd.type === 'paragraph') {
+        input = el('textarea', { id, class: 'devvit-form__input', rows: String(fd.lineHeight || 4) });
+        input.value = def != null ? String(def) : '';
+        row.appendChild(label);
+        row.appendChild(input);
+        getters.push([fd.name, () => input.value]);
+      } else {
+        const isNum = fd.type === 'number';
+        input = el('input', { id, class: 'devvit-form__input', type: isNum ? 'number' : 'text', placeholder: fd.placeholder ? String(fd.placeholder) : '' });
+        if (isNum && fd.step) input.step = String(fd.step);
+        input.value = def != null ? String(def) : '';
+        row.appendChild(label);
+        row.appendChild(input);
+        getters.push([fd.name, () => {
+          if (!isNum) return input.value;
+          return input.value === '' ? undefined : Number(input.value);
+        }]);
+      }
+      if (fd.required && fd.type !== 'boolean') input.required = true;
+      if (fd.disabled) input.disabled = true;
+      if (fd.helpText) row.appendChild(el('div', { class: 'devvit-form__help' }, String(fd.helpText)));
+      box.appendChild(row);
+    });
+
+    const done = (val) => {
+      document.removeEventListener('keydown', onKey, true);
+      backdrop.remove();
+      resolve(val);
+    };
+    const onKey = (e) => { if (e.key === 'Escape') { e.preventDefault(); done(null); } };
+    document.addEventListener('keydown', onKey, true);
+    const actions = el('div', { class: 'devvit-form__actions' });
+    actions.appendChild(el('button', { type: 'button', class: 'devvit-form__btn', onclick: () => done(null) }, (form && form.cancelLabel) || 'Cancel'));
+    actions.appendChild(el('button', { type: 'submit', class: 'devvit-form__btn devvit-form__btn--primary' }, (form && form.acceptLabel) || 'Submit'));
+    box.appendChild(actions);
+    box.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const values = {};
+      getters.forEach(([name, get]) => { const v = get(); if (v !== undefined) values[name] = v; });
+      done(values);
+    });
+    backdrop.addEventListener('mousedown', (e) => { if (e.target === backdrop) done(null); });
+    backdrop.appendChild(box);
+    document.body.appendChild(backdrop);
+    const first = box.querySelector('input:not([disabled]), select, textarea');
+    if (first) first.focus();
   });
 }
 
