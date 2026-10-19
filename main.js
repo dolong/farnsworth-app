@@ -11689,6 +11689,12 @@ ipcMain.handle('chatConv:create', async (event, { id, title, messages } = {}) =>
 
 ipcMain.handle('chatConv:save', async (_event, { id, title, messages } = {}) => {
   if (!id) return { ok: false, error: 'no_id' };
+  // A conversation a background Express task is running in has one writer:
+  // its lane. Another window saving its stale copy would clobber the run.
+  const owner = expressOwnerTask(id);
+  if (owner && expressLanes.byWebContents(_event.sender.id)?.run?.taskId !== owner.id) {
+    return { ok: false, error: 'owned_by_express', taskId: owner.id };
+  }
   db.saveConversation(id, title || 'Untitled', messages || []);
   return { ok: true };
 });
@@ -11748,6 +11754,21 @@ ipcMain.handle('credential:deleteSecret', async (_event, { service, account } = 
 const EXPRESS_LANE_IDLE_MS = 10 * 60 * 1000;
 let expressControl = null;
 let expressBridge = null;
+const EXPRESS_LIVE = new Set(['queued', 'running', 'stopping']);
+function expressOwnerTask(conversationId) {
+  if (!expressBridge || !conversationId) return null;
+  for (const t of expressBridge.tasks.values()) {
+    if (t.conversationId === conversationId && EXPRESS_LIVE.has(t.status)) return t;
+  }
+  return null;
+}
+// Plain JSON for the renderer (IPC structured clone).
+function expressChatView(t = {}) {
+  return { id: t.id || t.taskId || null, taskId: t.taskId || t.id || null, conversationId: t.conversationId || null, status: t.status || null, folder: t.folder || null, title: t.title || null };
+}
+ipcMain.handle('express:runningChats', () => (expressBridge
+  ? [...expressBridge.tasks.values()].filter((t) => t.conversationId && EXPRESS_LIVE.has(t.status)).map(expressChatView)
+  : []));
 let expressReaper = null;
 const expressRenderer = createRendererCaller();
 
@@ -11828,7 +11849,14 @@ function startExpressControl() {
       releaseTurn: (token, webContentsId) => expressTurns.release(token, webContentsId),
       afterLaneFree: () => setTimeout(expressTick, 100),
       scheduledRuns: () => [],
-      emit: (topic, data) => expressControl && expressControl.emit(topic, data),
+      emit: (topic, data) => {
+        if (expressControl) expressControl.emit(topic, data);
+        // Let the user's own windows follow background chats live.
+        for (const w of BrowserWindow.getAllWindows()) {
+          if (w.isDestroyed() || isExpressLaneWindow(w)) continue;
+          try { w.webContents.send('express:chatEvent', { topic, data: expressChatView(data) }); } catch {}
+        }
+      },
     });
     expressControl.addTools(expressBridge.tools);
     expressControl.start().catch((e) => console.warn('[express] control server failed:', e.message));

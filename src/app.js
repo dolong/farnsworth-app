@@ -917,8 +917,68 @@ function scheduleChatHistorySave() {
   }, delay);
 }
 
+// Background Express chats (Oct 19). Express tasks run in hidden lane
+// windows; this window only learns about them through main. A conversation a
+// task is running in is owned by that lane: don't stamp it stopped, don't
+// save over it, don't send into it, and follow it live from the DB.
+const IN_EXPRESS_LANE = new URLSearchParams(location.search).get('expressAgent') === '1';
+const expressOwnedChats = new Map(); // conversationId -> task view
+function isExpressOwned(id) { return !!id && expressOwnedChats.has(id); }
+async function refreshExpressOwned() {
+  if (IN_EXPRESS_LANE || !window.farnsworth?.expressRunningChats) return;
+  try {
+    const list = await window.farnsworth.expressRunningChats();
+    expressOwnedChats.clear();
+    for (const t of list || []) if (t?.conversationId) expressOwnedChats.set(t.conversationId, t);
+  } catch {}
+}
+let _expressReloadTimer = null;
+let _expressReloadAt = 0;
+async function reloadActiveFromDb() {
+  _expressReloadTimer = null;
+  _expressReloadAt = Date.now();
+  const id = state.chatActiveId;
+  if (!id || isChatTurnActive()) return;
+  const conv = await window.farnsworth.chatConvLoad(id);
+  if (!conv || state.chatActiveId !== id) return;
+  state.chatMessages = Array.isArray(conv.messages) ? conv.messages : [];
+  renderChat();
+  sendChatHistorySnapshot?.();
+}
+function scheduleExpressReload() {
+  if (_expressReloadTimer) return;
+  _expressReloadTimer = setTimeout(reloadActiveFromDb, Math.max(0, 1200 - (Date.now() - _expressReloadAt)));
+}
+async function onExpressChatEvent(evt) {
+  const t = evt?.data || {};
+  const convId = t.conversationId;
+  if (!convId) return;
+  if (evt.topic === 'chat.task') {
+    if (['queued', 'running', 'stopping'].includes(t.status)) {
+      const isNew = !expressOwnedChats.has(convId);
+      expressOwnedChats.set(convId, t);
+      refreshChatHistoryList?.();
+      // Follow the job: show the running chat when it is in this window's
+      // project and the user is not mid-turn here.
+      if (isNew && t.status === 'running' && !isChatTurnActive() && state.chatActiveId !== convId
+          && (!t.folder || t.folder === state.folder)) {
+        await switchConversation(convId);
+        toggleChatHistory?.(false);
+      }
+    } else {
+      expressOwnedChats.delete(convId);
+      refreshChatHistoryList?.();
+      if (state.chatActiveId === convId) { clearTimeout(_expressReloadTimer); await reloadActiveFromDb(); }
+    }
+    updateChatSendButton?.();
+  } else if (evt.topic === 'chat.progress' && convId === state.chatActiveId) {
+    scheduleExpressReload();
+  }
+}
+
 async function saveActiveConversation() {
   if (!state.chatActiveId) return;
+  if (isExpressOwned(state.chatActiveId)) return;
   // Title preference (Jul 13, per-call-site 'titles'): LLM-generated title
   // (this session) > preserved non-heuristic title from the DB row (survives
   // restarts — if the stored title differs from the heuristic, it was
@@ -1401,7 +1461,7 @@ async function switchConversation(id) {
   // A renderer turn cannot survive a conversation reload. Normalize any
   // persisted spinner from an interrupted/older session so it cannot make
   // Companion report a false busy state forever.
-  if (!isChatTurnActive()) {
+  if (!isChatTurnActive() && !isExpressOwned(conv.id)) {
     for (const m of state.chatMessages) {
       if (m?.working) {
         m.working = false;
@@ -14316,6 +14376,10 @@ async function sendChatMessage(opts) {
   // composer button is a Stop button while working, so a click here means the
   // user wants to stop; a stray Enter is a no-op.
   if (isChatTurnActive()) return;
+  if (!IN_EXPRESS_LANE && isExpressOwned(state.chatActiveId)) {
+    showToast?.('An Express job is running in this chat. Wait for it to finish, or start a new chat.');
+    return;
+  }
   const input = $('#chat-input');
   const synthetic = !!(opts && typeof opts.text === 'string');
   const text = synthetic ? opts.text.trim() : (input ? input.value.trim() : '');
@@ -17895,6 +17959,8 @@ async function init() {
   // Falls back to creating a new conversation if no saved active id
   // exists or if the saved id no longer exists in the DB.
   await refreshChatHistoryList();
+  await refreshExpressOwned();
+  window.farnsworth?.onExpressChatEvent?.((evt) => { onExpressChatEvent(evt).catch((e) => console.warn('[express] chat event:', e)); });
   let activeRestored = false;
   if (!state.chatActiveId && window.farnsworth?.getSetting) {
     try {
@@ -17905,8 +17971,9 @@ async function init() {
           state.chatActiveId = conv.id;
           state.chatMessages = Array.isArray(conv.messages) ? conv.messages : [];
           // No chat turn survives renderer startup. Persisted `working` flags
-          // are stale UI state, not proof that an agent is still running.
-          for (const m of state.chatMessages) {
+          // are stale UI state, not proof that an agent is still running --
+          // unless a background Express task owns this conversation.
+          if (!isExpressOwned(conv.id)) for (const m of state.chatMessages) {
             if (m?.working) {
               m.working = false;
               m.workingLabel = '';

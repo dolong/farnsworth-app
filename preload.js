@@ -489,6 +489,12 @@ contextBridge.exposeInMainWorld('farnsworth', {
   },
   expressAgentAccept: (offerId) => ipcRenderer.invoke('express:agent:accept', offerId),
   expressAgentStarted: (payload) => ipcRenderer.invoke('express:agent:started', payload || {}),
+  expressRunningChats: () => ipcRenderer.invoke('express:runningChats'),
+  onExpressChatEvent: (callback) => {
+    const handler = (_e, payload) => { try { callback(payload); } catch (err) { console.error('[express:chatEvent] handler error:', err); } };
+    ipcRenderer.on('express:chatEvent', handler);
+    return () => ipcRenderer.removeListener('express:chatEvent', handler);
+  },
   expressAgentProgress: (payload) => ipcRenderer.invoke('express:agent:progress', payload || {}),
   expressAgentComplete: (payload) => ipcRenderer.invoke('express:agent:complete', payload || {}),
   expressReply: (payload) => ipcRenderer.invoke('express:reply', payload || {}),
