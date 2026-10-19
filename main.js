@@ -16,6 +16,14 @@ const fs = require('fs/promises');
 const fsSync = require('fs');
 const child_process = require('child_process');
 const crypto = require('crypto');
+
+// Per-project key for the devvit emulator cache files (~/.cache/farnsworth-devvit-<key>[-state].json).
+// Oct 18 2026: the old key was the first 8 BYTES of the path in hex, which is
+// always "/Users/l" -> every project shared one emulator state, so mock posts
+// from BreachReddit showed up in DiceFightReddit's Post View. Hash the full path.
+function devvitRepoKey(p) {
+  return crypto.createHash('sha256').update(path.resolve(String(p))).digest('hex').slice(0, 16);
+}
 const db = require('./db');
 
 // ---- Instance identity (Jul 30) ------------------------------------------
@@ -1259,7 +1267,7 @@ async function getFarnsworthDevStatus(appType = 'devvit', repoRoot, { detailed =
 
   const workspace = (typeof repoRoot === 'string' && repoRoot) ? repoRoot : meta.repoRoot;
   if (workspace) {
-    const repoHash = Buffer.from(workspace).toString('hex').slice(0, 16);
+    const repoHash = devvitRepoKey(workspace);
     result.configPath = path.join(cacheDir, `farnsworth-devvit-${repoHash}.json`);
     try {
       const cfg = JSON.parse(await fs.readFile(result.configPath, 'utf8'));
@@ -2221,7 +2229,7 @@ ipcMain.handle('dev:farnsworth:boot', async (_event, appType = 'devvit', repoRoo
         };
         const cacheDir = path2.join(os2.homedir(), '.cache');
         fs2.mkdirSync(cacheDir, { recursive: true });
-        const repoHash = Buffer.from(repoRoot).toString('hex').slice(0, 16);
+        const repoHash = devvitRepoKey(repoRoot);
         const cfgPath = path2.join(cacheDir, `farnsworth-devvit-${repoHash}.json`);
         // Phase 1: separate state file for emulator-internal state (Redis
         // store + Reddit posts/comments/flairs). Hydrated on boot, written
@@ -2667,7 +2675,7 @@ ipcMain.handle('devvit:set-project-settings', async (_event, workspacePath, curr
     };
     const cacheDir = path2.join(os2.homedir(), '.cache');
     fs2.mkdirSync(cacheDir, { recursive: true });
-    const cfgPath = path2.join(cacheDir, `farnsworth-devvit-${Buffer.from(workspacePath).toString('hex').slice(0, 16)}.json`);
+    const cfgPath = path2.join(cacheDir, `farnsworth-devvit-${devvitRepoKey(workspacePath)}.json`);
     fs2.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
   } catch (e) {
     console.error('[devvit-emulator] failed to rewrite config file:', e);
