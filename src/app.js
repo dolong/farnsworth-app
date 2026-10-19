@@ -4833,6 +4833,35 @@ function emulatorActivePost() {
   return f.posts.slice().sort((a, b) => (b.createdUtc || 0) - (a.createdUtc || 0))[0];
 }
 
+function setActiveMockPost(id) {
+  // Remember where we came from so the post's back arrow can return there.
+  const f = state.emulatorFeed;
+  const cur = emulatorActivePost();
+  if (cur && cur.id !== id) {
+    f.backStack = (f.backStack || []).filter((x) => x !== cur.id && x !== id);
+    f.backStack.push(cur.id);
+  }
+  f.activePostId = id || null;
+  f.viewEntry = null;
+}
+
+function mockPostBack() {
+  const f = state.emulatorFeed;
+  const cur = emulatorActivePost();
+  const stack = (f.backStack || []).filter((x) => f.posts.some((p) => p.id === x) && (!cur || x !== cur.id));
+  let target = stack.pop();
+  if (!target) {
+    const other = f.posts.filter((p) => !cur || p.id !== cur.id)
+      .sort((a, b) => (a.createdUtc || 0) - (b.createdUtc || 0))[0];
+    target = other && other.id;
+  }
+  f.backStack = stack;
+  if (!target) return;
+  f.activePostId = target;
+  f.viewEntry = null;
+  emulatorFeedRerender();
+}
+
 async function createMockPost(title, body, extra = {}) {
   const f = state.emulatorFeed;
   if (f.busy) return null;
@@ -4845,8 +4874,7 @@ async function createMockPost(title, body, extra = {}) {
     if (extra.postType) payload.postType = extra.postType;
     const res = await window.farnsworth.devvitEmulatorSubmitPost(payload);
     if (res && res.ok) {
-      f.activePostId = res.id || null;
-      f.viewEntry = null;
+      setActiveMockPost(res.id || null);
       await loadEmulatorFeed({ force: true });
       return res.id || null;
     }
@@ -4920,8 +4948,7 @@ async function createPostOfType(type) {
         res = await window.farnsworth.devvitRunMenuAction({ endpoint: formEndpoint, body: values });
       }
       if (res && res.ok && res.id) {
-        f.activePostId = res.id;
-        f.viewEntry = null;
+        setActiveMockPost(res.id);
         f.error = null;
         f.hint = null;
         if (res.toast) showToast(res.toast);
@@ -5277,6 +5304,15 @@ function renderPostView() {
     <div class="post-view__credit-more"><svg viewBox="0 0 20 20" fill="currentColor"><circle cx="5" cy="10" r="1.4"/><circle cx="10" cy="10" r="1.4"/><circle cx="15" cy="10" r="1.4"/></svg></div>
   `;
   content.appendChild(credit);
+  {
+    const back = credit.querySelector('.post-view__credit-back');
+    const fe = state.emulatorFeed;
+    if (back && fe.posts && fe.posts.length > 1) {
+      back.classList.add('is-live');
+      back.title = 'Back to the previous post';
+      back.addEventListener('click', (e) => { e.stopPropagation(); mockPostBack(); });
+    }
+  }
 
   // Title — driven by state.liveConfig.postName when set, falls through
   // to the hardcoded mock post. (Long Jul 3 ~13:19 ET — "the post name
@@ -5548,7 +5584,7 @@ function renderPostView() {
   others.forEach((p) => {
     const card = el('div', {
       class: 'post-view__mock-card',
-      onclick: () => { f.activePostId = p.id; f.viewEntry = null; emulatorFeedRerender(); },
+      onclick: () => { setActiveMockPost(p.id); emulatorFeedRerender(); },
     });
     const meta = el('div', { class: 'post-view__mock-meta' });
     meta.appendChild(el('span', {}, subLabel));

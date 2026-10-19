@@ -265,7 +265,7 @@
 
 /* Feed body */
 .post-view__feed {
-  flex: 1; overflow: hidden;
+  flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden;
   display: flex; flex-direction: column;
 }
 
@@ -313,6 +313,8 @@
   margin-right: 2px;
 }
 .post-view__credit-back svg { width: 18px; height: 18px; }
+.post-view__credit-back.is-live { cursor: pointer; border-radius: 50%; }
+.post-view__credit-back.is-live:hover { background: #2a3236; color: #fff; }
 .post-view__credit-more {
   margin-left: auto;
   color: #818384;
