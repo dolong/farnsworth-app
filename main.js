@@ -4750,6 +4750,21 @@ async function getNodeTestRunner() {
   return _nodeTestRunnerMod || null;
 }
 
+// Recording only exists on the Node runner. These actions route a test to
+// the Python runner, so a test using any of them (nested too) records nothing.
+const UNRECORDABLE_TEST_ACTIONS = new Set(['switchUser', 'switchDevvitUser', 'llm-step']);
+const UNRECORDABLE_NOTE = 'No video: this test uses switchUser/switchDevvitUser or llm-step, which run on the Python runner and cannot be recorded. To get a recording, remove those steps (nested ones too): set the user with the switch_devvit_user tool before test_run, and replace llm-step judgments with waitFor/eval/if checks or a take_canvas_screenshot after the run.';
+function unrecordableActionsIn(steps, found = new Set()) {
+  if (!Array.isArray(steps)) return found;
+  for (const step of steps) {
+    if (!step || typeof step !== 'object') continue;
+    if (UNRECORDABLE_TEST_ACTIONS.has(step.action)) found.add(step.action);
+    if (Array.isArray(step.steps)) unrecordableActionsIn(step.steps, found);
+  }
+  return found;
+}
+function testStepsOf(parsed) { return Array.isArray(parsed) ? parsed : (parsed?.steps ?? []); }
+
 function recursivelyHasUnsupportedAction(steps, unsupportedSet) {
   if (!Array.isArray(steps)) return false;
   for (const step of steps) {
@@ -4941,13 +4956,20 @@ async function runTestByPath(testPath, opts = {}) {
             });
           }
         } catch {}
-        resolve({
+        const out = {
           ok: passed,
           code,
           failed,
           stdout: stdout.slice(-4000),  // tail, in case of long output
           stderr: stderr.slice(-2000),
-        });
+        };
+        if (testRecordingEnabled(opts.record)) {
+          let blockers = [];
+          try { blockers = [...unrecordableActionsIn(testStepsOf(JSON.parse(fsSync.readFileSync(testPath, 'utf8'))))]; } catch {}
+          out.video = null;
+          out.recording = { skipped: true, blockers, note: blockers.length ? UNRECORDABLE_NOTE : 'No video: the test ran on the Python runner (the canvas preview was not open or the Node runner was unavailable). Call open_testview, then run again.' };
+        }
+        resolve(out);
       });
       proc.on('error', err => {
         try {
@@ -7418,7 +7440,7 @@ const AGENT_TOOLS = [
   },
   {
     name: 'test_save',
-    description: 'Save a test JSON file to the active workspace\'s .farnsworth/devvit-tests/ folder. JSON is validated before writing. The name is normalized to lowercase-dashes (e.g. "My Test!" → "my-test"). See DEVVIT-TESTS.md for the test format. IMPORTANT - a test cannot declare its own viewport: the runner reads only `name` and `steps`, and the frame comes from the resolution dropdown in the canvas header, which defaults to MOBILE 390x844. Test View also supports Desktop presets (724x596, 1280x800, 1512x1320, 1920x1080, 2560x1440, 3440x1440), Fullscreen and Post. Do not silently assume mobile: if the layout differs between phone and desktop, ask which frame the test is for, state the assumption in the test name, and make the first step after `reload` a waitFor on `.fw-stage--desktop` or `.fw-stage--mobile` so a wrong preset fails loudly instead of dying on a selector that only exists in the other layout.',
+    description: 'Save a test JSON file to the active workspace\'s .farnsworth/devvit-tests/ folder. JSON is validated before writing. RECORDING: only tests WITHOUT switchUser, switchDevvitUser or llm-step steps (anywhere, including inside if/while) can be recorded, because those run on the Python runner. When the user wants a video of the run (or to share/send it), build the test from the other actions only: set the user beforehand with switch_devvit_user, and use waitFor/eval/if/while for checks. The result says recordable true/false. The name is normalized to lowercase-dashes (e.g. "My Test!" → "my-test"). See DEVVIT-TESTS.md for the test format. IMPORTANT - a test cannot declare its own viewport: the runner reads only `name` and `steps`, and the frame comes from the resolution dropdown in the canvas header, which defaults to MOBILE 390x844. Test View also supports Desktop presets (724x596, 1280x800, 1512x1320, 1920x1080, 2560x1440, 3440x1440), Fullscreen and Post. Do not silently assume mobile: if the layout differs between phone and desktop, ask which frame the test is for, state the assumption in the test name, and make the first step after `reload` a waitFor on `.fw-stage--desktop` or `.fw-stage--mobile` so a wrong preset fails loudly instead of dying on a selector that only exists in the other layout.',
     input_schema: {
       type: 'object',
       properties: {
@@ -7963,7 +7985,9 @@ async function executeAgentTool(name, input, folderOverride) {
     const filePath = path.join(dir, `${safeName}.json`);
     await fs.mkdir(dir, { recursive: true });
     await fs.writeFile(filePath, input.json + '\n', 'utf8');
-    return { ok: true, name: safeName, path: filePath };
+    const blockers = [...unrecordableActionsIn(testStepsOf(JSON.parse(input.json)))];
+    if (blockers.length) return { ok: true, name: safeName, path: filePath, recordable: false, blockers, note: UNRECORDABLE_NOTE };
+    return { ok: true, name: safeName, path: filePath, recordable: true };
   }
   if (name === 'test_run') {
     if (!input?.path || typeof input.path !== 'string') return { ok: false, error: 'missing_path' };
