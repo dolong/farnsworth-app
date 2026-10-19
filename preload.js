@@ -251,6 +251,11 @@ contextBridge.exposeInMainWorld('farnsworth', {
   testRun: ({ path, record }) => ipcRenderer.invoke('test:run', { path, record }),
   testRecordingsList: ({ folder, limit } = {}) => ipcRenderer.invoke('test:recordings:list', { folder, limit }),
   testRecordingsOpen: ({ folder, path, reveal } = {}) => ipcRenderer.invoke('test:recordings:open', { folder, path, reveal }),
+  onTestRecordingLive: (cb) => {
+    const h = (_e, p) => { try { cb(p || {}); } catch (err) { console.error('[test:recording:live]', err); } };
+    ipcRenderer.on('test:recording:live', h);
+    return () => ipcRenderer.removeListener('test:recording:live', h);
+  },
   onTestRecordChanged: (cb) => {
     const h = (_e, payload) => cb(payload);
     ipcRenderer.on('test:record:changed', h);

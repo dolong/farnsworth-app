@@ -6026,6 +6026,14 @@ function renderTestView() {
         paintTestRecordButton(recBtn, next);
         await window.farnsworth?.setSetting?.('test.record', next ? '1' : '0');
       });
+      paintTestRecordingLive(recBtn);
+      if (!state._testRecLiveUnsub && window.farnsworth?.onTestRecordingLive) {
+        state._testRecLiveUnsub = window.farnsworth.onTestRecordingLive(({ live }) => {
+          state.testRecordingLive = !!live;
+          const btn = document.querySelector('#testview-record');
+          if (btn) paintTestRecordingLive(btn);
+        });
+      }
       // Chat can flip the same toggle via set_test_recording — keep the button
       // honest instead of showing a stale state until the next re-render.
       if (!state._testRecordUnsub && window.farnsworth?.onTestRecordChanged) {
@@ -6069,8 +6077,20 @@ function removeTestViewTools() {
 
 // Record-toggle button paint. Kept out of renderTestView so the chat-driven
 // change listener can repaint the live button without a full canvas re-render.
-function paintTestRecordButton(btn, on) {
+// Live recording overrides the preference label: pulsing light + "Recording".
+function paintTestRecordingLive(btn) {
+  const live = !!state.testRecordingLive;
+  btn.classList.toggle('testview__btn--recording', live);
+  if (live) {
+    const label = btn.querySelector('.testview__rec-label');
+    if (label) label.textContent = 'Recording';
+  } else {
+    paintTestRecordButton(btn, state.testRecordEnabled !== false, true);
+  }
+}
+function paintTestRecordButton(btn, on, skipLive) {
   btn.classList.toggle('testview__btn--record-on', !!on);
+  if (!skipLive && state.testRecordingLive) { paintTestRecordingLive(btn); return; }
   const label = btn.querySelector('.testview__rec-label');
   if (label) label.textContent = on ? 'Record: on' : 'Record: off';
   btn.title = on

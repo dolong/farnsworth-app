@@ -2858,6 +2858,15 @@ function canvasRecordingsDirForFolder(folder) {
 // defaults to on. Every caller of the recorder goes through this so the button,
 // the agent tool and the env var can never disagree.
 const TEST_RECORD_SETTING_KEY = 'test.record';
+// "A recording is happening right now" (any run: the user's or the agent's),
+// separate from the Record on/off preference. Drives Test View's live light.
+function broadcastRecordingLive(live, filePath) {
+  const payload = { live: !!live, name: filePath ? path.basename(filePath) : null };
+  for (const w of BrowserWindow.getAllWindows()) {
+    if (w.isDestroyed() || isExpressLaneWindow(w)) continue;
+    try { w.webContents.send('test:recording:live', payload); } catch {}
+  }
+}
 function testRecordingEnabled(override) {
   if (override === true || override === false) return override;
   if (process.env.FARNSWORTH_TEST_RECORD === '0') return false;
@@ -3129,6 +3138,7 @@ async function stopCanvasTestRecording({ status, error, tailMs = 1200 } = {}) {
   await new Promise((resolve) => rec.out.end(resolve));
   canvasRecording = null;
   canvasCaptureViewOverride = null;
+  broadcastRecordingLive(false);
   const durationMs = Date.now() - rec.startedAt;
   const conv = await transcodeRecordingToMp4(rec.filePath);
   return {
@@ -11395,8 +11405,10 @@ ipcMain.handle('canvas-capture:record-state', async (_event, msg) => {
   if (msg.type === 'started') {
     rec.started = true;
     rec.width = msg.width; rec.height = msg.height; rec.mimeType = msg.mimeType;
+    broadcastRecordingLive(true, rec.filePath);
   } else if (msg.type === 'error') {
     rec.error = msg.reason || 'capture-failed';
+    broadcastRecordingLive(false);
     rec.resolveStopped?.();
   } else if (msg.type === 'stopped') {
     rec.resolveStopped?.();

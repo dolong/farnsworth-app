@@ -6231,6 +6231,18 @@ pre:hover .code-copy { opacity: 1; }
   background: #ff3b3b; border-color: #ff3b3b;
   box-shadow: 0 0 6px rgba(255,59,59,.75);
 }
+/* A recording is in progress right now (any run, including the agent's). */
+.testview__btn--recording {
+  border-color: #ff3b3b; background: rgba(255,59,59,.16); color: #fff;
+}
+.testview__btn--recording .testview__rec-dot {
+  background: #ff3b3b; border-color: #ff3b3b;
+  animation: testview-rec-pulse 1s ease-in-out infinite;
+}
+@keyframes testview-rec-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(255,59,59,.85); opacity: 1; }
+  50% { box-shadow: 0 0 0 5px rgba(255,59,59,0); opacity: .55; }
+}
 
 .testview__list {
   flex: 0 1 auto;
