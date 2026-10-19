@@ -4335,11 +4335,13 @@ async function bootFarnsworthDev() {
       }
     } else {
       state.farnsworthDev = { available: false };
+      state.farnsworthLastBootError = res?.message || res?.error || 'Failed to start dev server.';
       showToast?.(res?.message || 'Failed to start dev server.');
       console.warn('[Farnsworth] boot failed:', res);
     }
   } catch (e) {
     state.farnsworthDev = { available: false };
+    state.farnsworthLastBootError = String(e?.message || e);
     showToast?.('Failed to start dev server.');
     console.warn('[Farnsworth] boot error:', e);
   } finally {
@@ -14742,7 +14744,7 @@ async function sendChatMessage(opts) {
           '',
           '## The test format spec',
           '',
-          'Tests are JSON files. The full format spec is at `~/Documents/Farnsworth/app/DEVVIT-TESTS.md` — read it with the read_file tool BEFORE creating or editing tests so you get the action list, step shape, and common selectors right. Do NOT guess the format from this prompt — read the MD file.',
+          'Tests are JSON files. Call the `test_format_spec` tool BEFORE creating or editing tests so you get the action list, step shape, and common selectors right (it is bundled with the app; do not try to read DEVVIT-TESTS.md from disk). The game preview must be live for tests, screenshots and recordings: `open_testview` starts it, or call `go_live`. Never ask the user to click Go Live. Do NOT guess the format from this prompt — read the spec file.',
           '',
           '## General guidance',
           '',
@@ -17839,6 +17841,25 @@ async function init() {
       state.canvasMode = mode;
       updateModeToggles();
       renderCanvas();
+    });
+  }
+  // Agent Go Live (go_live / open_testview tools). Same path as the button.
+  if (window.farnsworth?.onAgentGoLive) {
+    window.farnsworth.onAgentGoLive(async () => {
+      if (!state.folder) return { ok: false, error: 'no_folder', message: 'No workspace folder is open.' };
+      if (state.farnsworthDev?.available && state.farnsworthDev?.url) {
+        if (state.canvasMode !== 'live') { window.farnsworth?.canvasRemoveAllViews?.(); state.canvasMode = 'live'; updateModeToggles(); renderCanvas(); }
+        return { ok: true, started: false, url: state.farnsworthDev.url };
+      }
+      if (state.farnsworthBooting) {
+        for (let i = 0; i < 600 && state.farnsworthBooting; i++) await new Promise((r) => setTimeout(r, 500));
+      } else {
+        if (state.canvasMode !== 'live') { window.farnsworth?.canvasRemoveAllViews?.(); state.canvasMode = 'live'; updateModeToggles(); renderCanvas(); }
+        state.farnsworthLastBootError = null;
+        await bootFarnsworthDev();
+      }
+      if (state.farnsworthDev?.available && state.farnsworthDev?.url) { renderCanvas(); return { ok: true, started: true, url: state.farnsworthDev.url }; }
+      return { ok: false, error: 'boot_failed', message: state.farnsworthLastBootError || "The project's Go Live script did not start. Check its farnsworth:devvit script and the dev server output." };
     });
   }
   // Programmatic devvit user switch (chat agent's switch_devvit_user tool).

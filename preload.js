@@ -103,6 +103,15 @@ contextBridge.exposeInMainWorld('farnsworth', {
     return () => ipcRenderer.removeListener('canvas:setPreview', handler);
   },
   // Programmatic canvas MODE switch (chat agent's set_canvas_view tool).
+  onAgentGoLive: (callback) => {
+    const handler = (_e, payload) => {
+      Promise.resolve().then(() => callback(payload))
+        .then((r) => ipcRenderer.send('agent:goLive:done', { id: payload?.id, ...(r || {}) }))
+        .catch((err) => ipcRenderer.send('agent:goLive:done', { id: payload?.id, ok: false, error: 'renderer_error', message: String(err?.message || err) }));
+    };
+    ipcRenderer.on('agent:goLive', handler);
+    return () => ipcRenderer.removeListener('agent:goLive', handler);
+  },
   onCanvasSetMode: (callback) => {
     const handler = (_e, payload) => {
       try { callback(payload); } catch (err) { console.error('[canvas:setMode] handler error:', err); }

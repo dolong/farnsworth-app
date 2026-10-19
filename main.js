@@ -2733,6 +2733,29 @@ ipcMain.handle('devvit:set-project-settings', async (_event, workspacePath, curr
 
 const canvasWebContentsViews = new Map();
 
+// Agent "Go Live": the renderer owns the boot (bootFarnsworthDev keeps its UI
+// state right), so main asks it and waits for the reply.
+let _goLiveSeq = 0;
+const _goLiveWaiters = new Map();
+ipcMain.on('agent:goLive:done', (_e, r) => {
+  const w = r && _goLiveWaiters.get(r.id);
+  if (w) { _goLiveWaiters.delete(r.id); w(r); }
+});
+function agentGoLive(target, timeoutMs = 300000) {
+  return new Promise((resolve) => {
+    const id = ++_goLiveSeq;
+    const t = setTimeout(() => { _goLiveWaiters.delete(id); resolve({ ok: false, error: 'timeout', message: 'The preview did not come up within 5 minutes.' }); }, timeoutMs);
+    _goLiveWaiters.set(id, (r) => { clearTimeout(t); resolve({ ok: !!r.ok, started: !!r.started, url: r.url || null, error: r.error || null, message: r.message || null, warning: r.warning || null }); });
+    try { target.webContents.send('agent:goLive', { id }); }
+    catch (e) { clearTimeout(t); _goLiveWaiters.delete(id); resolve({ ok: false, error: 'no_window', message: e.message }); }
+  });
+}
+async function waitForCanvasView(ms) {
+  const end = Date.now() + ms;
+  while (!canvasWebContentsViews.size && Date.now() < end) await new Promise((r) => setTimeout(r, 300));
+  return canvasWebContentsViews.size > 0;
+}
+
 // Companion WCV WebRTC capture (Aug 12 2026). A dedicated, invisible
 // BrowserWindow owns getDisplayMedia() + RTCPeerConnection. Main only selects
 // the active WebContentsView frame and carries signaling over the relay.
@@ -7440,7 +7463,7 @@ const AGENT_TOOLS = [
   },
   {
     name: 'test_save',
-    description: 'Save a test JSON file to the active workspace\'s .farnsworth/devvit-tests/ folder. JSON is validated before writing. RECORDING: only tests WITHOUT switchUser, switchDevvitUser or llm-step steps (anywhere, including inside if/while) can be recorded, because those run on the Python runner. When the user wants a video of the run (or to share/send it), build the test from the other actions only: set the user beforehand with switch_devvit_user, and use waitFor/eval/if/while for checks. The result says recordable true/false. The name is normalized to lowercase-dashes (e.g. "My Test!" → "my-test"). See DEVVIT-TESTS.md for the test format. IMPORTANT - a test cannot declare its own viewport: the runner reads only `name` and `steps`, and the frame comes from the resolution dropdown in the canvas header, which defaults to MOBILE 390x844. Test View also supports Desktop presets (724x596, 1280x800, 1512x1320, 1920x1080, 2560x1440, 3440x1440), Fullscreen and Post. Do not silently assume mobile: if the layout differs between phone and desktop, ask which frame the test is for, state the assumption in the test name, and make the first step after `reload` a waitFor on `.fw-stage--desktop` or `.fw-stage--mobile` so a wrong preset fails loudly instead of dying on a selector that only exists in the other layout.',
+    description: 'Save a test JSON file to the active workspace\'s .farnsworth/devvit-tests/ folder. JSON is validated before writing. RECORDING: only tests WITHOUT switchUser, switchDevvitUser or llm-step steps (anywhere, including inside if/while) can be recorded, because those run on the Python runner. When the user wants a video of the run (or to share/send it), build the test from the other actions only: set the user beforehand with switch_devvit_user, and use waitFor/eval/if/while for checks. The result says recordable true/false. The name is normalized to lowercase-dashes (e.g. "My Test!" → "my-test"). Call test_format_spec for the test format. IMPORTANT - a test cannot declare its own viewport: the runner reads only `name` and `steps`, and the frame comes from the resolution dropdown in the canvas header, which defaults to MOBILE 390x844. Test View also supports Desktop presets (724x596, 1280x800, 1512x1320, 1920x1080, 2560x1440, 3440x1440), Fullscreen and Post. Do not silently assume mobile: if the layout differs between phone and desktop, ask which frame the test is for, state the assumption in the test name, and make the first step after `reload` a waitFor on `.fw-stage--desktop` or `.fw-stage--mobile` so a wrong preset fails loudly instead of dying on a selector that only exists in the other layout.',
     input_schema: {
       type: 'object',
       properties: {
@@ -7502,6 +7525,16 @@ const AGENT_TOOLS = [
       },
       required: ['enabled']
     }
+  },
+  {
+    name: 'go_live',
+    description: 'Start the game preview (same as clicking Go Live): boots the project\'s dev server and Devvit emulator and shows the live game in the canvas. Waits until the preview is up (first run can take a few minutes while dependencies install). No-op if it is already live. Tests, recordings, screenshots and set_preview all need the preview live, so call this whenever devvit_emulator_status or take_canvas_screenshot says nothing is running. Never ask the user to click Go Live.',
+    input_schema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'test_format_spec',
+    description: 'The full test JSON format: every action and its fields, nesting rules, variables, selectors, recording rules and examples. Read it before writing or editing a test. Bundled with the app, so it always matches this version\'s runner.',
+    input_schema: { type: 'object', properties: {} }
   },
   {
     name: 'open_testview',
@@ -7992,6 +8025,7 @@ async function executeAgentTool(name, input, folderOverride) {
   if (name === 'test_run') {
     if (!input?.path || typeof input.path !== 'string') return { ok: false, error: 'missing_path' };
     if (!fsSync.existsSync(input.path)) return { ok: false, error: 'not_found', path: input.path };
+    if (!canvasWebContentsViews.size) return { ok: false, error: 'no_preview', message: 'The game preview is not running. Call go_live (or open_testview, which starts it), then run the test again.' };
     // Shares runTestByPath with the test:run IPC so an agent-driven run gets
     // the Node runner, the companion test:state broadcasts and the video
     // recording. `record` is a per-run override of the Test View toggle.
@@ -8034,8 +8068,24 @@ async function executeAgentTool(name, input, folderOverride) {
     // testview but we still send the IPC so the renderer can refresh.
     const target = BrowserWindow.getFocusedWindow() || mainWindow || openWindows[0];
     if (!target || target.isDestroyed()) return { ok: false, error: 'no_window' };
+    // Tests need a live preview; start it like Go Live if it is not running.
+    const live = await agentGoLive(target);
     target.webContents.send('canvas:setPreview', { preview: 'testview' });
-    return { ok: true, preview: 'testview' };
+    if (!live.ok) return { ok: false, preview: 'testview', error: live.error || 'go_live_failed', message: `Test View is open but the game preview did not start: ${live.message || live.error}` };
+    await waitForCanvasView(20000);
+    return { ok: true, preview: 'testview', live: true, url: live.url || null, started: !!live.started };
+  }
+  if (name === 'go_live') {
+    const target = BrowserWindow.getFocusedWindow() || mainWindow || openWindows[0];
+    if (!target || target.isDestroyed()) return { ok: false, error: 'no_window' };
+    const live = await agentGoLive(target);
+    if (live.ok) await waitForCanvasView(20000);
+    return { ...live, canvasReady: canvasWebContentsViews.size > 0 };
+  }
+  if (name === 'test_format_spec') {
+    try {
+      return { ok: true, spec: await fs.readFile(path.join(__dirname, 'DEVVIT-TESTS.md'), 'utf8') };
+    } catch (e) { return { ok: false, error: 'spec_missing', message: e.message }; }
   }
   if (name === 'set_canvas_view') {
     const view = input?.view;
