@@ -228,7 +228,7 @@
         if (stopped) return;
         resize();
         try { ctx.drawImage(video, 0, 0, canvas.width, canvas.height); } catch {}
-        try { drawOverlay(ctx, canvas.width, canvas.height); } catch {}
+        // Step overlay no longer burned in (Oct 19): recordings are clean video.
       };
       paint();
 
