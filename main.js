@@ -11556,7 +11556,14 @@ async function runShellCommand(command, opts = {}) {
   // (b) re-execute side-effecting commands a second time. The terminal chip
   // in the chat message renders the captured output inline.
   return await new Promise((resolve) => {
-    exec(command, { cwd: folder, maxBuffer: 8 * 1024 * 1024, timeout: timeoutMs }, (err, stdout, stderr) => {
+    const startedAt = Date.now();
+    let timedOut = false;
+    let child = null;
+    const timer = setTimeout(() => { timedOut = true; if (child) killCommandTreeHard(child.pid); }, timeoutMs);
+    child = exec(command, { cwd: folder, maxBuffer: 8 * 1024 * 1024, detached: true }, (err, stdout, stderr) => {
+      clearTimeout(timer);
+      if (!timedOut && child) reapCommandLeftovers(child.pid, startedAt);
+      if (timedOut) stderr = (stderr || '') + `\ntimeout: stopped after ${Math.round(timeoutMs / 1000)}s, with everything it started.`;
       if (pipeToActiveTerminal) {
         const activePty = getActiveTerminalPty();
         if (activePty) {
@@ -11584,12 +11591,55 @@ async function runShellCommand(command, opts = {}) {
 // npm scripts, etc.) recursively walks the entire macOS filesystem,
 // easily exceeding the 30s timeout and orphaning the spawn. See
 // [[farnsworth-chat-agent]] § run_command nono-wrap cwd bug (Jul 14).
+// Kill an agent command AND everything it started. child.kill() alone only
+// stops the wrapper (nono / sh): a long-running grandchild like ffmpeg is
+// reparented to launchd and keeps going. Oct 19: a trailer job's ffmpeg
+// (-loop 1 image input, no end time) ran 67 min at ~875% CPU after its
+// run_command timed out, starving the hub until the studio went offline,
+// and the agent could not stop it because Seatbelt blocks signals from the
+// sandbox. Commands now start in their own process group (detached), so
+// one group signal reaches every descendant, including reparented ones.
+const commandLeftoverGroups = new Set();
+function killCommandTree(pid, signal = 'SIGTERM') {
+  if (!pid) return;
+  const kids = new Set();
+  const walk = (parent) => {
+    let out = '';
+    try { out = require('child_process').execFileSync('/usr/bin/pgrep', ['-P', String(parent)], { encoding: 'utf8' }); } catch {}
+    for (const k of out.split('\n').map(Number).filter(Boolean)) if (!kids.has(k)) { kids.add(k); walk(k); }
+  };
+  walk(pid);
+  try { process.kill(-pid, signal); } catch {}
+  for (const k of [pid, ...kids]) { try { process.kill(k, signal); } catch {} }
+}
+function killCommandTreeHard(pid) {
+  killCommandTree(pid, 'SIGTERM');
+  const t = setTimeout(() => { killCommandTree(pid, 'SIGKILL'); commandLeftoverGroups.delete(pid); }, 2000);
+  if (t.unref) t.unref();
+}
+function commandGroupAlive(pid) {
+  try { process.kill(-pid, 0); return true; } catch { return false; }
+}
+// A command that finished may have left background children (`cmd &`,
+// nohup, a dev server). Leave them running, but never past the longest
+// allowed command, and never past app quit.
+function reapCommandLeftovers(pid, startedAt) {
+  if (!pid || !commandGroupAlive(pid)) return;
+  commandLeftoverGroups.add(pid);
+  const t = setTimeout(() => {
+    if (commandGroupAlive(pid)) killCommandTreeHard(pid); else commandLeftoverGroups.delete(pid);
+  }, Math.max(1000, startedAt + MAX_COMMAND_TIMEOUT_MS - Date.now()));
+  if (t.unref) t.unref();
+}
+app.on('will-quit', () => { for (const pid of commandLeftoverGroups) killCommandTree(pid, 'SIGKILL'); });
+
 async function runSandboxedCommand(nonoBin, profileName, command, folder, timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS) {
   const { spawn } = require('child_process');
   return await new Promise((resolve) => {
     let stdout = '';
     let stderr = '';
     let timedOut = false;
+    const startedAt = Date.now();
     // Farnsworth launched from Finder inherits launchd's bare PATH, so the
     // toolchain is invisible to the sandboxed shell. composeChildPath() adds
     // the user's login-shell PATH (version managers included) and the --read
@@ -11612,6 +11662,8 @@ async function runSandboxedCommand(nonoBin, profileName, command, folder, timeou
        ...readGrants, '--', '/bin/sh', '-c', command],
       {
         cwd: folder,
+        // Own process group, so a timeout can stop every descendant.
+        detached: true,
         // Farnsworth launched from Finder / `open .app` inherits launchd's bare
         // PATH (/usr/bin:/bin:/usr/sbin:/sbin), so Homebrew tools (node, npm,
         // git, python3, uv, ...) are invisible to the sandboxed shell and the
@@ -11625,17 +11677,18 @@ async function runSandboxedCommand(nonoBin, profileName, command, folder, timeou
     child.stderr.on('data', d => { stderr += d.toString(); });
     const timer = setTimeout(() => {
       timedOut = true;
-      try { child.kill('SIGTERM'); } catch {}
+      killCommandTreeHard(child.pid);
     }, timeoutMs);
     child.on('close', code => {
       clearTimeout(timer);
+      if (!timedOut) reapCommandLeftovers(child.pid, startedAt);
       resolve({
         ok: code === 0 && !timedOut,
         stdout,
         // Name the budget and how to raise it. A bare "timeout" reads like the
         // command failed, and the agent then invents a reason it failed.
         stderr: timedOut
-          ? stderr + `\ntimeout: killed after ${Math.round(timeoutMs / 1000)}s.`
+          ? stderr + `\ntimeout: killed after ${Math.round(timeoutMs / 1000)}s, with everything it started.`
             + ` If this command is legitimately slow (build, test suite, install, upload/publish),`
             + ` re-run it with a larger timeout_ms (max ${MAX_COMMAND_TIMEOUT_MS / 1000}s).`
           : stderr,
