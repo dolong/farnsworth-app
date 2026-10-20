@@ -2956,6 +2956,97 @@ async function shareTestRecording(folder, target) {
   return { ok: true, url: json.url, name, path: filePath, bytes: stat.size, contentType: json.contentType };
 }
 
+// Late pairing (Oct 20). If the boot-time Keychain read misses its budget or
+// the Keychain is locked, the relay starts unpaired (tenant routing, outside
+// the account hub). Apply the token whenever it does arrive and reconnect so
+// the desktop lands in the account hub without a restart.
+function applyLateRelayToken(token, why) {
+  if (!token) return false;
+  const rc = getRelayClient();
+  if (!rc.hydrateDeviceToken(token)) return false;
+  console.log(`[relay] device token hydrated (${why}); reconnecting paired`);
+  rc.stop();
+  rc.start();
+  return true;
+}
+let relayTokenRetryTimer = null;
+function scheduleRelayTokenRetry(attempt = 0) {
+  if (relayTokenRetryTimer || attempt >= 10) return;
+  relayTokenRetryTimer = setTimeout(async () => {
+    relayTokenRetryTimer = null;
+    if (getRelayClient().deviceToken) return;
+    try {
+      const r = await devicePairing.readStoredToken();
+      if (applyLateRelayToken(r?.token, 'Keychain retry')) return;
+      if (r && !r.token && !r.locked) return; // genuinely unpaired: stop asking
+    } catch {}
+    scheduleRelayTokenRetry(attempt + 1);
+  }, 60000);
+}
+// The relay may be running unpaired even though the Keychain holds a token
+// (see above). Make sure it is paired before handing out a link to it.
+async function ensureRelayPaired() {
+  const rc = getRelayClient();
+  if (rc.deviceToken) return rc.deviceToken;
+  try {
+    const r = await devicePairing.readStoredToken();
+    if (r?.token) applyLateRelayToken(r.token, 'watch link');
+  } catch {}
+  return rc.deviceToken || null;
+}
+
+// View-only live link to the canvas preview (Oct 20). The API mints a relay
+// JWT with role=viewer pinned to THIS instance (qualified by --instance), and
+// the relay only lets it receive this desktop's canvas stream. The stream
+// itself is the existing companion path (WebRTC, JPEG fallback), so nothing
+// new runs here until a viewer opens the link.
+async function createWatchLink({ ttlHours, label } = {}) {
+  const relay = getRelayClient();
+  const token = await ensureRelayPaired();
+  if (!token) {
+    return { ok: false, error: 'not_paired', message: 'This Farnsworth is not paired to an account, so it cannot make a watch link. Pair it in Settings → Account, then try again.' };
+  }
+  const body = { instance: INSTANCE_NAME };
+  if (Number.isFinite(Number(ttlHours)) && Number(ttlHours) > 0) body.ttlHours = Number(ttlHours);
+  const folder = currentFolderSetting();
+  const lbl = (typeof label === 'string' && label.trim()) ? label.trim() : (folder ? path.basename(folder) : '');
+  if (lbl) body.label = lbl.slice(0, 80);
+  let res, json;
+  try {
+    res = await fetch(`${devicePairing.API}/api/watch-link`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(20000),
+    });
+    json = await res.json().catch(() => ({}));
+  } catch (e) {
+    return { ok: false, error: 'mint_failed', message: `Could not reach Farnsworth Cloud: ${e.message}` };
+  }
+  if (!res.ok || !json.ok) {
+    return { ok: false, error: json.error || `http_${res.status}`, message: json.message || `Watch link failed (HTTP ${res.status})` };
+  }
+  let previewOpen = false;
+  try { previewOpen = !!activeCanvasWebContentsView(); } catch {}
+  for (let i = 0; i < 20 && relay.status !== 'connected'; i++) await new Promise((r) => setTimeout(r, 250));
+  const relayOnline = relay.status === 'connected';
+  const hours = Math.max(0, Math.round((json.expiresAt - Date.now()) / 360000) / 10);
+  return {
+    ok: true,
+    url: json.url,
+    viewOnly: true,
+    expiresAt: new Date(json.expiresAt).toISOString(),
+    expiresInHours: hours,
+    label: lbl || null,
+    previewOpen,
+    relayOnline,
+    note: [
+      previewOpen ? null : 'No canvas preview is open right now; viewers see "No preview open" until one is (the page picks it up on its own).',
+      relayOnline ? null : 'This desktop is not connected to the relay right now; viewers see "Desktop is offline" until it reconnects.',
+    ].filter(Boolean).join(' ') || undefined,
+  };
+}
+
 // Opens a recording (or the recordings folder) in the OS. `/usr/bin/open -R`
 // for a file so Finder reveals it without tripping the AppleEvents TCC prompt
 // that shell.showItemInFolder() raises; shell.openPath for a bare folder.
@@ -7526,6 +7617,17 @@ const AGENT_TOOLS = [
     }
   },
   {
+    name: 'watch_link',
+    description: 'Create a view-only live link to this Farnsworth\'s canvas preview (the open Mobile, Desktop or Fullscreen preview, or Post View). Anyone with the link can WATCH the preview live in a browser (app.farnsworth.tv/watch), no login; they cannot chat, click, type or see files. The link expires (default 12 hours, max 7 days). Use when the user asks for a stream, live link, or a way for someone to watch the app/game. Requires this Farnsworth to be paired to an account (Settings → Account).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        ttlHours: { type: 'number', description: 'Hours until the link stops working. Default 12, min 0.25, max 168.' },
+        label: { type: 'string', description: 'Optional title shown on the watch page, e.g. the project name.' }
+      }
+    }
+  },
+  {
     name: 'set_test_recording',
     description: 'Turn the default test-run video recording on or off. This is the same toggle as the Record button in Test View and applies to every later run until changed. Use for "stop recording my test runs" or "record all test runs from now on". For a single run, pass `record` to test_run instead.',
     input_schema: {
@@ -8051,6 +8153,9 @@ async function executeAgentTool(name, input, folderOverride) {
       path: typeof input?.path === 'string' && input.path.trim() ? input.path.trim() : null,
       reveal: true,
     });
+  }
+  if (name === 'watch_link') {
+    return await createWatchLink(input || {});
   }
   if (name === 'share_recording') {
     return await shareTestRecording(folder, typeof input?.path === 'string' && input.path.trim() ? input.path.trim() : null);
@@ -10090,24 +10195,32 @@ app.whenReady().then(async () => {
       relayClient.start();
     } else {
       const KEYCHAIN_READ_BUDGET_MS = 5000;
+      const firstRead = devicePairing.readStoredToken();
       Promise.race([
-        devicePairing.readStoredToken(),
+        firstRead,
         new Promise((resolve) => setTimeout(() => resolve({ token: null, timedOut: true }), KEYCHAIN_READ_BUDGET_MS)),
       ])
         .then(({ token, locked, timedOut }) => {
           if (timedOut) {
-            console.warn('[relay] Keychain read exceeded budget; starting unpaired');
+            console.warn('[relay] Keychain read exceeded budget; starting unpaired, will re-pair when it lands');
+            // The slow read usually DOES finish. Before Oct 20 its result was
+            // dropped, so a busy launch (e.g. right after an install) stayed
+            // unpaired for the whole session: invisible to the companion
+            // picker and to watch links even though Settings said "Paired".
+            firstRead.then((r) => applyLateRelayToken(r?.token, 'late Keychain read')).catch(() => {});
+            scheduleRelayTokenRetry();
             return;
           }
           if (locked) {
             console.warn('[relay] Keychain locked; staying unpaired until unlock');
+            scheduleRelayTokenRetry();
             return;
           }
           if (!token) return;
           relayClient.hydrateDeviceToken(token);
           console.log('[relay] device token hydrated from Keychain');
         })
-        .catch((e) => console.warn('[relay] Keychain token read failed:', e.message))
+        .catch((e) => { console.warn('[relay] Keychain token read failed:', e.message); scheduleRelayTokenRetry(); })
         .finally(() => relayClient.start());
     }
     // Forward ALL incoming relay messages to the renderer over IPC (wildcard).
@@ -11924,6 +12037,17 @@ function startExpressControl() {
       },
     });
     expressControl.addTools(expressBridge.tools);
+    expressControl.addTools({
+      watch_link: {
+        description: 'Create a view-only live link (app.farnsworth.tv/watch) to this Farnsworth\'s canvas preview. Anyone with the link watches the preview live in a browser, no login; no chat, input or file access. Expires after ttlHours (default 12, max 168). Returns { url, expiresAt, previewOpen, relayOnline, note }.',
+        inputSchema: { type: 'object', properties: { ttlHours: { type: 'number' }, label: { type: 'string' } } },
+        handler: async (a) => {
+          const r = await createWatchLink(a || {});
+          if (!r.ok) { const e = new Error(r.message || r.error); e.code = r.error; throw e; }
+          return r;
+        },
+      },
+    });
     expressControl.start().catch((e) => console.warn('[express] control server failed:', e.message));
     expressReaper = setInterval(() => {
       expressTick();

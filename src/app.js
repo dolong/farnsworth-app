@@ -14772,6 +14772,7 @@ async function sendChatMessage(opts) {
           '- test_recordings_list(limit?) — list recorded run videos for this workspace (newest first) from .farnsworth/recordings/',
           '- open_recordings_folder(path?) — reveal the recordings folder in Finder, or one specific recording',
           '- set_test_recording(enabled) — turn default test-run recording on or off (same toggle as the Record button in Test View)',
+          '- watch_link(ttlHours?, label?) — make a view-only live link (app.farnsworth.tv/watch) to the canvas preview that anyone can watch in a browser without logging in. Viewers cannot chat, click or see files. Default 12h expiry, max 168h. Give the user the url; if the result has a note, pass it on.',
           '- share_recording(path?) — upload a recording (newest if omitted) and post it in this chat as a video player that also plays in the Companion app; returns a shareable link. Use when the user asks to send/share/show a recording, especially from the Companion.',
           '',
           '**Recording test runs:** a recorded run returns a `video` object with the video path — an .mp4 (H.264, plays in QuickTime/Slack/Drive), or a .webm with a `transcodeError` when ffmpeg is unavailable on the machine. The video has a burned-in overlay showing each step number, action, selector, elapsed time and pass/fail state, so it is a real artifact — ALWAYS give the user the full path when one comes back, and offer to reveal it with open_recordings_folder. Recording only works on the Node runner path: tests containing `switchUser` or `llm-step` run under Python and cannot be recorded, so say so plainly instead of claiming a video exists. Recording needs an active Test View / mobile / desktop game preview to capture.',
@@ -15130,6 +15131,8 @@ async function sendChatMessage(opts) {
             : `No recordings yet in ${toolRes.dir}`;
         } else if (tu.name === 'open_recordings_folder') {
           resultContent = `Revealed ${toolRes.path} in Finder`;
+        } else if (tu.name === 'watch_link') {
+          resultContent = `View-only live link (expires ${toolRes.expiresAt}, ~${toolRes.expiresInHours}h): ${toolRes.url}${toolRes.note ? '\n' + toolRes.note : ''}\nInclude the full link in your reply.`;
         } else if (tu.name === 'share_recording') {
           resultContent = `Uploaded ${toolRes.name} (${Math.round((toolRes.bytes || 0) / 1024)}KB). Link: ${toolRes.url}\nIt now plays inline in this chat on the desktop and in the Companion. Include the link in your reply so the user can paste it elsewhere.`;
           updateAgentMsg({ media: [...(agentMsg.media || []), { kind: 'video', url: toolRes.url, name: toolRes.name }] });
