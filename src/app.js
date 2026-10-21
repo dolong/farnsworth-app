@@ -2325,7 +2325,13 @@ function setupCanvasBrowserViews() {
   }
 
   document.querySelectorAll('[data-canvas-view]').forEach(el => {
-    if (el.dataset.canvasViewId) return;
+    // Claim the placeholder synchronously. Several renderCanvas() calls in
+    // one frame (Go Live + zoom refits) queue several rAF setups that all
+    // see this same placeholder before the first createView IPC resolves;
+    // without a synchronous claim each one created its own view (Oct 21:
+    // 11 stacked live previews born in the same second).
+    if (el.dataset.canvasViewId || el.dataset.canvasViewPending) return;
+    el.dataset.canvasViewPending = '1';
     const viewId = `canvas-${el.dataset.canvasView}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const url = el.dataset.canvasUrl;
     const rect = el.getBoundingClientRect();
@@ -2350,8 +2356,15 @@ function setupCanvasBrowserViews() {
             : null,
         };
         const result = await window.farnsworth.canvasCreateView(viewId, url, bounds, viewOpts);
+        delete el.dataset.canvasViewPending;
         if (!result?.ok) {
           console.error('[canvas:setup] createView failed for viewId=' + viewId + ':', result?.error);
+          return;
+        }
+        // The canvas re-rendered while the IPC was in flight: this
+        // placeholder is gone, so the view it created is an orphan. Kill it.
+        if (!el.isConnected) {
+          window.farnsworth.canvasRemoveView?.(viewId).catch(() => {});
           return;
         }
         el.dataset.canvasViewId = viewId;
@@ -2372,6 +2385,7 @@ function setupCanvasBrowserViews() {
         ro.observe(el);
         el._browserViewRo = ro;
       } catch (e) {
+        delete el.dataset.canvasViewPending;
         console.error('[canvas:setup] IPC exception for viewId=' + viewId + ':', e);
       }
     })();
