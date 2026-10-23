@@ -4903,6 +4903,15 @@ function recursivelyHasUnsupportedAction(steps, unsupportedSet) {
 // stdout, stderr} result on success, or null if the test isn't eligible
 // (unsupported action present, no canvas preview, module unavailable, or the
 // run itself threw) — null means "fall back to the Python runner below".
+// Oct 23 2026: in-flight Node test runs, so stopping a background chat task
+// (Express chat_stop) also ends a test_run it is waiting on.
+const activeTestRunAborts = new Set();
+function abortActiveTestRuns() {
+  let n = 0;
+  for (const a of activeTestRunAborts) { try { a.abort(); n++; } catch {} }
+  return n;
+}
+
 async function tryNodeTestRunner(testPath, opts = {}) {
   const mod = await getNodeTestRunner();
   if (!mod) return null;
@@ -4948,8 +4957,13 @@ async function tryNodeTestRunner(testPath, opts = {}) {
         videoPath = null;
       }
     }
-    const result = await mod.runTest(wc, steps, {
+    const abort = new AbortController();
+    activeTestRunAborts.add(abort);
+    let result;
+    try {
+    result = await mod.runTest(wc, steps, {
       timeout: 60000,
+      signal: abort.signal,
       onStep: videoPath ? (ev) => {
         if (ev.phase === 'start') {
           updateCanvasRecordingOverlay({
@@ -4961,6 +4975,9 @@ async function tryNodeTestRunner(testPath, opts = {}) {
         }
       } : undefined,
     });
+    } finally {
+      activeTestRunAborts.delete(abort);
+    }
     let video = null;
     if (videoPath) {
       video = await stopCanvasTestRecording({
@@ -5064,6 +5081,21 @@ async function runTestByPath(testPath, opts = {}) {
       let stderr = '';
       proc.stdout.on('data', d => stdout += d.toString());
       proc.stderr.on('data', d => stderr += d.toString());
+      // Oct 23 2026: the Python runner had no ceiling either. Kill it after
+      // 10 minutes, or as soon as a background task stop asks.
+      const abort = new AbortController();
+      activeTestRunAborts.add(abort);
+      let killedFor = null;
+      const kill = (why) => {
+        if (killedFor) return;
+        killedFor = why;
+        stderr += `\n[test-runner] ${why}`;
+        try { proc.kill('SIGTERM'); } catch {}
+        setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 3000).unref?.();
+      };
+      const killTimer = setTimeout(() => kill('Python runner exceeded 600s and was stopped'), 600000);
+      abort.signal.addEventListener('abort', () => kill('Test run stopped'), { once: true });
+      proc.on('close', () => { clearTimeout(killTimer); activeTestRunAborts.delete(abort); });
       proc.on('close', code => {
         const failedMatch = stdout.match(/(\d+)\s+failed/);
         const failed = failedMatch ? Number(failedMatch[1]) : 0;
@@ -12027,6 +12059,7 @@ function startExpressControl() {
       releaseTurn: (token, webContentsId) => expressTurns.release(token, webContentsId),
       afterLaneFree: () => setTimeout(expressTick, 100),
       scheduledRuns: () => [],
+      onTaskStop: () => abortActiveTestRuns(),
       emit: (topic, data) => {
         if (expressControl) expressControl.emit(topic, data);
         // Let the user's own windows follow background chats live.

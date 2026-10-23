@@ -40,6 +40,7 @@ function createExpressBridge(deps) {
     releaseTurn,            // (token, webContentsId)
     afterLaneFree,          // (lane) => void  (prod cleanup + broadcast + tick)
     scheduledRuns,          // ({limit}) => runs
+    onTaskStop = () => {},  // () => void  (end in-flight tool work, e.g. a test run)
     emit = () => {},
   } = deps;
 
@@ -279,6 +280,7 @@ function createExpressBridge(deps) {
     if (t.status !== 'running') return { ok: true, task: view(t) };
     t.status = 'stopping';
     publish(t);
+    try { onTaskStop(t); } catch {}
     const lane = laneForTask(taskId);
     if (lane?.win) await callRenderer(lane.win, 'stop', {}).catch(() => {});
     return { ok: true, task: view(t) };

@@ -370,6 +370,7 @@ async function runSteps(webContents, vars, steps, opts = {}) {
  */
 export async function runTest(webContents, steps, opts = {}) {
   const timeout = opts.timeout ?? 60_000
+  const signal = opts.signal || null
   const vars = {}
   // Optional observer, used by the video recorder to drive its step overlay.
   // Never allowed to affect the run: a throwing hook is swallowed.
@@ -409,8 +410,22 @@ export async function runTest(webContents, steps, opts = {}) {
     }
 
     onStep({ phase: 'start', index: i, total, action, step })
+    if (signal?.aborted) {
+      errors.push(`Stopped before step ${i} (${action})`)
+      break
+    }
+    let hung = false
     try {
-      const result = await handler(webContents, vars, step)
+      // Oct 23 2026: the overall deadline used to be checked only BETWEEN
+      // steps, so one step whose CDP call never returned (a page stuck in a
+      // JS loop never answers Runtime.evaluate) hung test_run forever and
+      // chat_stop could not end it. Every step now races its own budget, the
+      // overall deadline and the stop signal.
+      const own = stepBudgetMs(step)
+      // if/while blocks were never bounded by the overall deadline (it was
+      // checked between top-level steps only); keep that, under a 10 min cap.
+      const budget = Number.isFinite(own) ? Math.min(own, deadline - Date.now()) : BLOCK_STEP_CAP_MS
+      const result = await raceStep(handler(webContents, vars, step), budget, signal, () => { hung = true })
       if (result?._screenshot) {
         screenshots.push(result._screenshot)
         vars.__lastScreenshot = result._screenshot
@@ -423,6 +438,11 @@ export async function runTest(webContents, steps, opts = {}) {
     } catch (err) {
       errors.push(`Step ${i} (${action}): ${err.message}`)
       onStep({ phase: 'end', index: i, total, action, step, ok: false, error: err.message })
+      // A hung page or a stop ends the run: every later step would hang too.
+      if (hung || signal?.aborted) {
+        if (hung) await unstickPage(webContents)
+        break
+      }
       // Don't break — keep going (matching Python runner behavior)
     }
   }
@@ -468,6 +488,50 @@ export async function loadTestFromFile(filePath) {
 }
 
 // ─── Utility functions ────────────────────────────────────────────────────────
+
+export const BLOCK_STEP_CAP_MS = 10 * 60_000
+
+// Longest a single step may run: its own wait budget plus slack, never less
+// than 20s. Nested if/while blocks get the overall deadline instead.
+export function stepBudgetMs(step) {
+  if (step?.action === 'if' || step?.action === 'while') return Infinity
+  const own = Number(step?.timeout ?? step?.ms ?? 0) || 0
+  return Math.max(20_000, own + 15_000)
+}
+
+// Resolve/reject with the step, or reject when its budget runs out or the run
+// is stopped. The abandoned step promise is left to settle on its own.
+export function raceStep(promise, budgetMs, signal, onHang = () => {}) {
+  return new Promise((resolve, reject) => {
+    let timer = null
+    const done = (fn, v) => {
+      if (timer) clearTimeout(timer)
+      if (signal) signal.removeEventListener('abort', onAbort)
+      fn(v)
+    }
+    const onAbort = () => done(reject, new Error('stopped'))
+    if (signal?.aborted) return onAbort()
+    if (signal) signal.addEventListener('abort', onAbort, { once: true })
+    if (Number.isFinite(budgetMs)) {
+      timer = setTimeout(() => {
+        onHang()
+        done(reject, new Error(`did not finish within ${Math.max(0, Math.round(budgetMs / 1000))}s; the page is not responding (stuck in a script loop, a dialog, or a hung load)`))
+      }, Math.max(0, budgetMs))
+    }
+    Promise.resolve(promise).then((v) => done(resolve, v), (e) => done(reject, e))
+  })
+}
+
+// Best effort: kill whatever script is spinning in the page so the preview is
+// usable again. Never throws and never waits more than 3s.
+async function unstickPage(webContents) {
+  try {
+    await Promise.race([
+      webContents.debugger.sendCommand('Runtime.terminateExecution'),
+      sleep(3000),
+    ])
+  } catch {}
+}
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
