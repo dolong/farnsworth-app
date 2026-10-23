@@ -7543,6 +7543,16 @@ const AGENT_TOOLS = [
     }
   },
   {
+    name: 'stop_processes',
+    description: 'List or stop background processes left running in this workspace (devvit playtest/upload watchers, dev servers or scripts started with &, nohup, or by an earlier run). run_command is sandboxed and cannot signal processes outside its own command, so `kill` there fails with "Operation not permitted"; use this instead. Call with no pids to list candidates (pid, age, command). Pass pids to stop them and everything they started (SIGTERM, then SIGKILL after 2s). Only processes this agent started, or that run inside the open folder, can be stopped; Farnsworth\'s own terminals, preview and dev servers are protected (use their own tools).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        pids: { type: 'array', items: { type: 'number' }, description: 'Process ids to stop. Omit to list candidates.' }
+      }
+    }
+  },
+  {
     // Renderer-side tool — Claude emits this to render an inline UI surface
     // (step progress card, choice buttons, form, copy block, work-result
     // receipt, etc.) inside the chat stream. The renderer intercepts this
@@ -8104,6 +8114,9 @@ async function executeAgentTool(name, input, folderOverride) {
       sandboxProfile: 'farnsworth-chat-run',
       timeoutMs: input.timeout_ms,
     });
+  }
+  if (name === 'stop_processes') {
+    return await stopWorkspaceProcesses(folder, input?.pids);
   }
   // -------------------------------------------------------------------
   // Test View tools (Jul 11 ~18:50 ET) — wire the chat agent to the
@@ -11778,6 +11791,92 @@ function reapCommandLeftovers(pid, startedAt) {
 }
 app.on('will-quit', () => { for (const pid of commandLeftoverGroups) killCommandTree(pid, 'SIGKILL'); });
 
+// Oct 23 2026: stop_processes. Seatbelt blocks signals from a sandboxed
+// run_command to anything outside that command, so an agent that started
+// `devvit playtest` in the background could never stop it later ("Operation
+// not permitted"), and the watcher kept re-uploading every file change until
+// Long killed it by hand. Main is unsandboxed, so it does the signalling,
+// limited to processes the agent started or that run inside the open folder.
+// Farnsworth's own descendants outside agent command groups (terminal PTYs,
+// Go Live preview, devvit dev server) are never eligible.
+function workspaceProcessTable() {
+  let out = '';
+  try {
+    out = require('child_process').execFileSync('/bin/ps', ['-axo', 'pid=,ppid=,pgid=,etime=,command='],
+      { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+  } catch { return new Map(); }
+  const table = new Map();
+  for (const line of out.split('\n')) {
+    const m = line.match(/^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/);
+    if (m) table.set(+m[1], { pid: +m[1], ppid: +m[2], pgid: +m[3], age: m[4], command: m[5].slice(0, 300) });
+  }
+  return table;
+}
+function processCwds(pids) {
+  const cwds = new Map();
+  if (!pids.length) return cwds;
+  let out = '';
+  try {
+    out = require('child_process').execFileSync('/usr/sbin/lsof', ['-a', '-d', 'cwd', '-Fpn', '-p', pids.join(',')],
+      { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+  } catch (e) { out = String(e.stdout || ''); }
+  let cur = null;
+  for (const line of out.split('\n')) {
+    if (line[0] === 'p') cur = +line.slice(1);
+    else if (line[0] === 'n' && cur) cwds.set(cur, line.slice(1));
+  }
+  return cwds;
+}
+function classifyWorkspaceProcess(proc, table, folder, cwd) {
+  if (proc.pid === process.pid) return 'farnsworth';
+  // Walk up: inside an agent command group is fine; inside Farnsworth
+  // otherwise is protected; an orphan is judged by its cwd.
+  let p = proc;
+  for (let i = 0; p && i < 64; i++) {
+    if (commandLeftoverGroups.has(p.pgid) || commandLeftoverGroups.has(p.pid)) return 'agent';
+    if (p.pid === process.pid) return 'farnsworth';
+    if (p.ppid <= 1) break;
+    p = table.get(p.ppid);
+  }
+  const root = path.resolve(folder);
+  if (cwd && (cwd === root || cwd.startsWith(root + path.sep))) return 'workspace';
+  return null;
+}
+async function stopWorkspaceProcesses(folder, pids) {
+  if (!folder) return { ok: false, error: 'no_folder', message: 'No workspace folder open' };
+  const table = workspaceProcessTable();
+  if (!Array.isArray(pids) || pids.length === 0) {
+    const all = [...table.values()].filter((p) => p.pid !== process.pid);
+    const cwds = processCwds(all.map((p) => p.pid));
+    const candidates = [];
+    for (const p of all) {
+      const kind = classifyWorkspaceProcess(p, table, folder, cwds.get(p.pid));
+      if (kind === 'agent' || kind === 'workspace') candidates.push({ pid: p.pid, ppid: p.ppid, age: p.age, command: p.command });
+    }
+    return { ok: true, processes: candidates.slice(0, 100), note: candidates.length ? 'Pass the pids to stop.' : 'No stoppable processes are running in this workspace.' };
+  }
+  const want = [...new Set(pids.map(Number).filter((n) => Number.isInteger(n) && n > 1))];
+  const cwds = processCwds(want.filter((n) => table.has(n)));
+  const stopped = [], refused = [], notRunning = [];
+  for (const pid of want) {
+    const proc = table.get(pid);
+    if (!proc) { notRunning.push(pid); continue; }
+    const kind = classifyWorkspaceProcess(proc, table, folder, cwds.get(pid));
+    if (kind === 'agent' || kind === 'workspace') { killCommandTree(pid, 'SIGTERM'); stopped.push(pid); }
+    else refused.push({ pid, reason: kind === 'farnsworth' ? 'belongs to Farnsworth itself (terminal, preview or dev server)' : 'not started by this agent and not running in the open folder' });
+  }
+  if (stopped.length) {
+    await new Promise((r) => setTimeout(r, 2000));
+    for (const pid of stopped) {
+      let alive = false; try { process.kill(pid, 0); alive = true; } catch {}
+      if (alive) killCommandTree(pid, 'SIGKILL');
+    }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  const still = stopped.filter((pid) => { try { process.kill(pid, 0); return true; } catch { return false; } });
+  return { ok: refused.length === 0 && still.length === 0, stopped: stopped.filter((p) => !still.includes(p)), stillRunning: still, refused, notRunning };
+}
+
 async function runSandboxedCommand(nonoBin, profileName, command, folder, timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS) {
   const { spawn } = require('child_process');
   return await new Promise((resolve) => {
@@ -11836,7 +11935,9 @@ async function runSandboxedCommand(nonoBin, profileName, command, folder, timeou
           ? stderr + `\ntimeout: killed after ${Math.round(timeoutMs / 1000)}s, with everything it started.`
             + ` If this command is legitimately slow (build, test suite, install, upload/publish),`
             + ` re-run it with a larger timeout_ms (max ${MAX_COMMAND_TIMEOUT_MS / 1000}s).`
-          : stderr,
+          : (/kill[^\n]*operation not permitted/i.test(stderr)
+            ? stderr + '\nnote: run_command is sandboxed and cannot signal processes outside this command. Use the stop_processes tool with these pids.'
+            : stderr),
         exitCode: timedOut ? 124 : (typeof code === 'number' ? code : 1),
       });
     });
