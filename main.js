@@ -12556,6 +12556,22 @@ function startExpressControl() {
       afterLaneFree: () => setTimeout(expressTick, 100),
       scheduledRuns: () => [],
       onTaskStop: () => abortActiveTestRuns(),
+      // Express must never repoint a window the user is working in (Oct 27:
+      // a folder_switch turned the BreachReddit window into CringeBattles).
+      openFolderWindow: async (folder) => {
+        const norm = (f) => String(f || '').replace(/\/+$/, '');
+        for (const [id, f] of windowWorkspaces) {
+          if (!f || norm(f) !== norm(folder)) continue;
+          const w = BrowserWindow.getAllWindows().find((x) => !x.isDestroyed() && x.webContents.id === id && !isExpressLaneWindow(x));
+          if (w) { try { if (w.isMinimized()) w.restore(); w.show(); w.focus(); } catch {} return { folder, window: 'existing' }; }
+        }
+        createWindow({ fresh: true });
+        const win = mainWindow;
+        await new Promise((r) => win.webContents.once('did-finish-load', r));
+        await new Promise((r) => setTimeout(r, 800));
+        await expressRenderer.call(win, 'switchFolder', { path: folder });
+        return { folder, window: 'new' };
+      },
       emit: (topic, data) => {
         if (expressControl) expressControl.emit(topic, data);
         // Let the user's own windows follow background chats live.

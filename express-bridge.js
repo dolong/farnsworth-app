@@ -41,6 +41,7 @@ function createExpressBridge(deps) {
     afterLaneFree,          // (lane) => void  (prod cleanup + broadcast + tick)
     scheduledRuns,          // ({limit}) => runs
     onTaskStop = () => {},  // () => void  (end in-flight tool work, e.g. a test run)
+    openFolderWindow = null, // (folder) => Promise<{folder, window}>  focus the window holding it, else open a new one
     emit = () => {},
   } = deps;
 
@@ -377,11 +378,12 @@ function createExpressBridge(deps) {
       handler: ({ limit } = {}) => ({ folders: (recentFolders(Math.max(1, Math.min(50, Number(limit) || 10))) || []).map((f) => ({ path: f.path, name: f.name, openedAt: f.opened_at })) }),
     },
     folder_switch: {
-      description: `Switch ${app}'s main window to a folder (same path as picking it in the app).`,
+      description: `Bring a folder up in ${app}: focuses the window that already has it open, otherwise opens it in a NEW window. Never repoints a window the user is working in. Delegated tasks (chat_send with folder) do not need this.`,
       inputSchema: obj({ path: { type: 'string' } }, ['path']),
       handler: async ({ path: p } = {}) => {
         const folder = str(p);
         if (!folder || !fs.existsSync(folder)) throw err('bad_input', `Folder does not exist: ${folder}`);
+        if (openFolderWindow) return { ok: true, ...(await openFolderWindow(folder)) };
         await callMainRenderer('switchFolder', { path: folder });
         return { ok: true, folder };
       },
