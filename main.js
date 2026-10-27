@@ -1969,7 +1969,7 @@ function devvitSelectAccount(folder, id) {
 // Browser login into a fresh root. Whatever Reddit account the default browser
 // is signed into becomes the saved account.
 let _devvitLoginChild = null;
-async function devvitAddAccount(folder) {
+async function devvitAddAccount(folder, sender) {
   const fsx = require('fs');
   if (_devvitLoginChild) return { ok: false, error: 'login_in_progress', message: 'A Devvit login is already waiting in your browser.' };
   const tmpId = `pending-${Date.now()}`;
@@ -1981,6 +1981,21 @@ async function devvitAddAccount(folder) {
   const loggedIn = await new Promise((resolve) => {
     const child = require('child_process').spawn(devvitCliBin(folder), ['login'], { env, cwd: folder || os.homedir(), stdio: ['ignore', 'pipe', 'pipe'] });
     _devvitLoginChild = child;
+    // The CLI prints the authorize URL and waits for Enter before opening a
+    // browser; with no TTY that Enter never comes. Read the URL off stdout,
+    // open it ourselves, and hand it to the UI as a copyable fallback.
+    let outBuf = '', urlSent = false;
+    const onOut = (d) => {
+      if (urlSent) return;
+      outBuf += d.toString();
+      const m = outBuf.match(/https:\/\/[^\s]*reddit\.com\/[^\s]*authorize[^\s]*/);
+      if (!m) return;
+      urlSent = true;
+      try { shell.openExternal(m[0]); } catch {}
+      try { if (sender && !sender.isDestroyed()) sender.send('devvit:login-url', { url: m[0] }); } catch {}
+    };
+    child.stdout.on('data', onOut);
+    child.stderr.on('data', onOut);
     let done = false;
     const finish = (v) => { if (done) return; done = true; clearInterval(poll); clearTimeout(timer); _devvitLoginChild = null; try { child.kill(); } catch {} resolve(v); };
     const poll = setInterval(() => { try { if (fsx.statSync(tokenFile).size > 0) setTimeout(() => finish(true), 500); } catch {} }, 500);
@@ -2903,7 +2918,7 @@ ipcMain.handle('workspace:saveConfig', async (_event, folderPath, config) => {
 ipcMain.handle('devvit:list-users', async () => db.devvitListUsers());
 ipcMain.handle('devvit:accounts', async (_e, folder) => devvitAccountsState(folder));
 ipcMain.handle('devvit:accounts-select', async (_e, folder, id) => devvitSelectAccount(folder, id));
-ipcMain.handle('devvit:accounts-add', async (_e, folder) => devvitAddAccount(folder));
+ipcMain.handle('devvit:accounts-add', async (_e, folder) => devvitAddAccount(folder, _e.sender));
 ipcMain.handle('devvit:accounts-remove', async (_e, id) => devvitRemoveAccount(id));
 ipcMain.handle('devvit:upsert-user', async (_event, user) => db.devvitUpsertUser(user));
 ipcMain.handle('devvit:delete-user', async (_event, id) => db.devvitDeleteUser(id));

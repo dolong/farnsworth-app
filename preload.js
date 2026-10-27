@@ -173,6 +173,7 @@ contextBridge.exposeInMainWorld('farnsworth', {
   devvitAccountsSelect: (folder, id) => ipcRenderer.invoke('devvit:accounts-select', folder, id),
   devvitAccountsAdd: (folder) => ipcRenderer.invoke('devvit:accounts-add', folder),
   devvitAccountsRemove: (id) => ipcRenderer.invoke('devvit:accounts-remove', id),
+  onDevvitLoginUrl: (cb) => ipcRenderer.on('devvit:login-url', (_e, p) => cb(p)),
   devvitUpsertUser: (user) => ipcRenderer.invoke('devvit:upsert-user', user),
   devvitDeleteUser: (id) => ipcRenderer.invoke('devvit:delete-user', id),
   devvitSetUserModerator: (id, on) => ipcRenderer.invoke('devvit:set-user-moderator', id, on),

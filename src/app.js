@@ -4118,6 +4118,18 @@ async function openDevvitConfig() {
     const btn = e.currentTarget;
     btn.disabled = true;
     btn.textContent = 'Finish the Reddit login in your browser…';
+    const hint = pop.querySelector('#devvit-config-account-hint');
+    window.__fwDevvitLoginUrlCb = ({ url }) => {
+      if (!hint || !url) return;
+      hint.innerHTML = 'Opened Reddit in your browser. If it did not open, copy this link into the browser signed into the right account: ';
+      const inp = document.createElement('input');
+      inp.readOnly = true; inp.value = url; inp.style.cssText = 'width:100%;margin-top:4px;font-size:11px';
+      inp.addEventListener('focus', () => inp.select());
+      const cp = document.createElement('button');
+      cp.className = 'devvit-config-add-btn'; cp.textContent = 'Copy link';
+      cp.addEventListener('click', () => { navigator.clipboard.writeText(url); cp.textContent = 'Copied'; });
+      hint.append(inp, cp);
+    };
     const r = await window.farnsworth.devvitAccountsAdd(state.folder);
     if (r?.ok) { showToast?.(`Added u/${r.account.username}. This project now uses it.`); reopenConfig(); }
     else { btn.disabled = false; btn.textContent = '+ Add Reddit account'; showToast?.(r?.message || 'Reddit login failed.'); }
@@ -17987,6 +17999,7 @@ async function init() {
   }
   // Test View frame from the chat agent: switch to Test View if needed, then
   // apply the frame exactly like picking the resolution preset.
+  window.farnsworth?.onDevvitLoginUrl?.((p) => { try { window.__fwDevvitLoginUrlCb?.(p); } catch {} });
   if (window.farnsworth?.onCanvasSetTestFrame) {
     window.farnsworth.onCanvasSetTestFrame((payload) => {
       const w = Number(payload?.w), h = Number(payload?.h);
