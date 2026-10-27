@@ -92,6 +92,15 @@ contextBridge.exposeInMainWorld('farnsworth', {
   canvasRemoveView: (viewId) =>
     ipcRenderer.invoke('canvas:removeView', { viewId }),
   canvasSetPreview: (preview) => ipcRenderer.invoke('canvas:setPreview', { preview }),
+  // Test View frame set by the chat agent (set_test_frame / test_run frame /
+  // a test file's "frame" key). Same effect as picking the dropdown preset.
+  onCanvasSetTestFrame: (callback) => {
+    const handler = (_e, payload) => {
+      try { callback(payload); } catch (err) { console.error('[canvas:setTestFrame] handler error:', err); }
+    };
+    ipcRenderer.on('canvas:setTestFrame', handler);
+    return () => ipcRenderer.removeListener('canvas:setTestFrame', handler);
+  },
   // Subscribe to programmatic preview switches (chat agent's open_testview
   // tool, Jul 11 ~18:50 ET). Renderer-side handler does the same thing as
   // the size-toggle click — nukes views, sets state.preview, re-renders.

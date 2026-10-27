@@ -5113,9 +5113,72 @@ async function tryNodeTestRunner(testPath, opts = {}) {
 // could not work from chat. One path, one behaviour.
 // opts.record: true forces recording on, false forces it off, undefined
 // follows the Test View toggle.
+// Test View frame resolution shared by set_test_frame, test_run's frame arg
+// and a test file's top-level "frame" key.
+function resolveTestFrame(spec) {
+  if (spec == null || spec === '') return null;
+  let w, h, device;
+  if (typeof spec === 'string') {
+    const s = spec.trim().toLowerCase();
+    if (s === 'mobile' || s === 'phone') { w = 390; h = 844; device = 'mobile'; }
+    else if (s === 'desktop') { w = 1280; h = 800; device = 'desktop'; }
+    else if (s === 'desktop-default') { w = 724; h = 596; device = 'desktop'; }
+    else {
+      const mm = s.match(/^(\d{3,4})\s*[x×,]\s*(\d{3,4})$/);
+      if (!mm) return { error: `Unknown frame "${spec}". Use "mobile", "desktop", "desktop-default" or "WxH" like "1512x1320".` };
+      w = +mm[1]; h = +mm[2];
+    }
+  } else if (typeof spec === 'object') {
+    if (spec.preset) return resolveTestFrame(spec.preset);
+    w = Number(spec.width ?? spec.w); h = Number(spec.height ?? spec.h); device = spec.device;
+  } else return { error: 'frame must be a string or {width, height, device}' };
+  if (!Number.isFinite(w) || !Number.isFinite(h) || w < 160 || h < 160 || w > 4000 || h > 4000) return { error: 'frame width and height must be 160-4000' };
+  if (device !== 'mobile' && device !== 'desktop') device = w >= h ? 'desktop' : 'mobile';
+  return { w: Math.round(w), h: Math.round(h), device };
+}
+
+// The window an agent/tool call belongs to: the one with that folder open,
+// else the focused window. With several windows, getFocusedWindow() alone
+// would aim a tool at whichever project happens to be in front.
+function windowForFolder(folder) {
+  const norm = (f) => String(f || '').replace(/\/+$/, '');
+  if (folder) {
+    for (const [id, f] of windowWorkspaces) {
+      if (!f || norm(f) !== norm(folder)) continue;
+      const w = BrowserWindow.getAllWindows().find((x) => !x.isDestroyed() && x.webContents.id === id && !isExpressLaneWindow(x));
+      if (w) return w;
+    }
+  }
+  const t = BrowserWindow.getFocusedWindow() || mainWindow || openWindows[0];
+  return t && !t.isDestroyed() ? t : null;
+}
+
+async function applyTestFrame(win, frame) {
+  if (!win || win.isDestroyed()) return { ok: false, error: 'no_window' };
+  win.webContents.send('canvas:setTestFrame', frame);
+  // Let the renderer re-lay out and the WebContentsView take the new size.
+  await new Promise((r) => setTimeout(r, 1500));
+  return { ok: true, device: frame.device, width: frame.w, height: frame.h };
+}
+
 async function runTestByPath(testPath, opts = {}) {
   try {
     if (!testPath || typeof testPath !== 'string') return { ok: false, error: 'missing_path' };
+
+    // Frame: explicit per-run frame wins, else the test file's "frame" key.
+    let frameSpec = opts.frame;
+    if (frameSpec == null) { try { frameSpec = JSON.parse(fsSync.readFileSync(testPath, 'utf8')).frame; } catch {} }
+    let appliedFrame = null;
+    if (frameSpec != null) {
+      const fr = resolveTestFrame(frameSpec);
+      if (fr?.error) return { ok: false, error: 'bad_frame', message: fr.error };
+      const win = opts.window || windowForFolder(opts.folder);
+      const r = await applyTestFrame(win, fr);
+      if (!r.ok) return { ok: false, error: r.error, message: 'Could not set the Test View frame.' };
+      appliedFrame = { device: fr.device, width: fr.w, height: fr.h };
+      await waitForCanvasView(15000);
+    }
+    const withFrame = (res) => (appliedFrame && res && typeof res === 'object' ? { ...res, frame: appliedFrame } : res);
 
     // Try the Node-native path first (no Python/websocket-client
     // dependency, no CDP-over-WebSocket hop). Falls through to the
@@ -5133,7 +5196,7 @@ async function runTestByPath(testPath, opts = {}) {
           });
         }
       } catch {}
-      return nodeResult;
+      return withFrame(nodeResult);
     }
     // Spawn the Python test runner. Capture stdout+stderr, resolve with
     // the merged output. Exit code 0 = pass, non-zero = fail (but a test
@@ -5220,7 +5283,7 @@ async function runTestByPath(testPath, opts = {}) {
           out.video = null;
           out.recording = { skipped: true, blockers, note: blockers.length ? UNRECORDABLE_NOTE : 'No video: the test ran on the Python runner (the canvas preview was not open or the Node runner was unavailable). Call open_testview, then run again.' };
         }
-        resolve(out);
+        resolve(withFrame(out));
       });
       proc.on('error', err => {
         try {
@@ -5240,8 +5303,8 @@ async function runTestByPath(testPath, opts = {}) {
 // test:run takes an absolute test path (not a folder) — the renderer already
 // knows the per-project dir from the test:list response and passes the full
 // path through, so the IPC works for tests that live anywhere.
-ipcMain.handle('test:run', async (_event, { path: testPath, record } = {}) =>
-  runTestByPath(testPath, { record }));
+ipcMain.handle('test:run', async (event, { path: testPath, record } = {}) =>
+  runTestByPath(testPath, { record, window: BrowserWindow.fromWebContents(event.sender) }));
 
 // Recordings: list them, and open the folder (or reveal one file) in Finder.
 // The Test View Record toggle itself rides the generic setting:get/setting:set
@@ -7701,7 +7764,7 @@ const AGENT_TOOLS = [
   },
   {
     name: 'test_save',
-    description: 'Save a test JSON file to the active workspace\'s .farnsworth/devvit-tests/ folder. JSON is validated before writing. RECORDING: only tests WITHOUT switchUser, switchDevvitUser or llm-step steps (anywhere, including inside if/while) can be recorded, because those run on the Python runner. When the user wants a video of the run (or to share/send it), build the test from the other actions only: set the user beforehand with switch_devvit_user, and use waitFor/eval/if/while for checks. The result says recordable true/false. The name is normalized to lowercase-dashes (e.g. "My Test!" → "my-test"). Call test_format_spec for the test format. IMPORTANT - a test cannot declare its own viewport: the runner reads only `name` and `steps`, and the frame comes from the resolution dropdown in the canvas header, which defaults to MOBILE 390x844. Test View also supports Desktop presets (724x596, 1280x800, 1512x1320, 1920x1080, 2560x1440, 3440x1440), Fullscreen and Post. Do not silently assume mobile: if the layout differs between phone and desktop, ask which frame the test is for, state the assumption in the test name, and make the first step after `reload` a waitFor on `.fw-stage--desktop` or `.fw-stage--mobile` so a wrong preset fails loudly instead of dying on a selector that only exists in the other layout.',
+    description: 'Save a test JSON file to the active workspace\'s .farnsworth/devvit-tests/ folder. JSON is validated before writing. RECORDING: only tests WITHOUT switchUser, switchDevvitUser or llm-step steps (anywhere, including inside if/while) can be recorded, because those run on the Python runner. When the user wants a video of the run (or to share/send it), build the test from the other actions only: set the user beforehand with switch_devvit_user, and use waitFor/eval/if/while for checks. The result says recordable true/false. The name is normalized to lowercase-dashes (e.g. "My Test!" → "my-test"). Call test_format_spec for the test format. FRAME: a test can declare the Test View frame it needs with a top-level "frame" key next to name and steps: "mobile" (390x844), "desktop" (1280x800), a size string like "1512x1320", or {"width":1280,"height":800,"device":"desktop"}. test_run (and the Run button) applies it before the steps run, so the test always gets its frame. Without "frame" the test runs in whatever the resolution dropdown shows (default MOBILE 390x844). When the layout differs between phone and desktop, set "frame" and make the first step after `reload` a waitFor on `.fw-stage--desktop` or `.fw-stage--mobile`.',
     input_schema: {
       type: 'object',
       properties: {
@@ -7713,11 +7776,12 @@ const AGENT_TOOLS = [
   },
   {
     name: 'test_run',
-    description: 'Run a test against the canvas WebContentsView. Takes the test\'s ABSOLUTE file path (not a name) — get it from test_list or test_save results. Returns stdout/stderr (last 4000/2000 chars), exit code, a `failed` count parsed from the runner output, and — when the run was recorded — a `video` object with the video path (.mp4; .webm only if ffmpeg is unavailable), byte size and duration. Recording is on by default: report the video path back to the user when one comes back. The test runs against whatever frame Test View is currently set to - the resolution dropdown in the canvas header, default MOBILE 390x844 - and neither the test file nor this tool can change it. If a run fails on layout-specific selectors, consider that the user may need to pick a Desktop preset before re-running, and say so.',
+    description: 'Run a test against the canvas WebContentsView. Takes the test\'s ABSOLUTE file path (not a name) — get it from test_list or test_save results. Returns stdout/stderr (last 4000/2000 chars), exit code, a `failed` count parsed from the runner output, and — when the run was recorded — a `video` object with the video path (.mp4; .webm only if ffmpeg is unavailable), byte size and duration. Recording is on by default: report the video path back to the user when one comes back. Frame: pass `frame` here, or put a top-level "frame" in the test file, and the Test View frame is set before the run (same as picking the resolution dropdown). Otherwise the run uses the current dropdown frame (default MOBILE 390x844). To change it without running, call set_test_frame.',
     input_schema: {
       type: 'object',
       properties: {
         path: { type: 'string', description: 'Absolute path to the test JSON file (e.g. /Users/long/Documents/lastdraft/the-last-draft/.farnsworth/devvit-tests/play-tab.json)' },
+        frame: { description: 'Optional Test View frame for this run, overriding the test file\'s "frame": "mobile", "desktop", "1280x800", or {width, height, device}.' },
         record: { type: 'boolean', description: 'Optional per-run override for video recording. Omit to follow the Test View Record toggle (on by default). true = record this run even if the toggle is off; false = skip recording. Recording only applies to the Node runner path (tests using switchUser or llm-step run under Python and cannot be recorded).' }
       },
       required: ['path']
@@ -7864,6 +7928,19 @@ const AGENT_TOOLS = [
         view: { type: 'string', enum: ['live', 'storybook', 'code', 'prod'], description: 'Which top-level canvas view to show.' }
       },
       required: ['view']
+    }
+  },
+  {
+    name: 'set_test_frame',
+    description: 'Set the Test View game frame - the same thing as picking a preset in the resolution dropdown in the canvas header. Switches the canvas to Test View if needed. preset: "mobile" (390x844), "desktop" (1280x800), "desktop-default" (724x596), or any "WxH" such as "1512x1320", "1920x1080", "375x667". Or pass width + height (device defaults to desktop when wider than tall). Use whenever a test or check needs a phone or desktop layout; never ask the user to pick the dropdown.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        preset: { type: 'string', description: '"mobile", "desktop", "desktop-default", or "WxH" like "1512x1320".' },
+        width: { type: 'number' },
+        height: { type: 'number' },
+        device: { type: 'string', enum: ['mobile', 'desktop'], description: 'Phone or desktop-window chrome. Defaults by orientation.' }
+      }
     }
   },
   {
@@ -8282,7 +8359,7 @@ async function executeAgentTool(name, input, folderOverride) {
     // the Node runner, the companion test:state broadcasts and the video
     // recording. `record` is a per-run override of the Test View toggle.
     const record = typeof input.record === 'boolean' ? input.record : undefined;
-    return await runTestByPath(input.path, { record });
+    return await runTestByPath(input.path, { record, frame: input.frame, folder });
   }
   if (name === 'test_recordings_list') {
     return await listTestRecordings(folder, input?.limit);
@@ -8351,6 +8428,13 @@ async function executeAgentTool(name, input, folderOverride) {
     if (!target || target.isDestroyed()) return { ok: false, error: 'no_window' };
     target.webContents.send('canvas:setMode', { mode: view });
     return { ok: true, view };
+  }
+  if (name === 'set_test_frame') {
+    const fr = resolveTestFrame(input?.preset ? input.preset : (input?.width || input?.height ? { width: input.width, height: input.height, device: input.device } : null));
+    if (!fr) return { ok: false, error: 'bad_input', message: 'Pass preset ("mobile", "desktop", "1512x1320") or width + height.' };
+    if (fr.error) return { ok: false, error: 'bad_frame', message: fr.error };
+    if (input?.device === 'mobile' || input?.device === 'desktop') fr.device = input.device;
+    return await applyTestFrame(windowForFolder(folder), fr);
   }
   if (name === 'set_preview') {
     const preview = input?.preview;

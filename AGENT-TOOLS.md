@@ -74,6 +74,7 @@ so the agent path and the UI path cannot drift.
 | `test_recordings_list(limit?)` | List recorded run videos in `<project>/.farnsworth/recordings/`, newest first: path, source test, size, mtime. |
 | `open_recordings_folder(path?)` | Reveal the recordings folder in Finder, or one specific `.webm`. Uses `/usr/bin/open -R` to avoid the AppleEvents TCC prompt. |
 | `set_test_recording(enabled)` | Flip the persisted default-recording toggle (`test.record`). Same state as the Record button in Test View; broadcasts `test:record:changed` so the button repaints. |
+| `set_test_frame(preset? \| width, height, device?)` | Set the Test View game frame (same as the resolution dropdown). Tests can also carry a top-level `frame`; `test_run` applies it, and takes a `frame` arg. |
 
 **Recording (Aug 17).** Runs record to `<project>/.farnsworth/recordings/<test>_<stamp>.webm`
 with a burned-in overlay (step index/total, action, selector, elapsed clock, pass/fail).

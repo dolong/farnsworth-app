@@ -14786,6 +14786,7 @@ async function sendChatMessage(opts) {
           '- test_recordings_list(limit?) — list recorded run videos for this workspace (newest first) from .farnsworth/recordings/',
           '- open_recordings_folder(path?) — reveal the recordings folder in Finder, or one specific recording',
           '- set_test_recording(enabled) — turn default test-run recording on or off (same toggle as the Record button in Test View)',
+          '- set_test_frame(preset? | width+height, device?) — set the Test View game frame (the resolution dropdown): "mobile" 390x844, "desktop" 1280x800, or any preset/size like 1512x1320. A test file may also carry a top-level "frame" (e.g. "desktop" or {"width":1280,"height":800}); test_run applies it before running, and test_run takes a frame arg too.',
           '- watch_link(ttlHours?, label?) — make a view-only live link (app.farnsworth.tv/watch) to the canvas preview that anyone can watch in a browser without logging in. Viewers cannot chat, click or see files. Default 12h expiry, max 168h. Give the user the url; if the result has a note, pass it on.',
           '- share_recording(path?) — upload a recording (newest if omitted) and post it in this chat as a video player that also plays in the Companion app; returns a shareable link. Use when the user asks to send/share/show a recording, especially from the Companion.',
           '',
@@ -15159,6 +15160,8 @@ async function sendChatMessage(opts) {
         } else if (tu.name === 'share_recording') {
           resultContent = `Uploaded ${toolRes.name} (${Math.round((toolRes.bytes || 0) / 1024)}KB). Link: ${toolRes.url}\nIt now plays inline in this chat on the desktop and in the Companion. Include the link in your reply so the user can paste it elsewhere.`;
           updateAgentMsg({ media: [...(agentMsg.media || []), { kind: 'video', url: toolRes.url, name: toolRes.name }] });
+        } else if (tu.name === 'set_test_frame') {
+          resultContent = `Test View frame is now ${toolRes.device} ${toolRes.width}x${toolRes.height} (same as picking it in the resolution dropdown).`;
         } else if (tu.name === 'set_test_recording') {
           resultContent = `Test-run recording is now ${toolRes.enabled ? 'ON' : 'OFF'}${toolRes.note ? ' — ' + toolRes.note : ''}`;
         } else if (tu.name === 'test_read') {
@@ -17937,6 +17940,24 @@ async function init() {
         syncResolutionDropdownToCategory();
       }
       if (state.previewCustomHeight) delete state.previewCustomHeight[state.preview];
+      updateModeToggles();
+      renderCanvas();
+    });
+  }
+  // Test View frame from the chat agent: switch to Test View if needed, then
+  // apply the frame exactly like picking the resolution preset.
+  if (window.farnsworth?.onCanvasSetTestFrame) {
+    window.farnsworth.onCanvasSetTestFrame((payload) => {
+      const w = Number(payload?.w), h = Number(payload?.h);
+      if (!Number.isFinite(w) || !Number.isFinite(h)) return;
+      const device = payload?.device === 'mobile' ? 'mobile' : 'desktop';
+      if (state.canvasMode !== 'live') state.canvasMode = 'live';
+      if (state.preview !== 'testview') {
+        window.farnsworth?.canvasRemoveAllViews?.();
+        state.preview = 'testview';
+      }
+      applyTestviewFrame({ device, w, h });
+      if (typeof syncResolutionDropdownToCategory === 'function') syncResolutionDropdownToCategory();
       updateModeToggles();
       renderCanvas();
     });

@@ -201,3 +201,15 @@ User: "make the lobby screenshot test wait 2 seconds after PLAY"
 3. test_save with the edited JSON
 4. Report the change
 ```
+
+## Test View frame
+
+A test can declare the frame it needs with a top-level `"frame"` next to `name` and `steps`:
+`"mobile"` (390x844), `"desktop"` (1280x800), `"desktop-default"` (724x596), a size like `"1512x1320"`,
+or `{"width":1280,"height":800,"device":"desktop"}`. `test_run` and the Run button set the Test View
+frame (the resolution dropdown) before the steps run. `test_run` also takes a `frame` arg, and
+`set_test_frame` changes it without running. Without `"frame"`, the run uses whatever the dropdown shows.
+
+```json
+{ "name": "admin-schedule-battle", "frame": "desktop", "steps": [ { "action": "reload" }, { "action": "waitFor", "selector": ".fw-stage--desktop" } ] }
+```
