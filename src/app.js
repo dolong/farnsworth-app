@@ -2673,6 +2673,7 @@ function renderCanvas() {
   // Keep the Scripts panel's run-target badge honest whenever the canvas moves
   // between Prod and everything else.
   syncScriptsTarget();
+  try { window.__fwSyncResolutionDropdown?.(); } catch {}
   // Leaving Prod is an authenticated-browser lifecycle transition, not just a DOM repaint.
   if (state.canvasMode === 'prod') state._prodWasActive = true;
   else if (state._prodWasActive) {
@@ -13306,6 +13307,9 @@ function wire() {
   // syncResolutionDropdownToCategory() — selects the matching dropdown
   // option for the current preview category's default width so the
   // dropdown doesn't lie about what's on screen after a category swap.
+  // Exposed so renderCanvas can resync on every redraw: the header must never
+  // disagree with the artboard (Oct 27: dropdown said 390x844, frame was 1512x1320).
+  window.__fwSyncResolutionDropdown = () => syncResolutionDropdownToCategory();
   function syncResolutionDropdownToCategory() {
     const sel = $('#canvas-resolution-select');
     if (!sel) return;
@@ -17952,12 +17956,26 @@ async function init() {
       if (!Number.isFinite(w) || !Number.isFinite(h)) return;
       const device = payload?.device === 'mobile' ? 'mobile' : 'desktop';
       if (state.canvasMode !== 'live') state.canvasMode = 'live';
-      if (state.preview !== 'testview') {
-        window.farnsworth?.canvasRemoveAllViews?.();
-        state.preview = 'testview';
-      }
+      // Always drop the old game view: a frame change can flip phone <->
+      // desktop, and a surviving view keeps its old bounds and floats outside
+      // the new frame while the new placeholder stays black.
+      window.farnsworth?.canvasRemoveAllViews?.();
+      state.preview = 'testview';
       applyTestviewFrame({ device, w, h });
-      if (typeof syncResolutionDropdownToCategory === 'function') syncResolutionDropdownToCategory();
+      // Keep the resolution dropdown honest (its sync helper is scoped to the
+      // header wiring, so set it directly).
+      const sel = document.querySelector('#canvas-resolution-select');
+      if (sel) {
+        const custom = document.querySelector('#canvas-resolution-custom');
+        const opt = Array.from(sel.options).find((o) => o.value === `${w},${h}`);
+        if (opt) { sel.value = opt.value; if (custom) custom.hidden = true; }
+        else {
+          sel.value = 'custom';
+          if (custom) custom.hidden = false;
+          const wi = document.querySelector('#canvas-resolution-w'); if (wi) wi.value = String(w);
+          const hi = document.querySelector('#canvas-resolution-h'); if (hi) hi.value = String(h);
+        }
+      }
       updateModeToggles();
       renderCanvas();
     });

@@ -146,7 +146,14 @@ ipcMain.handle('workspace:setActive', async (event, folder) => {
 });
 
 app.on('web-contents-created', (_e, contents) => {
-  contents.on('destroyed', () => windowWorkspaces.delete(contents.id));
+  const ownerId = contents.id;
+  contents.on('destroyed', () => {
+    windowWorkspaces.delete(ownerId);
+    // A closed window's previews must not linger as orphans in the map.
+    try {
+      for (const k of [...canvasWebContentsViews.keys()]) if (k.startsWith(`${ownerId}:`)) destroyCanvasViewKey(k);
+    } catch {}
+  });
 });
 
 function currentFolderSetting() {
@@ -861,7 +868,7 @@ function buildMenu() {
           label: 'Inspect Canvas Preview',
           accelerator: 'CmdOrCtrl+Shift+I',
           click: () => {
-            const view = canvasWebContentsViews.values().next().value;
+            const view = canvasViewForWindow(BrowserWindow.getFocusedWindow() || mainWindow);
             if (view) {
               try {
                 const wc = view.webContents;
@@ -2826,7 +2833,39 @@ ipcMain.handle('devvit:set-project-settings', async (_event, workspacePath, curr
 // - Doesn't share the renderer's CSS, session storage, or DevTools
 //   target — its own debugger target is at port 9222 type=page
 
+// Canvas previews are owned PER WINDOW. Keys are `${ownerWebContentsId}:${viewId}`
+// (viewId = "mobile" | "desktop" | ...), so two windows can each show their own
+// game. Before Oct 27 this map was keyed by viewId alone and every view was
+// attached to `mainWindow` (the newest window): a second window stole the first
+// window's preview and its removeAllViews wiped the other window's views.
 const canvasWebContentsViews = new Map();
+const canvasViewOwners = new Map(); // key -> BrowserWindow
+function canvasViewKey(event, viewId) {
+  const id = event && event.sender && !event.sender.isDestroyed() ? event.sender.id : 0;
+  return `${id}:${viewId}`;
+}
+function canvasViewsOfWindow(win) {
+  if (!win || win.isDestroyed()) return [];
+  const prefix = `${win.webContents.id}:`;
+  return [...canvasWebContentsViews.entries()].filter(([k]) => k.startsWith(prefix)).map(([, v]) => v);
+}
+// The preview that belongs to a window (newest view of that window); falls back
+// to any preview so single-window behavior is unchanged.
+function canvasViewForWindow(win) {
+  const own = canvasViewsOfWindow(win);
+  if (own.length) return own[own.length - 1];
+  const all = [...canvasWebContentsViews.values()];
+  return all.length ? all[all.length - 1] : null;
+}
+function destroyCanvasViewKey(key) {
+  const view = canvasWebContentsViews.get(key);
+  const owner = canvasViewOwners.get(key);
+  try { if (owner && !owner.isDestroyed()) owner.contentView.removeChildView(view); } catch {}
+  try { if (view && !view.webContents.isDestroyed()) view.webContents.destroy(); } catch {}
+  canvasWebContentsViews.delete(key);
+  canvasViewOwners.delete(key);
+  canvasViewZoomFactors.delete(key);
+}
 
 // Agent "Go Live": the renderer owns the boot (bootFarnsworthDev keeps its UI
 // state right), so main asks it and waits for the reply.
@@ -2861,8 +2900,7 @@ let canvasRecording = null;
 let canvasCaptureWindow = null;
 let canvasCaptureReady = null;
 function activeCanvasWebContentsView() {
-  const entries = [...canvasWebContentsViews.entries()];
-  return entries.length ? entries[entries.length - 1][1] : null;
+  return canvasViewForWindow(BrowserWindow.getFocusedWindow() || mainWindow);
 }
 function createCanvasCaptureWindow() {
   canvasCaptureWindow = new BrowserWindow({
@@ -4040,20 +4078,21 @@ async function prodRunScript({ path: testPath, timeout } = {}) {
 }
 ipcMain.handle('prod:test:run', async (_event, payload = {}) => prodRunScript(payload));
 
-const captureCanvasPNG = async () => {
+const captureCanvasPNG = async (win) => {
   if (prodCanvasActive && latestProdFrame?.buffer) {
     const image = nativeImage.createFromBuffer(latestProdFrame.buffer);
     return image && !image.isEmpty() ? image : null;
   }
-  const entries = [...canvasWebContentsViews.entries()];
-  if (entries.length) {
-    const img = await entries[entries.length - 1][1].webContents.capturePage();
+  const host = win && !win.isDestroyed() ? win : (BrowserWindow.getFocusedWindow() || mainWindow);
+  const v = canvasViewForWindow(host);
+  if (v && !v.webContents.isDestroyed()) {
+    const img = await v.webContents.capturePage();
     return (img && !img.isEmpty()) ? img : null;
   }
   try {
-    const r = await mainWindow.webContents.executeJavaScript(_CANVAS_IFRAME_RECT_JS, true);
+    const r = await host.webContents.executeJavaScript(_CANVAS_IFRAME_RECT_JS, true);
     if (!r || r.width <= 0) return null;
-    const img = await mainWindow.webContents.capturePage(r);
+    const img = await host.webContents.capturePage(r);
     return (img && !img.isEmpty()) ? img : null;
   } catch { return null; }
 };
@@ -4103,7 +4142,7 @@ ipcMain.handle('canvas:setNetworkAccess', (_event, { allowed }) => {
 // so openDevTools is a no-op on them by construction.
 ipcMain.handle('canvas:openDevTools', (_event, args) => {
   const wanted = args && args.viewId;
-  const view = wanted ? canvasWebContentsViews.get(wanted) : canvasWebContentsViews.values().next().value;
+  const view = wanted ? canvasWebContentsViews.get(canvasViewKey(_event, wanted)) : canvasViewForWindow(BrowserWindow.fromWebContents(_event.sender));
   if (!view) {
     // Post View is a plain DOM <iframe> living in the MAIN renderer, not a
     // WebContentsView — so its DOM is inspectable from the main window's
@@ -4180,10 +4219,12 @@ function attachPreviewContextMenu(view, devToolsEnabled) {
 
 
 ipcMain.handle('canvas:createView', async (_event, { viewId, url, bounds, opts }) => {
+  const ownerWin = BrowserWindow.fromWebContents(_event.sender) || mainWindow;
+  const viewKey = canvasViewKey(_event, viewId);
   try {
     // Re-create if a view with this ID already exists (defensive).
-    if (canvasWebContentsViews.has(viewId)) {
-      const existing = canvasWebContentsViews.get(viewId);
+    if (canvasWebContentsViews.has(viewKey)) {
+      const existing = canvasWebContentsViews.get(viewKey);
       existing.setBounds(bounds);
       try { existing.webContents.loadURL(url); } catch {}
       return { ok: true, updated: true };
@@ -4206,20 +4247,21 @@ ipcMain.handle('canvas:createView', async (_event, { viewId, url, bounds, opts }
         devTools: !opts || opts.devTools !== false,
       }
     });
-    mainWindow.contentView.addChildView(view);
+    ownerWin.contentView.addChildView(view);
     view.setBounds(bounds);
     // Pin the content zoom on every navigation commit — otherwise the
     // partition's persisted per-origin zoom wins over whatever the renderer
     // set while the page was still loading.
     const applyZoom = () => {
-      const f = canvasViewZoomFactors.get(viewId);
+      const f = canvasViewZoomFactors.get(viewKey);
       if (f) { try { view.webContents.setZoomFactor(f); } catch {} }
     };
     view.webContents.on('did-navigate', applyZoom);
     view.webContents.on('did-finish-load', applyZoom);
     view.webContents.loadURL(url);
     attachPreviewContextMenu(view, !opts || opts.devTools !== false);
-    canvasWebContentsViews.set(viewId, view);
+    canvasWebContentsViews.set(viewKey, view);
+    canvasViewOwners.set(viewKey, ownerWin);
     return { ok: true };
   } catch (e) {
     console.error('[canvas:createView] error:', e);
@@ -4228,7 +4270,7 @@ ipcMain.handle('canvas:createView', async (_event, { viewId, url, bounds, opts }
 });
 
 ipcMain.handle('canvas:updateViewBounds', (_event, { viewId, bounds }) => {
-  const view = canvasWebContentsViews.get(viewId);
+  const view = canvasWebContentsViews.get(canvasViewKey(_event, viewId));
   if (!view) return { ok: false, error: 'view_not_found' };
   try {
     view.setBounds(bounds);
@@ -4239,13 +4281,10 @@ ipcMain.handle('canvas:updateViewBounds', (_event, { viewId, bounds }) => {
 });
 
 ipcMain.handle('canvas:removeView', (_event, { viewId }) => {
-  const view = canvasWebContentsViews.get(viewId);
-  if (!view) return { ok: false, error: 'view_not_found' };
+  const key = canvasViewKey(_event, viewId);
+  if (!canvasWebContentsViews.has(key)) return { ok: false, error: 'view_not_found' };
   try {
-    mainWindow.contentView.removeChildView(view);
-    view.webContents.destroy();
-    canvasWebContentsViews.delete(viewId);
-    canvasViewZoomFactors.delete(viewId);
+    destroyCanvasViewKey(key);
     return { ok: true };
   } catch (e) {
     return { ok: false, error: e.message };
@@ -4260,17 +4299,13 @@ ipcMain.handle('canvas:removeView', (_event, { viewId }) => {
 // Calling removeAllViews on every preview switch ensures no view survives
 // across previews regardless of in-flight createView promises. Jul 11
 // ~16:30 ET — testview orphan bug fix.
-ipcMain.handle('canvas:removeAllViews', () => {
+ipcMain.handle('canvas:removeAllViews', (_event) => {
   try {
-    for (const [viewId, view] of canvasWebContentsViews) {
-      try {
-        mainWindow.contentView.removeChildView(view);
-        view.webContents.destroy();
-      } catch {}
-    }
-    canvasWebContentsViews.clear();
-    canvasViewZoomFactors.clear();
-    return { ok: true, removed: canvasWebContentsViews.size };
+    // Only the asking window's previews: another window's game must survive.
+    const prefix = canvasViewKey(_event, '');
+    const keys = [...canvasWebContentsViews.keys()].filter((k) => k.startsWith(prefix));
+    for (const k of keys) destroyCanvasViewKey(k);
+    return { ok: true, removed: keys.length };
   } catch (e) {
     return { ok: false, error: e.message };
   }
@@ -4566,7 +4601,7 @@ ipcMain.handle('devvit:setProjectSubreddit', async (_event, { folder, subredditI
 // emulator cogwheel popover) — the WebContentsView is a separate composited
 // layer that CSS z-index cannot affect, so hide it instead.
 ipcMain.handle('canvas:setVisible', (_event, { viewId, visible }) => {
-  const view = canvasWebContentsViews.get(viewId);
+  const view = canvasWebContentsViews.get(canvasViewKey(_event, viewId));
   if (!view) return { ok: false, error: 'view_not_found' };
   try {
     view.setVisible(visible !== false);
@@ -4583,12 +4618,13 @@ ipcMain.handle('canvas:setVisible', (_event, { viewId, visible }) => {
 // zoom scale (0.25-2.0); the page's logical CSS viewport stays constant
 // (bounds/factor), so test-runner selectors + screenshots are unaffected.
 ipcMain.handle('canvas:setZoomFactor', (_event, { viewId, factor }) => {
-  const view = canvasWebContentsViews.get(viewId);
+  const zkey = canvasViewKey(_event, viewId);
+  const view = canvasWebContentsViews.get(zkey);
   if (!view) return { ok: false, error: 'view_not_found' };
   const f = Number(factor);
   if (!Number.isFinite(f) || f <= 0.05 || f > 5) return { ok: false, error: 'bad_factor' };
   try {
-    canvasViewZoomFactors.set(viewId, f);
+    canvasViewZoomFactors.set(zkey, f);
     view.webContents.setZoomFactor(f);
     return { ok: true };
   } catch (e) {
@@ -4598,7 +4634,7 @@ ipcMain.handle('canvas:setZoomFactor', (_event, { viewId, factor }) => {
 
 // Debug: inspect a canvas WebContentsView's state.
 ipcMain.handle('canvas:debugView', (_event, { viewId }) => {
-  const view = canvasWebContentsViews.get(viewId);
+  const view = canvasWebContentsViews.get(canvasViewKey(_event, viewId));
   if (!view) return { found: false, error: 'view_not_found' };
   const wc = view.webContents;
   try {
@@ -5011,7 +5047,9 @@ async function tryNodeTestRunner(testPath, opts = {}) {
   const mod = await getNodeTestRunner();
   if (!mod) return null;
 
-  const view = canvasWebContentsViews.values().next().value;
+  // Drive the preview of the window that owns this run, not whichever
+  // window's preview happens to be first in the map.
+  const view = canvasViewForWindow(opts.window || BrowserWindow.getFocusedWindow() || mainWindow);
   if (!view || view.webContents.isDestroyed()) return null;
 
   let raw;
@@ -5183,7 +5221,8 @@ async function runTestByPath(testPath, opts = {}) {
     // Try the Node-native path first (no Python/websocket-client
     // dependency, no CDP-over-WebSocket hop). Falls through to the
     // existing Python runner untouched if not eligible or if it errors.
-    const nodeResult = await tryNodeTestRunner(testPath, { record: opts.record });
+    const runWin = opts.window || windowForFolder(opts.folder);
+    const nodeResult = await tryNodeTestRunner(testPath, { record: opts.record, window: runWin });
     if (nodeResult) {
       try {
         const rc = getRelayClient();
@@ -8131,7 +8170,7 @@ async function executeAgentTool(name, input, folderOverride) {
   }
 
   if (name === 'take_canvas_screenshot') {
-    const img = await captureCanvasPNG();
+    const img = await captureCanvasPNG(windowForFolder(folderOverride || currentFolderSetting()));
     if (!img) return { ok: false, error: 'no_canvas', message: 'No active canvas view. Switch to a preview mode first (e.g. set_preview("mobile") or set_canvas_view("live")).' };
     const ts = Date.now();
     const raw = (typeof input?.filename === 'string' && input.filename.trim())
@@ -10602,10 +10641,10 @@ app.whenReady().then(async () => {
     };
     // Capture one JPEG frame from whatever the desktop is currently showing.
     const captureCanvasFrame = async (maxWidth, quality) => {
-      const entries = [...canvasWebContentsViews.entries()];
+      const activeView = activeCanvasWebContentsView();
       let img;
-      if (entries.length) {
-        img = await entries[entries.length - 1][1].webContents.capturePage();
+      if (activeView) {
+        img = await activeView.webContents.capturePage();
       } else {
         const rect = await getIframeRect();
         if (!rect) return null;
@@ -10676,10 +10715,10 @@ app.whenReady().then(async () => {
       const nx = Number(msg?.nx), ny = Number(msg?.ny);
       if (!Number.isFinite(nx) || !Number.isFinite(ny)) return;
       const cx = Math.min(Math.max(nx, 0), 1), cy = Math.min(Math.max(ny, 0), 1);
-      const entries = [...canvasWebContentsViews.entries()];
+      const activeView = activeCanvasWebContentsView();
       let wc, x, y;
-      if (entries.length) {
-        const view = entries[entries.length - 1][1];
+      if (activeView) {
+        const view = activeView;
         const b = view.getBounds();
         wc = view.webContents; x = Math.round(cx * b.width); y = Math.round(cy * b.height);
       } else {
