@@ -123,53 +123,45 @@ function isPortBound(port) {
  */
 function allocatePort(opts) {
   const { db, repoRoot, role, preferred, rangeStart, rangeEnd, instanceId } = opts;
+  const windowId = Number.isInteger(opts.windowId) ? opts.windowId : null;
+  // Extra ports that must ALSO be free for this one to count, as offsets
+  // (the server-runner binds its admin listener at server port + 100).
+  const alsoFree = Array.isArray(opts.alsoFreeOffsets) ? opts.alsoFreeOffsets : [];
 
   if (typeof db !== 'object' || !db) {
     throw new Error('allocatePort: db handle is required');
   }
 
-  // Ensure schema exists (idempotent)
   db.exec(SCHEMA_SQL);
+  try { require('./dev-live-registry').ensureSchema(db); } catch (_) {}
 
-  // Step 1: Reap stale leases
   reapStaleLeases(db);
 
   const now = Math.floor(Date.now() / 1000);
   const t = tag(repoRoot, role);
+  const order = [];
+  if (preferred >= rangeStart && preferred <= rangeEnd) order.push(preferred);
+  for (let port = rangeStart; port <= rangeEnd; port++) if (port !== preferred) order.push(port);
 
-  // Step 2: Try preferred port
-  if (preferred >= rangeStart && preferred <= rangeEnd) {
+  for (const port of order) {
     try {
       db.prepare(
-        'INSERT INTO dev_port_leases (port, repo_root, role, pid, instance, leased_at) VALUES (?, ?, ?, ?, ?, ?)'
-      ).run(preferred, repoRoot, role, process.pid, instanceId, now);
-      console.log(`${t} allocated preferred port ${preferred}`);
-      return preferred;
+        'INSERT INTO dev_port_leases (port, repo_root, role, pid, instance, leased_at, window_id) VALUES (?, ?, ?, ?, ?, ?, ?)'
+      ).run(port, repoRoot, role, process.pid, instanceId, now, windowId);
     } catch (_) {
-      // UNIQUE violation — someone else has it
-      console.warn(`${t} preferred port ${preferred} taken, scanning range ${rangeStart}-${rangeEnd}`);
+      continue; // leased by another Farnsworth window
     }
-  }
-
-  // Step 3: Scan range for first free port
-  for (let port = rangeStart; port <= rangeEnd; port++) {
-    if (port === preferred) continue; // already tried above
-    try {
-      db.prepare(
-        'INSERT INTO dev_port_leases (port, repo_root, role, pid, instance, leased_at) VALUES (?, ?, ?, ?, ?, ?)'
-      ).run(port, repoRoot, role, process.pid, instanceId, now);
-      // Lease acquired. Log if something non-Farnsworth is already on the port
-      // (child process will crash on EADDRINUSE with strictPort:true — acceptable).
-      if (isPortBound(port)) {
-        console.warn(`${t} port ${port} leased but external listener detected —` +
-          ' child process may EADDRINUSE');
-      }
-      console.log(`${t} allocated port ${port}`);
-      return port;
-    } catch (_) {
-      // UNIQUE violation — another instance claimed it before us
+    // Oct 27 2026: a port something else is already listening on is NOT
+    // usable. The old code leased it anyway and only logged a warning, which
+    // is exactly how an orphaned Vite on 5174 broke every later Go Live.
+    const busy = [port, ...alsoFree.map((o) => port + o)].find((p) => isPortBound(p));
+    if (busy) {
+      db.prepare('DELETE FROM dev_port_leases WHERE port = ? AND pid = ?').run(port, process.pid);
+      console.warn(`${t} port ${busy} already has a listener, skipping ${port}`);
       continue;
     }
+    console.log(`${t} allocated port ${port}`);
+    return port;
   }
 
   throw new Error(

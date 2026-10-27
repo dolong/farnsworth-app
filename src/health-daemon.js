@@ -263,6 +263,148 @@ function createDevServerProbe(mainWindow, db, instanceId) {
   }
 
   function releaseLease(port, pid) {
+    // Report-only since Oct 27 2026. The lease `pid` is the OWNING
+    // Farnsworth process, not the dev server, so the old kill here would have
+    // SIGTERMed Farnsworth itself the moment a leased port was slow to answer.
+    // Lifecycle (kill on window close, reap dead owners, orphan sweep) lives
+    // in src/dev-live-registry.js.
+    console.log(`[health] dev server on port ${port} looks unhealthy (owner pid ${pid}); left to dev-live-registry`);
+  }
+
+  return {
+    start() {
+      // Only activate on Darwin packaged builds
+      if (process.platform !== 'darwin') {
+        console.log('[health] renderer watchdog disabled — not macOS');
+        return;
+      }
+      if (isDevTree) {
+        console.log('[health] dev tree — renderer watchdog disabled');
+        return;
+      }
+
+      state = 'running';
+      startTime = Date.now();
+      console.log('[health] renderer watchdog active');
+
+      intervalId = setInterval(() => {
+        try {
+          lastCheck = Date.now();
+
+          // Phase 1: waiting for first renderer
+          if (state === 'running') {
+            const count = countRendererProcesses();
+            if (count === -1) {
+              console.warn('[health] ps aux failed — retrying next tick');
+              return;
+            }
+            if (count >= 1) {
+              state = 'recovered';
+              console.log(`[health] renderer process detected after ${Date.now() - startTime}ms`);
+              if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('health:event', { type: 'renderer-recovered' });
+              }
+              return;
+            }
+
+            // 30s timeout
+            if (Date.now() - startTime >= RENDERER_TIMEOUT_MS) {
+              state = 'recovering';
+              const elapsed = Date.now() - startTime;
+              console.log(`[health] no renderer after ${elapsed}ms — attempting recovery`);
+
+              if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('health:event', { type: 'renderer-recovering', message: 'Rebuilding native modules...' });
+              }
+
+              // Spawn electron-rebuild
+              const erPath = electronRebuildPath();
+              if (erPath) {
+                console.log(`[health] running electron-rebuild at ${erPath}`);
+                try {
+                  execFileSync(erPath, ['--arch', 'arm64'], { timeout: 120000, stdio: 'pipe' });
+                  console.log('[health] electron-rebuild succeeded — relaunching');
+                } catch (err) {
+                  console.warn(`[health] electron-rebuild failed: ${err.message} — relaunching anyway`);
+                }
+              } else {
+                console.log('[health] electron-rebuild not found — relaunching without rebuild');
+              }
+
+              // Relaunch
+              setTimeout(() => {
+                try {
+                  app.relaunch();
+                  app.exit(0);
+                } catch (err) {
+                  console.error(`[health] relaunch failed: ${err.message}`);
+                  state = 'failed';
+                  lastError = err;
+                  if (mainWindow && !mainWindow.isDestroyed()) {
+                    mainWindow.loadURL(`data:text/html;base64,${Buffer.from(rendererOverlayHtml()).toString('base64')}`);
+                    mainWindow.webContents.send('health:event', { type: 'renderer-failed', message: err.message });
+                  }
+                }
+              }, 1000);
+              return;
+            }
+          }
+
+          // Phase 2: after recovery attempt, relaunched. Check again.
+          if (state === 'recovering') {
+            // We'll be in a new process — this interval was cleared by stop()
+            // The relaunched app creates a fresh daemon. Nothing to do here.
+          }
+        } catch (err) {
+          console.error('[health] renderer watchdog error:', err.message);
+          lastError = err;
+        }
+      }, TICK_MS);
+    },
+
+    stop() {
+      if (intervalId) {
+        clearInterval(intervalId);
+        intervalId = null;
+      }
+      state = 'idle';
+    },
+
+    getStatus() {
+      return { state, lastCheck, lastError: lastError?.message || null, startTime };
+    },
+  };
+}
+
+// ─── DevServerProbe ────────────────────────────────────────────────────────
+
+function createDevServerProbe(mainWindow, db, instanceId) {
+  let intervalId = null;
+  let state = 'idle';
+  let serverStates = []; // { port, role, state, lastCheck, lastError }
+  let lastError = null;
+  let lastCheck = null;
+
+  function queryLeases() {
+    if (!db) return [];
+    try {
+      const stmt = db.prepare(
+        'SELECT port, repo_root, role, pid, instance, leased_at FROM dev_port_leases ' +
+        'WHERE instance = ?'
+      );
+      // instanceId must match the same string port-authority leases under
+      // (main.js's INSTANCE_NAME, from --instance=<name> or the default) —
+      // NOT app.name+version, which never matches any real lease and would
+      // silently make this probe query zero rows forever. Fixed Aug 3 2026
+      // when wiring this daemon in alongside the port-authority integration.
+      return stmt.all(instanceId) || [];
+    } catch (err) {
+      console.warn('[health] dev_port_leases query failed:', err.message);
+      return [];
+    }
+  }
+
+  function releaseLease(port, pid) {
     if (!db) return;
     try {
       // Kill the process first

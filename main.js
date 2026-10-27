@@ -1073,7 +1073,12 @@ function createWindow({ fresh = false } = {}) {
   // When a window closes, remove it and rebuild the menu so the list
   // stays accurate.
   openWindows.push(win);
+  const devWinId = win.id;
   win.on('closed', () => {
+    // Multi-live Go Live: a window's dev servers die with it.
+    try { stopDevForWindow(devWinId, 'window-closed'); } catch (e) {
+      console.warn('[dev-live] window-close cleanup failed:', e.message);
+    }
     const idx = openWindows.indexOf(win);
     if (idx >= 0) openWindows.splice(idx, 1);
     // Was `mainWindow === openWindows[0]` then reassigned to openWindows[0]:
@@ -1166,7 +1171,7 @@ ipcMain.handle('setting:set', async (_event, key, value) => {
 // Farnsworth (--instance=<name>) overwrites it. Killing whatever pid the file
 // currently holds would let one instance kill another instance's dev server.
 // This map only ever holds pids we spawned ourselves.
-const spawnedDevServers = new Map(); // type -> { pid, serverPid, metaPath, repoRoot }
+const spawnedDevServers = new Map(); // `${type}:${windowId}` -> { type, windowId, pids, metaPath, repoRoot }
 
 // Port authority (Aug 3 2026) — see farnsworth-multi-window-dev-servers.
 // Lazily required so a module-load error here can't take down boot; the
@@ -1181,37 +1186,87 @@ function portAlloc() {
   return _portAlloc || null;
 }
 
-function killTrackedDevServers(reason) {
-  if (spawnedDevServers.size === 0) return;
-  const fsSyncLocal = require('fs');
-  for (const [type, rec] of spawnedDevServers) {
-    for (const pid of [rec.pid, rec.serverPid]) {
-      if (!pid) continue;
-      try {
-        process.kill(pid, 'SIGKILL');
-        console.log(`[dev:farnsworth] ${reason}: killed ${type} pid ${pid}`);
-      } catch {
-        // already gone — nothing to do
-      }
-    }
-    // Clear the meta so the next launch reports unavailable instead of
-    // pointing the canvas at a dead pid.
-    if (rec.metaPath) { try { fsSyncLocal.unlinkSync(rec.metaPath); } catch {} }
-    // Release any leased ports for this repo (port authority, Aug 3 2026).
-    if (rec.repoRoot) {
-      const pa = portAlloc();
-      try { if (pa) pa.releaseAllForRepo(db.getRawDb(), rec.repoRoot); } catch (e) {
-        console.warn('[port-alloc] release-on-quit failed:', e.message);
-      }
-    }
+// Multi-live Go Live (Oct 27 2026): every window owns its own dev servers.
+// See src/dev-live-registry.js for the lifecycle (window close, launch-time
+// reap of dead owners, orphan sweep).
+let _liveReg = null;
+function liveRegistry() {
+  if (_liveReg === null) {
+    try { _liveReg = require('./src/dev-live-registry'); }
+    catch (e) { console.warn('[dev-live] module unavailable:', e.message); _liveReg = false; }
   }
+  return _liveReg || null;
+}
+
+function devWindowIdOf(event) {
+  try { const w = BrowserWindow.fromWebContents(event.sender); if (w) return w.id; } catch {}
+  return 0;
+}
+
+// One metadata file per PROJECT instead of the single shared
+// ~/.cache/farnsworth-<type>.json that every window used to overwrite.
+function devMetaPathFor(type, repoRoot) {
+  return path.join(os.homedir(), '.cache', `farnsworth-${type}-live-${devvitRepoKey(repoRoot)}.json`);
+}
+
+function devRecordPids(rec) {
+  return [...new Set((rec && rec.pids || []).map(Number).filter((p) => p > 1))];
+}
+
+// Kill and release whatever one window started. Synchronous (window close and
+// before-quit don't await).
+function stopDevForWindow(windowId, reason) {
+  const reg = liveRegistry();
+  for (const [key, rec] of [...spawnedDevServers]) {
+    if (rec.windowId !== windowId) continue;
+    const pids = devRecordPids(rec);
+    if (reg) reg.killTree(pids, { label: `dev:farnsworth ${reason}` });
+    else for (const pid of pids) { try { process.kill(pid, 'SIGKILL'); } catch {} }
+    for (const mp of [rec.metaPath, rec.legacyMetaPath]) {
+      if (!mp) continue;
+      try {
+        const m = JSON.parse(fsSync.readFileSync(mp, 'utf8'));
+        if (!m.repoRoot || m.repoRoot === rec.repoRoot) fsSync.unlinkSync(mp);
+      } catch {}
+    }
+    spawnedDevServers.delete(key);
+  }
+  if (reg) {
+    try { reg.killOwner(db.getRawDb(), { windowId, reason }); }
+    catch (e) { console.warn('[dev-live] killOwner failed:', e.message); }
+  }
+}
+
+function killTrackedDevServers(reason) {
+  const windowIds = new Set([...spawnedDevServers.values()].map((r) => r.windowId));
+  for (const id of windowIds) stopDevForWindow(id, reason);
+  // Leases we hold without a tracked record (e.g. a boot that failed half way).
+  const pa = portAlloc();
+  try { if (pa) pa.releaseAllForInstance(db.getRawDb(), INSTANCE_NAME); } catch {}
   spawnedDevServers.clear();
+}
+
+function reapDevServers(phase) {
+  const reg = liveRegistry();
+  if (!reg) return;
+  try {
+    const raw = db.getRawDb();
+    const liveWindowIds = new Set(BrowserWindow.getAllWindows().filter((w) => !w.isDestroyed()).map((w) => w.id));
+    reg.reapDeadOwners(raw, { liveWindowIds: phase === 'launch' ? null : liveWindowIds });
+    if (phase === 'launch') reg.sweepOrphans(raw);
+  } catch (e) {
+    console.warn(`[dev-live] ${phase} reap failed:`, e.message);
+  }
 }
 
 async function getFarnsworthDevStatus(appType = 'devvit', repoRoot, { detailed = false } = {}) {
   const type = (typeof appType === 'string' && appType) ? appType : 'devvit';
   const cacheDir = path.join(os.homedir(), '.cache');
-  const metaPath = path.join(cacheDir, `farnsworth-${type}.json`);
+  let metaPath = path.join(cacheDir, `farnsworth-${type}.json`);
+  if (repoRoot && typeof repoRoot === 'string') {
+    const perRepo = devMetaPathFor(type, repoRoot);
+    if (fsSync.existsSync(perRepo)) metaPath = perRepo;
+  }
   const result = { available: false, type, metaPath };
   let meta = null;
   try {
@@ -1337,11 +1392,21 @@ ipcMain.handle('dev:farnsworth:get', async (_event, appType = 'devvit', repoRoot
 // in-memory maps: an out-of-band write would be silently overwritten by the
 // next flush. The admin port is derived from the recorded serverPort, so no
 // template script has to publish it.
-async function resolveEmulatorAdminBase() {
+async function resolveEmulatorAdminBase(event) {
   const cacheDir = path.join(os.homedir(), '.cache');
-  const metaPath = path.join(cacheDir, 'farnsworth-devvit.json');
   let meta = null;
-  try { meta = JSON.parse(await fs.readFile(metaPath, 'utf8')); } catch {}
+  // The asking window's own project first (multi-live), then the legacy
+  // shared file for launchers that don't write per-project metadata.
+  const winId = event ? devWindowIdOf(event) : null;
+  const rec = winId != null ? spawnedDevServers.get(`devvit:${winId}`) : null;
+  const candidates = [];
+  if (rec?.metaPath) candidates.push(rec.metaPath);
+  candidates.push(path.join(cacheDir, 'farnsworth-devvit.json'));
+  for (const mp of candidates) {
+    try { meta = JSON.parse(await fs.readFile(mp, 'utf8')); } catch { meta = null; }
+    if (meta && (!rec || !meta.repoRoot || meta.repoRoot === rec.repoRoot)) break;
+    meta = null;
+  }
   if (!meta) return { ok: false, error: 'no_dev_metadata' };
   // serverPort, else the port in serverUrl, else the legacy default. Launchers
   // that bind a non-default server port (dontdie uses 3001) only publish it
@@ -1353,8 +1418,8 @@ async function resolveEmulatorAdminBase() {
   return { ok: true, base: `http://127.0.0.1:${adminPort}`, adminPort, serverPort, repoRoot: meta.repoRoot || null };
 }
 
-async function emulatorAdminRequest(route, { method = 'GET', body = null, timeoutMs = 3000 } = {}) {
-  const resolved = await resolveEmulatorAdminBase();
+async function emulatorAdminRequest(route, { method = 'GET', body = null, timeoutMs = 3000, event = null } = {}) {
+  const resolved = await resolveEmulatorAdminBase(event);
   if (!resolved.ok) return resolved;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -1387,10 +1452,10 @@ async function emulatorAdminRequest(route, { method = 'GET', body = null, timeou
   }
 }
 
-ipcMain.handle('devvit:emulatorState', async () => emulatorAdminRequest('/emulator/state'));
+ipcMain.handle('devvit:emulatorState', async (event) => emulatorAdminRequest('/emulator/state', { event }));
 
 ipcMain.handle('devvit:emulatorSubmitPost', async (_event, payload = {}) =>
-  emulatorAdminRequest('/emulator/post', { method: 'POST', body: payload, timeoutMs: 5000 }));
+  emulatorAdminRequest('/emulator/post', { method: 'POST', body: payload, timeoutMs: 5000, event: _event }));
 
 // ---- Post types (Oct 8) ------------------------------------------------
 // A Devvit app can create several kinds of custom post: different entrypoints
@@ -1470,9 +1535,9 @@ ipcMain.handle('devvit:runMenuAction', async (_event, payload = {}) => {
   const endpoint = String(payload.endpoint || '');
   const isFormSubmit = !!(payload.body && typeof payload.body === 'object');
   if (!endpoint.startsWith('/internal/')) return { ok: false, error: 'bad_endpoint' };
-  const resolved = await resolveEmulatorAdminBase();
+  const resolved = await resolveEmulatorAdminBase(_event);
   if (!resolved.ok) return resolved;
-  const before = await emulatorAdminRequest('/emulator/state');
+  const before = await emulatorAdminRequest('/emulator/state', { event: _event });
   const beforeIds = new Set(((before && before.posts) || []).map((p) => p.id));
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 10000);
@@ -1498,7 +1563,7 @@ ipcMain.handle('devvit:runMenuAction', async (_event, payload = {}) => {
   } finally {
     clearTimeout(timer);
   }
-  const after = await emulatorAdminRequest('/emulator/state');
+  const after = await emulatorAdminRequest('/emulator/state', { event: _event });
   const created = ((after && after.posts) || []).filter((p) => !beforeIds.has(p.id));
   created.sort((a, b) => (b.createdUtc || 0) - (a.createdUtc || 0));
   const toast = devvitToastText(json && json.showToast);
@@ -1520,7 +1585,7 @@ ipcMain.handle('devvit:runMenuAction', async (_event, payload = {}) => {
 });
 
 ipcMain.handle('devvit:emulatorSubmitComment', async (_event, payload = {}) =>
-  emulatorAdminRequest('/emulator/comment', { method: 'POST', body: payload, timeoutMs: 5000 }));
+  emulatorAdminRequest('/emulator/comment', { method: 'POST', body: payload, timeoutMs: 5000, event: _event }));
 
 // Boot the farnsworth dev server for a workspace by running its
 // `npm run farnsworth:<appType>` script (which lives in the app's template
@@ -2081,23 +2146,34 @@ ipcMain.handle('dev:farnsworth:boot', async (_event, appType = 'devvit', repoRoo
     };
   }
 
-  // Port authority (Aug 3 2026): a project opts in with a `farnsworth.ports`
-  // manifest block in package.json (see port-authority-implementation-plan).
-  // Projects WITHOUT the manifest keep today's behavior exactly — their own
-  // scripts hardcode 5174/3000 and nothing here changes. Only when the
-  // manifest declares a port do we lease one from the shared SQLite table
-  // and hand it back via FARNSWORTH_PORT_<ROLE> env vars, so two windows on
-  // the same or different projects stop colliding.
+  // Multi-live port authority (Oct 27 2026; opt-in version Aug 3). Every
+  // devvit Go Live now leases its ports from the shared SQLite registry, so
+  // two or more windows/instances run side by side. A port that is leased by
+  // another window OR already has any listener is skipped. A project's
+  // `farnsworth.ports` manifest can still override defaults and ranges.
+  const winId = devWindowIdOf(_event);
+  const liveKey = `${type}:${winId}`;
+  // This window's previous Go Live (same or different project) goes first.
+  stopDevForWindow(winId, 'reboot');
   const portEnv = {};
-  const portsManifest = pkg?.farnsworth?.ports;
-  if (portsManifest && typeof portsManifest === 'object') {
+  const allocated = {};
+  {
     const pa = portAlloc();
+    const manifest = (pkg?.farnsworth?.ports && typeof pkg.farnsworth.ports === 'object') ? pkg.farnsworth.ports : {};
+    const roles = {};
+    if (type === 'devvit') {
+      roles.vite = { default: 5174, rangeStart: 5174, rangeEnd: 5199 };
+      // Admin listener binds server + 100, so it must be free too.
+      roles.server = { default: 3000, rangeStart: 3000, rangeEnd: 3099, alsoFreeOffsets: [100] };
+    }
+    for (const [role, spec] of Object.entries(manifest)) {
+      if (spec && typeof spec.default === 'number') roles[role] = { ...(roles[role] || {}), ...spec };
+    }
     if (pa) {
       const rawDb = db.getRawDb();
-      for (const [role, spec] of Object.entries(portsManifest)) {
-        if (!spec || typeof spec.default !== 'number') continue;
+      for (const [role, spec] of Object.entries(roles)) {
         try {
-          const assigned = pa.allocatePort({
+          allocated[role] = pa.allocatePort({
             db: rawDb,
             repoRoot,
             role,
@@ -2105,14 +2181,32 @@ ipcMain.handle('dev:farnsworth:boot', async (_event, appType = 'devvit', repoRoo
             rangeStart: spec.rangeStart || spec.default,
             rangeEnd: spec.rangeEnd || (spec.default + 25),
             instanceId: INSTANCE_NAME,
+            windowId: winId,
+            alsoFreeOffsets: spec.alsoFreeOffsets,
           });
-          portEnv[`FARNSWORTH_PORT_${role.toUpperCase()}`] = String(assigned);
+          portEnv[`FARNSWORTH_PORT_${role.toUpperCase()}`] = String(allocated[role]);
         } catch (e) {
           console.warn(`[port-alloc] allocation failed for ${role}:`, e.message);
         }
       }
     }
+    // Aliases older launchers read (DiceFightReddit, dontdie, WEBBIT proxy).
+    if (allocated.vite) portEnv.FARNSWORTH_DEVVIT_PORT = String(allocated.vite);
+    if (allocated.server) {
+      portEnv.DEVVIT_EMULATOR_SERVER_PORT = String(allocated.server);
+      portEnv.WEBBIT_PORT = String(allocated.server);
+    }
   }
+  // Per-project metadata + logs so concurrent windows never overwrite each other.
+  const liveMetaPath = devMetaPathFor(type, repoRoot);
+  const legacyMetaPath = path.join(os.homedir(), '.cache', `farnsworth-${type}.json`);
+  try { fs.unlinkSync(liveMetaPath); } catch {}
+  portEnv.FARNSWORTH_DEVVIT_META = liveMetaPath;
+  portEnv.FARNSWORTH_DEVVIT_LOG = path.join(os.homedir(), '.cache', `farnsworth-${type}-live-${devvitRepoKey(repoRoot)}.log`);
+  portEnv.FARNSWORTH_DEVVIT_SERVER_LOG = path.join(os.homedir(), '.cache', `farnsworth-${type}-live-${devvitRepoKey(repoRoot)}-server.log`);
+  const releaseOnFail = () => {
+    try { const reg = liveRegistry(); if (reg) reg.killOwner(db.getRawDb(), { windowId: winId, reason: 'boot-failed' }); } catch {}
+  };
 
   // Resolve npm to an ABSOLUTE path and build a PATH that actually reflects
   // how the user installed node (Jul 28). The old code just prepended
@@ -2292,6 +2386,14 @@ ipcMain.handle('dev:farnsworth:boot', async (_event, appType = 'devvit', repoRoo
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
+      // Whatever the script already started belongs to nobody now: kill it.
+      try {
+        const reg = liveRegistry();
+        let m = null;
+        try { m = JSON.parse(fs.readFileSync(liveMetaPath, 'utf8')); } catch {}
+        if (reg) reg.killTree([child.pid, m?.pid, m?.serverPid, m?.storybookPid].filter(Boolean), { label: 'dev:farnsworth timeout' });
+      } catch {}
+      releaseOnFail();
       resolve({ ok: false, error: 'timeout', message: 'Dev server did not come up within 45s.' });
     }, 45000);
 
@@ -2299,6 +2401,7 @@ ipcMain.handle('dev:farnsworth:boot', async (_event, appType = 'devvit', repoRoo
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      releaseOnFail();
       resolve({ ok: false, error: 'spawn_failed', message: err.message });
     });
 
@@ -2307,36 +2410,62 @@ ipcMain.handle('dev:farnsworth:boot', async (_event, appType = 'devvit', repoRoo
       settled = true;
       clearTimeout(timer);
       if (code !== 0) {
+        releaseOnFail();
         resolve({ ok: false, error: 'script_failed', code, message: stderr.trim() || `Script exited ${code}.` });
         return;
       }
-      // Script exited 0 → server is up and meta written. Read it back.
-      const metaPath = path.join(os.homedir(), '.cache', `farnsworth-${type}.json`);
-      try {
-        const meta = JSON.parse(await fs.promises.readFile(metaPath, 'utf8'));
-        // Remember what we started so before-quit can clean it up. The npm
-        // script daemonizes, so the child we spawned has already exited by
-        // now -- these pids in the meta are the only handle on the real
-        // processes.
-        spawnedDevServers.set(type, {
-          pid: meta.pid || null,
-          serverPid: meta.serverPid || null,
-          metaPath,
-          repoRoot,
-        });
-        // A project with server code needs its server-runner. Launchers
-        // copied from older templates start only the Vite client, which
-        // previews fine but silently breaks comments, mock posts, post types,
-        // and every /api call. Say so at Go Live instead of later.
-        let warning = null;
-        if (type === 'devvit' && !meta.serverPid
-          && fs.existsSync(path.join(repoRoot, 'src', 'server'))) {
-          warning = 'missing_server_runner';
-        }
-        resolve({ ok: true, type, url: meta.url, pid: meta.pid, startedAt: meta.startedAt, warning });
-      } catch {
-        resolve({ ok: true, type, url: `http://localhost:5174` });
+      // Script exited 0 → server is up and meta written. Updated launchers
+      // write the per-project file we asked for; older ones still write the
+      // shared one, which we only trust if it names this project.
+      let meta = null;
+      let usedLegacy = false;
+      try { meta = JSON.parse(await fs.promises.readFile(liveMetaPath, 'utf8')); } catch {}
+      if (!meta) {
+        try {
+          const m = JSON.parse(await fs.promises.readFile(legacyMetaPath, 'utf8'));
+          if (!m.repoRoot || m.repoRoot === repoRoot) { meta = m; usedLegacy = true; }
+        } catch {}
       }
+      if (!meta) {
+        resolve({ ok: true, type, url: `http://localhost:${allocated.vite || 5174}` });
+        return;
+      }
+      // A launcher whose Vite config hardcodes its port can land somewhere
+      // other than the port it claims. Trust Vite's own "Local:" line.
+      try {
+        const logText = meta.log ? await fs.promises.readFile(meta.log, 'utf8') : '';
+        const hits = [...logText.matchAll(/Local:\s+(http:\/\/(?:localhost|127\.0\.0\.1):\d+)\/?/g)];
+        if (hits.length) {
+          const actual = hits[hits.length - 1][1];
+          if (actual !== meta.url) {
+            console.warn(`[dev:farnsworth:boot] ${path.basename(repoRoot)} launcher claimed ${meta.url}, Vite is on ${actual} (update its scripts/farnsworth-devvit.sh)`);
+            meta.url = actual;
+          }
+        }
+      } catch {}
+      meta.repoRoot = meta.repoRoot || repoRoot;
+      // Always keep a per-project copy so status lookups stop depending on
+      // whichever window wrote the shared file last.
+      try { await fs.promises.writeFile(liveMetaPath, JSON.stringify(meta, null, 2)); } catch {}
+      const pids = [meta.pid, meta.serverPid, meta.storybookPid].map(Number).filter((p) => p > 1);
+      spawnedDevServers.set(liveKey, {
+        type, windowId: winId, pids, metaPath: liveMetaPath,
+        legacyMetaPath: usedLegacy ? legacyMetaPath : null, repoRoot,
+      });
+      try {
+        const reg = liveRegistry();
+        if (reg) reg.setOwnerPids(db.getRawDb(), { windowId: winId, repoRoot, pids });
+      } catch (e) { console.warn('[dev-live] setOwnerPids failed:', e.message); }
+      // A project with server code needs its server-runner. Launchers
+      // copied from older templates start only the Vite client, which
+      // previews fine but silently breaks comments, mock posts, post types,
+      // and every /api call. Say so at Go Live instead of later.
+      let warning = null;
+      if (type === 'devvit' && !meta.serverPid
+        && fs.existsSync(path.join(repoRoot, 'src', 'server'))) {
+        warning = 'missing_server_runner';
+      }
+      resolve({ ok: true, type, url: meta.url, pid: meta.pid, startedAt: meta.startedAt, warning });
     });
   });
 });
@@ -2344,47 +2473,13 @@ ipcMain.handle('dev:farnsworth:boot', async (_event, appType = 'devvit', repoRoo
 // Stop the farnsworth dev server (kills the vite process) and clears its meta
 // so the canvas falls back to static images. Best-effort.
 ipcMain.handle('dev:farnsworth:stop', async (_event, appType = 'devvit') => {
-  const fs = require('fs');
-  const path = require('path');
-  const os = require('os');
-  const { execFile } = require('child_process');
   const type = (typeof appType === 'string' && appType) ? appType : 'devvit';
-  const metaPath = path.join(os.homedir(), '.cache', `farnsworth-${type}.json`);
-
-  // Kill by pid from meta if present. serverPid was added Jul 10 when the
-  // Farnsworth-side server-runner spawned alongside Vite (so the workspace's
-  // src/server/ tRPC + Hono code runs against the emulator's persistent
-  // redis). Older meta files without serverPid are handled gracefully.
-  try {
-    const meta = JSON.parse(await fs.promises.readFile(metaPath, 'utf8'));
-    if (meta && meta.pid) { try { process.kill(meta.pid, 'SIGKILL'); } catch {} }
-    if (meta && meta.serverPid) { try { process.kill(meta.serverPid, 'SIGKILL'); } catch {} }
-  } catch {}
-
-  // Belt-and-suspenders: kill any lingering devtools vite process + the
-  // server-runner (added Jul 10).
-  await new Promise((resolve) => {
-    execFile('pkill', ['-f', 'vite.devtools.config.ts'], () => resolve());
-  });
-  await new Promise((resolve) => {
-    execFile('pkill', ['-f', 'server-runner.mjs'], () => resolve());
-  });
-
-  // Clear the meta so get/re-detect reports unavailable.
-  try { await fs.promises.unlink(metaPath); } catch {}
-  // Release any leased ports (port authority, Aug 3 2026) before dropping
-  // the record — repoRoot only lives on the tracked record, not this
-  // handler's params.
-  const rec = spawnedDevServers.get(type);
-  if (rec?.repoRoot) {
-    const pa = portAlloc();
-    try { if (pa) pa.releaseAllForRepo(db.getRawDb(), rec.repoRoot); } catch (e) {
-      console.warn('[port-alloc] release-on-stop failed:', e.message);
-    }
-  }
-  // Already killed above -- drop the record so before-quit doesn't re-kill
-  // pids that may have been recycled onto unrelated processes by then.
-  spawnedDevServers.delete(type);
+  // Multi-live (Oct 27 2026): stop ONLY what this window started, as whole
+  // process trees. The old blanket `pkill -f vite.devtools.config.ts` /
+  // `server-runner.mjs` killed every other window's preview, and killing just
+  // the npm wrapper pid orphaned the real Vite child on its port.
+  const winId = devWindowIdOf(_event);
+  stopDevForWindow(winId, 'stop');
   return { ok: true, type };
 });
 
@@ -10127,6 +10222,13 @@ if (!gotSingleInstanceLock) {
 }
 
 app.whenReady().then(async () => {
+  // Multi-live Go Live: servers left behind by Farnsworth windows/instances
+  // that no longer exist die now, then keep checking every 30s.
+  setTimeout(() => {
+    reapDevServers('launch');
+    const t = setInterval(() => reapDevServers('tick'), 30000);
+    try { t.unref?.(); } catch {}
+  }, 1500);
   // app.quit() above is not guaranteed to prevent this callback from firing,
   // so bail explicitly rather than binding ports / opening the DB twice.
   if (!gotSingleInstanceLock) return;
