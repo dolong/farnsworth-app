@@ -5414,6 +5414,16 @@ async function runTestByPath(testPath, opts = {}) {
         rc.send({ type: 'test:state', testId: testPath, status: 'running', ts: Date.now() });
       }
     } catch {}
+    // Oct 27 multi-live: tell the runner which window's game to drive. With two
+    // windows live, the hardcoded localhost:5174 pick drove the OTHER project.
+    try {
+      const ownerWin = opts.window || windowForFolder(opts.folder || currentFolderSetting());
+      if (ownerWin && !ownerWin.isDestroyed()) {
+        const info = await ownerWin.webContents.executeJavaScript('(typeof state!=="undefined"&&state?{url:(state.farnsworthDev&&state.farnsworthDev.url)||null,folder:state.folder||null}:{})', true);
+        if (info && info.url) runnerEnv.FARNSWORTH_GAME_URL = String(info.url);
+        if (info && info.folder) runnerEnv.FARNSWORTH_FOLDER = String(info.folder);
+      }
+    } catch {}
     const launch = await spawnTestRunner(testPath, runnerEnv);
     if (launch.error) {
       try {

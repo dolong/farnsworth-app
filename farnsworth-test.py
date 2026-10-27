@@ -81,6 +81,18 @@ import websocket
 # Farnsworth passes the port it actually bound (see activeCdpPort in main.js).
 # Falls back to 9222 for standalone terminal use.
 CDP_PORT = int(os.environ.get('FARNSWORTH_CDP_PORT') or 9222)
+# Oct 27: multi-live. Each window's game runs on its own leased port, so the
+# runner must attach to THIS project's page, not whatever sits on 5174.
+# main.js passes the owning window's live game URL + folder.
+def _game_host(url):
+    m = re.match(r'^https?://([^/?#]+)', str(url or ''))
+    return m.group(1) if m else ''
+GAME_HOST = _game_host(os.environ.get('FARNSWORTH_GAME_URL')) or 'localhost:5174'
+GAME_PORT = GAME_HOST.rsplit(':', 1)[-1] if ':' in GAME_HOST else ''
+PROJECT_FOLDER = (os.environ.get('FARNSWORTH_FOLDER') or '').rstrip('/')
+def _is_this_game(url):
+    url = str(url or '')
+    return bool(GAME_PORT) and bool(re.match(r'^https?://(localhost|127\.0\.0\.1|\[::1\]):%s(/|$|\?)' % re.escape(GAME_PORT), url))
 
 def find_renderer_target(port=CDP_PORT):
     """Find Farnsworth's OWN renderer (file://...index.html), not the game page.
@@ -94,11 +106,25 @@ def find_renderer_target(port=CDP_PORT):
         targets = json.loads(urllib.request.urlopen(f'http://localhost:{port}/json').read())
     except Exception:
         return None
-    return next((t for t in targets
-                 if t.get('type') == 'page' and 'index.html' in t.get('url', '')), None)
+    shells = [t for t in targets
+              if t.get('type') == 'page' and 'index.html' in t.get('url', '')
+              and 'expressAgent' not in t.get('url', '') and 'canvas-capture' not in t.get('url', '')]
+    if PROJECT_FOLDER and len(shells) > 1:
+        for t in shells:
+            try:
+                ws = websocket.create_connection(t['webSocketDebuggerUrl'], timeout=5, suppress_origin=True)
+                try:
+                    f = Tester(ws).eval('(typeof state !== "undefined" && state && state.folder) || ""') or ''
+                finally:
+                    ws.close()
+                if str(f).rstrip('/') == PROJECT_FOLDER:
+                    return t
+            except Exception:
+                continue
+    return shells[0] if shells else None
 
 
-def find_target(port=CDP_PORT, prefer_url='localhost:5174', quiet=False):
+def find_target(port=CDP_PORT, prefer_url=None, quiet=False):
     """Find the game page target.
 
     `quiet` suppresses the "no WebContentsView" guidance — used by the
@@ -112,9 +138,18 @@ def find_target(port=CDP_PORT, prefer_url='localhost:5174', quiet=False):
         if quiet:
             return None
         raise
-    bv = next((t for t in targets if t.get('type') == 'page' and prefer_url in t.get('url', '')), None)
+    if prefer_url:
+        bv = next((t for t in targets if t.get('type') == 'page' and prefer_url in t.get('url', '')), None)
+    else:
+        bv = next((t for t in targets if t.get('type') == 'page' and _is_this_game(t.get('url', ''))), None)
     if bv:
         return bv
+    if os.environ.get('FARNSWORTH_GAME_URL'):
+        # Multi-live: never grab another window's game. Wait / fail instead.
+        if not quiet:
+            print(f'ERROR: this project\'s game page ({GAME_HOST}) is not open in the canvas.')
+            print(f'  Turn Go Live on and switch the canvas to Test View / App Mobile, then re-run.')
+        return None
     # NEVER fall back to one of Farnsworth's OWN pages. A test evals arbitrary
     # JS into whatever target this returns, so handing back the IDE shell means
     # the test runs against the IDE itself — and a step like
