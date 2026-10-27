@@ -11401,7 +11401,7 @@ async function swapAgentTabsToFolder(folderPath, previousFolder) {
 
   const ccParked = claudeCodeSessions.size;
   if (ccParked) {
-    await persistClaudeCodeTabs(previousFolder);
+    if (previousFolder) await persistClaudeCodeTabs(previousFolder);
     for (const tabId of Array.from(claudeCodeSessions.keys())) {
       await closeClaudeCodeTab(tabId, { persist: false });
     }
@@ -11412,7 +11412,7 @@ async function swapAgentTabsToFolder(folderPath, previousFolder) {
 
   const cxParked = codexSessions.size;
   if (cxParked) {
-    await persistCodexTabs(previousFolder);
+    if (previousFolder) await persistCodexTabs(previousFolder);
     for (const tabId of Array.from(codexSessions.keys())) {
       await closeCodexTab(tabId, { persist: false });
     }
@@ -11509,6 +11509,13 @@ async function handleFolderPicked(folderPath) {
     // left running (or resumable) against the folder you just left.
     swapAgentTabsToFolder(folderPath, previousFolder).catch((e) => {
       console.warn('[folder switch] agent tab swap failed:', e?.message || e);
+    });
+  } else if (!previousFolder && (claudeCodeSessions.size || codexSessions.size)) {
+    // Oct 27: a fresh window spawns its default agent panel before any folder
+    // is picked, so the PTY lands in the global last-folder (another window's
+    // project). Respawn those sessions in the folder this window now owns.
+    swapAgentTabsToFolder(folderPath, null).catch((e) => {
+      console.warn('[folder switch] fresh-window agent respawn failed:', e?.message || e);
     });
   }
   // Aug 5: the chat used to carry the previous project's conversation across
