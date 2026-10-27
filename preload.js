@@ -168,6 +168,11 @@ contextBridge.exposeInMainWorld('farnsworth', {
   // The user/subreddit library is global (workspace-agnostic). The
   // active selection is per-project (workspace_path key).
   devvitListUsers: () => ipcRenderer.invoke('devvit:list-users'),
+  // Real Reddit developer accounts (devvit CLI login), selected per project.
+  devvitAccounts: (folder) => ipcRenderer.invoke('devvit:accounts', folder),
+  devvitAccountsSelect: (folder, id) => ipcRenderer.invoke('devvit:accounts-select', folder, id),
+  devvitAccountsAdd: (folder) => ipcRenderer.invoke('devvit:accounts-add', folder),
+  devvitAccountsRemove: (id) => ipcRenderer.invoke('devvit:accounts-remove', id),
   devvitUpsertUser: (user) => ipcRenderer.invoke('devvit:upsert-user', user),
   devvitDeleteUser: (id) => ipcRenderer.invoke('devvit:delete-user', id),
   devvitSetUserModerator: (id, on) => ipcRenderer.invoke('devvit:set-user-moderator', id, on),

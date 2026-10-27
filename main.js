@@ -1881,11 +1881,144 @@ function gitConfigReadFiles() {
 // it could name anything devvit-something to earn the grant. That would be
 // theater, not a control. The real containment remains the profile's deny list
 // (~/.aws, ~/.ssh, ~/.gnupg, ~/.config/gh) and the workspace write boundary.
+// ── Reddit developer accounts, per project (Oct 27) ─────────────────────────
+// The devvit CLI keeps ONE login in ~/.devvit/token, so every project shared
+// whichever account logged in last. The CLI honors DEVVIT_ROOT_DIR (token lives
+// at $DEVVIT_ROOT_DIR/.devvit/token, refreshes write back there), so each saved
+// account gets its own root and each project picks one. Every child Farnsworth
+// spawns for a folder (terminal, Claude, Codex, agent shell, npm scripts, Go
+// Live) gets that folder's DEVVIT_ROOT_DIR. "system" = the plain ~/.devvit login.
+const DEVVIT_ACCOUNTS_DIR = path.join(os.homedir(), '.farnsworth', 'devvit-accounts');
+const DEVVIT_ACCOUNTS_FILE = path.join(DEVVIT_ACCOUNTS_DIR, 'accounts.json');
+function readDevvitAccounts() {
+  try {
+    const j = JSON.parse(require('fs').readFileSync(DEVVIT_ACCOUNTS_FILE, 'utf8'));
+    return { accounts: Array.isArray(j.accounts) ? j.accounts : [], projects: j.projects && typeof j.projects === 'object' ? j.projects : {} };
+  } catch { return { accounts: [], projects: {} }; }
+}
+function writeDevvitAccounts(data) {
+  const fsx = require('fs');
+  fsx.mkdirSync(DEVVIT_ACCOUNTS_DIR, { recursive: true });
+  fsx.writeFileSync(DEVVIT_ACCOUNTS_FILE, JSON.stringify(data, null, 2));
+}
+function devvitAccountRoot(id) { return path.join(DEVVIT_ACCOUNTS_DIR, String(id).replace(/[^a-z0-9_-]/gi, '_')); }
+function normFolderKey(folder) { return folder ? path.resolve(String(folder)) : ''; }
+function devvitAccountIdForFolder(folder) {
+  if (!folder) return 'system';
+  const { accounts, projects } = readDevvitAccounts();
+  const id = projects[normFolderKey(folder)];
+  return id && accounts.some((a) => a.id === id) ? id : 'system';
+}
+// Env fragment for any child spawned on behalf of `folder`. Empty for the
+// system login, so single-account behavior is byte-identical to before.
+function devvitAccountEnv(folder) {
+  const id = devvitAccountIdForFolder(folder);
+  return id === 'system' ? {} : { DEVVIT_ROOT_DIR: devvitAccountRoot(id) };
+}
+function devvitCliBin(folder) {
+  const fsx = require('fs');
+  const local = folder ? path.join(folder, 'node_modules', '.bin', 'devvit') : null;
+  if (local && fsx.existsSync(local)) return local;
+  for (const d of composeChildPath().split(':')) {
+    const c = path.join(d, 'devvit');
+    if (d && fsx.existsSync(c)) return c;
+  }
+  return 'devvit';
+}
+function devvitWhoami(rootDir, folder) {
+  return new Promise((resolve) => {
+    const env = { ...process.env, PATH: composeChildPath(), NO_COLOR: '1', FORCE_COLOR: '0' };
+    delete env.DEVVIT_ROOT_DIR;
+    if (rootDir) env.DEVVIT_ROOT_DIR = rootDir;
+    require('child_process').execFile(devvitCliBin(folder), ['whoami'], { env, timeout: 30000, cwd: folder || os.homedir() }, (err, stdout, stderr) => {
+      const out = `${stdout || ''}\n${stderr || ''}`;
+      const m = out.match(/u\/([A-Za-z0-9_-]{2,})/);
+      resolve(m ? m[1] : null);
+    });
+  });
+}
+let _systemDevvitUser = { name: null, at: 0 };
+async function devvitAccountsState(folder) {
+  const { accounts } = readDevvitAccounts();
+  if (!_systemDevvitUser.at || Date.now() - _systemDevvitUser.at > 5 * 60 * 1000) {
+    _systemDevvitUser = { name: await devvitWhoami(null, folder), at: Date.now() };
+  }
+  return {
+    ok: true,
+    folder: folder || null,
+    selected: devvitAccountIdForFolder(folder),
+    accounts: [
+      { id: 'system', username: _systemDevvitUser.name, label: _systemDevvitUser.name ? `u/${_systemDevvitUser.name} (system login)` : 'System login (~/.devvit)' },
+      ...accounts.map((a) => ({ id: a.id, username: a.username, label: `u/${a.username}` })),
+    ],
+  };
+}
+function devvitSelectAccount(folder, id) {
+  if (!folder) return { ok: false, error: 'no_folder', message: 'Open a project first.' };
+  const data = readDevvitAccounts();
+  const key = normFolderKey(folder);
+  if (!id || id === 'system') delete data.projects[key];
+  else {
+    const acct = data.accounts.find((a) => a.id === id || a.username.toLowerCase() === String(id).replace(/^u\//i, '').toLowerCase());
+    if (!acct) return { ok: false, error: 'unknown_account', available: ['system', ...data.accounts.map((a) => a.username)] };
+    data.projects[key] = acct.id;
+  }
+  writeDevvitAccounts(data);
+  return { ok: true, selected: data.projects[key] || 'system', note: 'New terminals, Claude/Codex panels, agent commands and Go Live use this account. Already-open terminals keep the old one until reopened.' };
+}
+// Browser login into a fresh root. Whatever Reddit account the default browser
+// is signed into becomes the saved account.
+let _devvitLoginChild = null;
+async function devvitAddAccount(folder) {
+  const fsx = require('fs');
+  if (_devvitLoginChild) return { ok: false, error: 'login_in_progress', message: 'A Devvit login is already waiting in your browser.' };
+  const tmpId = `pending-${Date.now()}`;
+  const root = devvitAccountRoot(tmpId);
+  fsx.mkdirSync(path.join(root, '.devvit'), { recursive: true });
+  const tokenFile = path.join(root, '.devvit', 'token');
+  const env = { ...process.env, PATH: composeChildPath(), DEVVIT_ROOT_DIR: root, NO_COLOR: '1' };
+  const cleanup = () => { try { fsx.rmSync(root, { recursive: true, force: true }); } catch {} };
+  const loggedIn = await new Promise((resolve) => {
+    const child = require('child_process').spawn(devvitCliBin(folder), ['login'], { env, cwd: folder || os.homedir(), stdio: ['ignore', 'pipe', 'pipe'] });
+    _devvitLoginChild = child;
+    let done = false;
+    const finish = (v) => { if (done) return; done = true; clearInterval(poll); clearTimeout(timer); _devvitLoginChild = null; try { child.kill(); } catch {} resolve(v); };
+    const poll = setInterval(() => { try { if (fsx.statSync(tokenFile).size > 0) setTimeout(() => finish(true), 500); } catch {} }, 500);
+    const timer = setTimeout(() => finish(false), 5 * 60 * 1000);
+    child.on('exit', () => setTimeout(() => { let ok = false; try { ok = fsx.statSync(tokenFile).size > 0; } catch {} finish(ok); }, 300));
+    child.on('error', () => finish(false));
+  });
+  if (!loggedIn) { cleanup(); return { ok: false, error: 'login_not_completed', message: 'The Reddit login was not completed in the browser.' }; }
+  const username = await devvitWhoami(root, folder);
+  if (!username) { cleanup(); return { ok: false, error: 'whoami_failed', message: 'Logged in, but devvit could not identify the account.' }; }
+  const data = readDevvitAccounts();
+  const id = username.toLowerCase();
+  const finalRoot = devvitAccountRoot(id);
+  try { fsx.rmSync(finalRoot, { recursive: true, force: true }); } catch {}
+  fsx.renameSync(root, finalRoot);
+  data.accounts = data.accounts.filter((a) => a.id !== id).concat([{ id, username, addedAt: new Date().toISOString() }]);
+  if (folder) data.projects[normFolderKey(folder)] = id;
+  writeDevvitAccounts(data);
+  return { ok: true, account: { id, username }, selected: folder ? id : undefined };
+}
+function devvitRemoveAccount(id) {
+  if (!id || id === 'system') return { ok: false, error: 'cannot_remove_system' };
+  const data = readDevvitAccounts();
+  data.accounts = data.accounts.filter((a) => a.id !== id);
+  for (const k of Object.keys(data.projects)) if (data.projects[k] === id) delete data.projects[k];
+  writeDevvitAccounts(data);
+  try { require('fs').rmSync(devvitAccountRoot(id), { recursive: true, force: true }); } catch {}
+  return { ok: true };
+}
+try { require('fs').mkdirSync(DEVVIT_ACCOUNTS_DIR, { recursive: true }); } catch {}
+
 function devvitStateDirs() {
   const home = os.homedir();
   return [
     path.join(home, '.devvit'),
     path.join(home, 'Library', 'Caches', 'devvit'),
+    // Saved per-project accounts: same accepted trade as ~/.devvit above.
+    DEVVIT_ACCOUNTS_DIR,
   ];
 }
 
@@ -2226,7 +2359,7 @@ ipcMain.handle('dev:farnsworth:boot', async (_event, appType = 'devvit', repoRoo
   // Same class as the nono-profile and server-runner path bugs: a hardcoded
   // location that happened to be true on the dev machine.
   const npmBin = resolveNpmBin();
-  const env = { ...process.env, ...portEnv };
+  const env = { ...process.env, ...portEnv, ...devvitAccountEnv(repoRoot) };
   // composeChildPath() is the single source of truth for child PATHs: login
   // shell (both flavors) + discovered version managers + static fallbacks.
   // This site used to assemble the list by hand and so missed the discovery
@@ -2768,6 +2901,10 @@ ipcMain.handle('workspace:saveConfig', async (_event, folderPath, config) => {
 // workspace_path. The renderer calls these from the cogwheel popover
 // and from the canvas-overlay-bar user dropdown.
 ipcMain.handle('devvit:list-users', async () => db.devvitListUsers());
+ipcMain.handle('devvit:accounts', async (_e, folder) => devvitAccountsState(folder));
+ipcMain.handle('devvit:accounts-select', async (_e, folder, id) => devvitSelectAccount(folder, id));
+ipcMain.handle('devvit:accounts-add', async (_e, folder) => devvitAddAccount(folder));
+ipcMain.handle('devvit:accounts-remove', async (_e, id) => devvitRemoveAccount(id));
 ipcMain.handle('devvit:upsert-user', async (_event, user) => db.devvitUpsertUser(user));
 ipcMain.handle('devvit:delete-user', async (_event, id) => db.devvitDeleteUser(id));
 ipcMain.handle('devvit:set-user-moderator', async (_event, id, on) => db.devvitSetUserModerator(id, on));
@@ -8005,6 +8142,18 @@ const AGENT_TOOLS = [
     }
   },
   {
+    name: 'devvit_account',
+    description: 'The REAL Reddit developer account the devvit CLI uses for this project (devvit upload, playtest, publish, logs, whoami). Separate from switch_devvit_user, which only changes the fake emulator user inside the local preview. action "list" shows the saved accounts and which one this project uses; action "use" makes this project use one (username or "system" for the plain ~/.devvit login). Your run_command shells pick it up on the next command. If a deploy says the app belongs to another user, list and switch accounts here instead of running devvit login/logout.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['list', 'use'] },
+        account: { type: 'string', description: 'For "use": a saved username (u/ optional) or "system".' }
+      },
+      required: ['action']
+    }
+  },
+  {
     name: 'devvit_emulator_status',
     description: "Inspect the open project's Farnsworth Devvit runtime: Vite preview, emulator-backed server-runner, selected emulator identity, server probe, and bounded server-log tail. Call this FIRST for local /api/trpc 502, 503, 504, ECONNREFUSED, failed saves, or missing identity. A dead server-runner is not evidence that Farnsworth lacks Redis, Reddit, or user emulation.",
     input_schema: { type: 'object', properties: {} }
@@ -8489,6 +8638,11 @@ async function executeAgentTool(name, input, folderOverride) {
   if (name === 'devvit_emulator_status') {
     const status = await getFarnsworthDevStatus('devvit', folder, { detailed: true });
     return { ok: true, ...status };
+  }
+  if (name === 'devvit_account') {
+    const f = folderOverride || currentFolderSetting();
+    if (input?.action === 'use') return devvitSelectAccount(f, input.account);
+    return await devvitAccountsState(f);
   }
   if (name === 'switch_devvit_user') {
     const raw = String(input?.username || '').trim().replace(/^u\//i, '');
@@ -10831,6 +10985,7 @@ function startTerminalServer() {
           cwd,
           env: {
             ...process.env,
+            ...devvitAccountEnv(cwd),
             TERM: 'xterm-256color',
             PATH: pathWithBrew,
           },
@@ -11136,7 +11291,7 @@ function startClaudeCodeServer() {
           cols: 80,
           rows: 24,
           cwd,
-          env: { ...process.env, ...githubAuthEnv(), TERM: 'xterm-256color', PATH: newPath },
+          env: { ...process.env, ...githubAuthEnv(), ...devvitAccountEnv(cwd), TERM: 'xterm-256color', PATH: newPath },
         });
       } catch (e) {
         send({ type: 'error', message: 'claude pty.spawn failed: ' + e.message + ' — is `claude` on PATH? Run `npm i -g @anthropic-ai/claude-code` if not.' });
@@ -11516,7 +11671,7 @@ function startCodexServer() {
           cols: 80,
           rows: 24,
           cwd,
-          env: { ...process.env, TERM: 'xterm-256color', PATH: newPath },
+          env: { ...process.env, ...devvitAccountEnv(cwd), TERM: 'xterm-256color', PATH: newPath },
         });
       } catch (e) {
         send({ type: 'error', message: 'codex pty.spawn failed: ' + e.message + ' — is `codex` on PATH? Install with `brew install codex`.' });
@@ -12139,7 +12294,7 @@ async function runSandboxedCommand(nonoBin, profileName, command, folder, timeou
         // chat agent sees `command -v node` return nothing even though Node is
         // installed. Prepend the Homebrew + /usr/local bins. Same class of fix
         // as the terminal PTY PATH fix (Jul 4) — this call site never got it.
-        env: { ...process.env, ...githubAuthEnv(), PATH: composeChildPath() },
+        env: { ...process.env, ...githubAuthEnv(), ...devvitAccountEnv(folder), PATH: composeChildPath() },
       }
     );
     child.stdout.on('data', d => { stdout += d.toString(); });

@@ -4004,8 +4004,9 @@ async function openDevvitConfig() {
     showToast?.('Open a devvit workspace first.');
     return;
   }
-  let users, subreddits, settings;
+  let users, subreddits, settings, accts = null;
   try {
+    try { accts = await window.farnsworth.devvitAccounts?.(state.folder); } catch {}
     users = await window.farnsworth.devvitListUsers();
     subreddits = await window.farnsworth.devvitListSubreddits();
     settings = await window.farnsworth.devvitGetProjectSettings(state.folder);
@@ -4018,6 +4019,19 @@ async function openDevvitConfig() {
   pop.innerHTML = `
     <div class="devvit-config-title">Devvit emulator — users &amp; subreddit</div>
     <div class="devvit-config-sub">Pick the active user + subreddit for this project. Click any user or subreddit to make it active. Use + to add new ones.</div>
+
+    ${accts?.ok ? `
+    <div class="devvit-config-section">
+      <div class="devvit-config-section-label">Reddit developer account (upload · playtest · publish)</div>
+      <div style="display:flex;gap:6px;align-items:center">
+        <select class="devvit-config-select" id="devvit-config-account" style="flex:1">
+          ${accts.accounts.map((a) => `<option value="${escapeHtml(a.id)}" ${a.id === accts.selected ? 'selected' : ''}>${escapeHtml(a.label)}</option>`).join('')}
+        </select>
+        ${accts.selected !== 'system' ? `<button class="devvit-config-list-del" id="devvit-config-account-del" title="Forget this saved account">×</button>` : ''}
+      </div>
+      <button class="devvit-config-add-btn" id="devvit-config-account-add">+ Add Reddit account</button>
+      <div class="devvit-config-sub" id="devvit-config-account-hint" style="margin-top:4px">Applies to this project only, immediately. Already-open terminals keep the old account until reopened. To add one, sign into that Reddit account in your browser first.</div>
+    </div>` : ''}
 
     <div class="devvit-config-section">
       <div class="devvit-config-section-label">Active user</div>
@@ -4086,6 +4100,28 @@ async function openDevvitConfig() {
     pop.remove();
     showAllCanvasViews();
   };
+
+  // Real Reddit developer account (per project). Applies immediately, no
+  // Save needed: it only changes which devvit login child processes get.
+  const reopenConfig = () => { showAllCanvasViews(); pop.remove(); openDevvitConfig(); };
+  pop.querySelector('#devvit-config-account')?.addEventListener('change', async (e) => {
+    const r = await window.farnsworth.devvitAccountsSelect(state.folder, e.target.value);
+    showToast?.(r?.ok ? `This project now uses ${e.target.selectedOptions[0]?.textContent}.` : (r?.message || 'Could not switch account.'));
+  });
+  pop.querySelector('#devvit-config-account-del')?.addEventListener('click', async () => {
+    const id = pop.querySelector('#devvit-config-account')?.value;
+    if (!id || id === 'system') return;
+    await window.farnsworth.devvitAccountsRemove(id);
+    reopenConfig();
+  });
+  pop.querySelector('#devvit-config-account-add')?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    btn.textContent = 'Finish the Reddit login in your browser…';
+    const r = await window.farnsworth.devvitAccountsAdd(state.folder);
+    if (r?.ok) { showToast?.(`Added u/${r.account.username}. This project now uses it.`); reopenConfig(); }
+    else { btn.disabled = false; btn.textContent = '+ Add Reddit account'; showToast?.(r?.message || 'Reddit login failed.'); }
+  });
 
   // Wire delete buttons.
   pop.querySelectorAll('[data-del-user]').forEach((btn) => {
@@ -14802,6 +14838,7 @@ async function sendChatMessage(opts) {
           '- set_canvas_view(view) — switch the top-level canvas view: "live" (Live Preview), "storybook", "code" (Monaco editor), or "prod" (real headed Reddit Chrome). Use when the user says "switch to live preview", "show me the code", "open storybook".',
           '- set_preview(preview) — within Live Preview, switch the surface: "post", "mobile", "desktop", "fullscreen", or "testview". Auto-switches into live view first. Use for "show the app mobile view", "switch to desktop", "show the post view".',
           '- switch_devvit_user(username) — immediately switch the active Devvit emulator user (leading "u/" optional) and restart the dev server. A direct request such as "switch to u/bob", "change user", or "log in as carol" MUST call this tool directly. Never create or run a test, call run_command, request Python, or ask the user to install anything for a direct user switch. The JSON-test action switchUser is separate and only applies when the user explicitly asks to run an existing test script. On an unknown name the tool returns the list of available users — relay those to the user.',
+          '- devvit_account(action, account?) — the REAL Reddit developer login devvit upload/playtest/publish use for THIS project. "list" shows saved accounts + current; "use" switches this project. Use it when a deploy says the app belongs to another user; never run devvit login/logout yourself.',
           "- devvit_emulator_status() — inspect the open project's Vite preview, emulator-backed server-runner, selected identity, backend probe, and bounded server-log tail. Call this FIRST for local /api/trpc 5xx, ECONNREFUSED, failed saves, or missing identity.",
           "- farnsworth_project_guide() — read Farnsworth's built-in, project-agnostic architecture and adaptation guide. Call this BEFORE wiring or repairing Go Live in a greenfield or inherited repository. It works without an open workspace.",
           '',

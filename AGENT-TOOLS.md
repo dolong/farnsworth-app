@@ -31,6 +31,7 @@ Living spec for the Farnsworth chat agent tool design space.
 | `set_canvas_view(view)` | Switch top-level view: `"live"` / `"storybook"` / `"code"` / `"prod"` (real headed Reddit Chrome). |
 | `set_preview(preview)` | Within Live, switch surface: `"post"` / `"mobile"` / `"desktop"` / `"fullscreen"` / `"testview"`. Auto-switches to live. |
 | `switch_devvit_user(username)` | Immediately switch the active emulator user and restart the dev server. Direct user requests always use this native tool, never a JSON test, `run_command`, or Python. Returns the available list on miss. |
+| `devvit_account(action, account?)` | The real Reddit developer login (devvit CLI) for this project. `list` shows saved accounts and the current one; `use` switches this project (username or `system`). Per project, via DEVVIT_ROOT_DIR in every child Farnsworth spawns. |
 | `devvit_emulator_status()` | Inspect Vite, the emulator-backed server-runner, selected identity, backend probe, and bounded server-log tail. First diagnostic for local `/api/trpc` 5xx/`ECONNREFUSED`, failed saves, or missing identity. |
 | `farnsworth_project_guide()` | Read Farnsworth's app-owned architecture and adaptation guide. Available without a workspace; call before integrating a greenfield or inherited repository. |
 
