@@ -152,7 +152,7 @@ function createControlServer({ app, version = '0.0.0', tools = {}, log = console
     if (!force) {
       try {
         const cur = JSON.parse(fs.readFileSync(file, 'utf8'));
-        if (cur.pid === process.pid && cur.port === port && cur.folder === (info().folder || null)) return true;
+        if (cur.pid === process.pid && cur.port === port && cur.folder === (info().folder || null) && JSON.stringify(cur.folders || null) === JSON.stringify(info().folders || null)) return true;
         if (ownerAlive(cur.pid) && process.env.EXPRESS_CLAIM !== '1') return false;
       } catch {}
     }
@@ -160,7 +160,9 @@ function createControlServer({ app, version = '0.0.0', tools = {}, log = console
     const folder = info().folder || null;
     if (lastFolder !== undefined && folder !== lastFolder) emit('instance', { instance: inst, folder });
     lastFolder = folder;
-    fs.writeFileSync(tmp, JSON.stringify({ app, instance: inst, folder, port, token, pid: process.pid, version, startedAt }), { mode: 0o600 });
+    // folders: every project folder this copy has open (one per window).
+    const folders = Array.isArray(info().folders) ? info().folders : null;
+    fs.writeFileSync(tmp, JSON.stringify({ app, instance: inst, folder, folders, port, token, pid: process.pid, version, startedAt }), { mode: 0o600 });
     fs.renameSync(tmp, file);
     return true;
   }

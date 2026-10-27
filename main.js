@@ -12246,7 +12246,7 @@ function expressReadConversation(input = {}) {
 function startExpressControl() {
   if (expressControl) return;
   try {
-    expressControl = createControlServer({ app: 'farnsworth', version: app.getVersion(), instance: INSTANCE_NAME, describe: () => ({ folder: currentFolderSetting() || null }) });
+    expressControl = createControlServer({ app: 'farnsworth', version: app.getVersion(), instance: INSTANCE_NAME, describe: () => { const cur = currentFolderSetting() || null; const all = [...expressOpenFolders()]; if (cur && !all.includes(cur)) all.unshift(cur); return { folder: cur || all[0] || null, folders: all }; } });
     expressBridge = createExpressBridge({
       app: 'farnsworth',
       rawDb: () => db.getRawDb(),
