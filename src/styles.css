@@ -7929,6 +7929,23 @@ body.density-compact .msg__body { font-size: 12.5px; }
 }
 .post-view__entry-btn.is-active { background: #343536; color: #fff; }
 .post-view__embed--expanded { aspect-ratio: 9 / 16; max-height: 78vh; }
+.post-view__expanded-bar {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 8px 6px 12px; margin: 2px 0 0;
+  background: #1a1a1b; border: 1px solid #343536; border-bottom: 0;
+  border-radius: 10px 10px 0 0;
+}
+.post-view__expanded-title {
+  flex: 1; min-width: 0;
+  font-size: 13px; font-weight: 600; color: #d7dadc;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.post-view__expanded-close {
+  width: 26px; height: 26px; border-radius: 50%;
+  border: 0; background: #272729; color: #d7dadc;
+  font-size: 12px; cursor: pointer;
+}
+.post-view__expanded-close:hover { background: #343536; }
 .post-view__embed-iframe--native {
   position: absolute; top: 0; left: 0;
   width: 700px; height: 512px;

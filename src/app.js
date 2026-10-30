@@ -93,6 +93,12 @@ const state = {
     // entry. Set by the entry toggle or by the app calling
     // requestExpandedMode inside the iframe.
     viewEntry: null,
+    // Expanded mode is tracked on its own, like Reddit: an app may call
+    // requestExpandedMode while already expanded (even for its own entry),
+    // and only exitExpandedMode or the close button returns to inline.
+    expanded: false,
+    // Optional title from requestExpandedMode(event, entry, { title }).
+    expandedTitle: null,
   },
   farnsworthBooting: false,
   // 'installing' while Go Live's dependency preflight runs npm install,
@@ -4995,6 +5001,8 @@ function setActiveMockPost(id) {
   }
   f.activePostId = id || null;
   f.viewEntry = null;
+  f.expanded = false;
+  f.expandedTitle = null;
 }
 
 function mockPostBack() {
@@ -5008,6 +5016,8 @@ function mockPostBack() {
   if (!target) return;
   f.activePostId = target;
   f.viewEntry = null;
+  f.expanded = false;
+  f.expandedTitle = null;
   emulatorFeedRerender();
 }
 
@@ -5250,26 +5260,41 @@ function postViewIframeSrc(post) {
     params.push('postId=' + encodeURIComponent(post.id));
     const entry = f.viewEntry || post.entry || 'default';
     params.push('entry=' + encodeURIComponent(entry));
-    params.push('mode=' + (f.viewEntry && f.viewEntry !== (post.entry || 'default') ? 'expanded' : 'inline'));
+    params.push('mode=' + (f.expanded ? 'expanded' : 'inline'));
     if (post.postData !== undefined) {
       const enc = encodePostData(post.postData);
       if (enc) params.push('postData=' + enc);
     }
   } else if (f.viewEntry) {
     params.push('entry=' + encodeURIComponent(f.viewEntry));
-    params.push('mode=expanded');
+    params.push('mode=' + (f.expanded ? 'expanded' : 'inline'));
   }
   return state.farnsworthDev.url + '/?' + params.join('&');
 }
 
-// The harness shim forwards requestExpandedMode(event, entry) to the IDE, the
-// way Reddit opens a post's expanded entrypoint.
+function exitPostViewExpanded() {
+  const f = state.emulatorFeed;
+  f.expanded = false;
+  f.expandedTitle = null;
+  f.viewEntry = null;
+  emulatorFeedRerender();
+}
+
+// The harness shim forwards requestExpandedMode(event, entry, { title }) and
+// exitExpandedMode(event) to the IDE, the way Reddit opens and closes a
+// post's expanded web view (Devvit 0.15). Requests while already expanded
+// switch the entry and title and stay expanded, as on Reddit.
 window.addEventListener('message', (ev) => {
   const d = ev && ev.data;
-  if (!d || typeof d !== 'object' || d.type !== 'devvit:requestExpandedMode') return;
+  if (!d || typeof d !== 'object') return;
+  if (d.type !== 'devvit:requestExpandedMode' && d.type !== 'devvit:exitExpandedMode') return;
   const frame = document.querySelector('.post-view__embed-iframe');
   if (!frame || ev.source !== frame.contentWindow) return;
-  state.emulatorFeed.viewEntry = typeof d.entry === 'string' && d.entry ? d.entry : 'game';
+  if (d.type === 'devvit:exitExpandedMode') { exitPostViewExpanded(); return; }
+  const f = state.emulatorFeed;
+  f.viewEntry = typeof d.entry === 'string' && d.entry ? d.entry : 'game';
+  f.expanded = true;
+  f.expandedTitle = typeof d.title === 'string' && d.title.trim() ? d.title.trim() : null;
   emulatorFeedRerender();
 });
 
@@ -5505,7 +5530,10 @@ function renderPostView() {
             class: 'post-view__entry-btn' + (name === shown ? ' is-active' : ''),
             title: name === ownEntry ? `This post's entrypoint (${name})` : `Open the ${name} entrypoint`,
             onclick: () => {
-              state.emulatorFeed.viewEntry = name === ownEntry ? null : name;
+              const f = state.emulatorFeed;
+              f.viewEntry = name === ownEntry ? null : name;
+              f.expanded = name !== ownEntry;
+              f.expandedTitle = null;
               emulatorFeedRerender();
             },
           }, name));
@@ -5516,8 +5544,21 @@ function renderPostView() {
     }
   }
 
-  const expanded = !!(state.emulatorFeed.viewEntry
-    && state.emulatorFeed.viewEntry !== ((activeMock && activeMock.entry) || 'default'));
+  const expanded = !!state.emulatorFeed.expanded;
+  if (expanded) {
+    // Reddit's expanded web view header: the requested title (or the post
+    // title) and a close button that returns to the inline post.
+    const head = el('div', { class: 'post-view__expanded-bar' });
+    head.appendChild(el('span', { class: 'post-view__expanded-title' },
+      state.emulatorFeed.expandedTitle || (activeMock && activeMock.title) || ''));
+    head.appendChild(el('button', {
+      class: 'post-view__expanded-close',
+      title: 'Close expanded view',
+      'aria-label': 'Close expanded view',
+      onclick: exitPostViewExpanded,
+    }, '\u2715'));
+    content.appendChild(head);
+  }
   const embed = el('div', { class: 'post-view__embed' + (expanded ? ' post-view__embed--expanded' : '') });
   if (state.farnsworthDev?.available) {
     const frame = el('iframe', {
@@ -14869,7 +14910,7 @@ async function sendChatMessage(opts) {
           '- Farnsworth injects FARNSWORTH_DEVVIT_RUNNER, DEVVIT_EMULATOR_CONFIG, DEVVIT_EMULATOR_STATE, and VITE_DEVVIT_EMULATOR_CONFIG_JSON. Never hardcode a Farnsworth source-checkout path. The installed app owns where its runner lives.',
           '- The canvas requests /?view=post, /?view=mobile, and /?view=desktop from the project-published preview URL. Post is not routed by devvit.json and Farnsworth does not load dist/client directly.',
           "- ALWAYS START THE SERVER: if the project has src/server (or any tRPC/Hono/Redis/@devvit/web/server code), its farnsworth:<appType> launcher MUST start FARNSWORTH_DEVVIT_RUNNER alongside the Vite harness and record serverPid, serverPort, serverUrl, and serverLog in the preview metadata. A launcher that only starts Vite is broken even though the preview looks fine: Post View comments, mock posts, post types, and every /api call fail. Check this whenever you open, adapt, or repair a project, and fix the launcher before anything else. Go Live warns with missing_server_runner when it is absent.",
-          "- Post types: Post View's '+ New post' picker discovers them dynamically from (1) devvit.json menu items with /internal/ endpoints, run against the emulator so the app's real submitCustomPost decides entry + postData, (2) .farnsworth/config.json \"postTypes\": [{ id, label, title?, entry?, postData? }] presets, and (3) devvit.json post.entrypoints as an entry toggle. The Post View iframe gets ?view=post&postId=&entry=&mode=inline|expanded&postData=<base64url JSON>. The project's client shim must expose those as context.postId / context.postData, route by entry, send x-farnsworth-post-id on /api requests, and forward requestExpandedMode(event, entry) as window.parent.postMessage({ type: 'devvit:requestExpandedMode', entry }, '*'). When the user asks to add a post type, add a preset to .farnsworth/config.json (or a real menu item if the app should create it).",
+          "- Post types: Post View's '+ New post' picker discovers them dynamically from (1) devvit.json menu items with /internal/ endpoints, run against the emulator so the app's real submitCustomPost decides entry + postData, (2) .farnsworth/config.json \"postTypes\": [{ id, label, title?, entry?, postData? }] presets, and (3) devvit.json post.entrypoints as an entry toggle. The Post View iframe gets ?view=post&postId=&entry=&mode=inline|expanded&postData=<base64url JSON>. The project's client shim must expose those as context.postId / context.postData, route by entry, send x-farnsworth-post-id on /api requests, forward requestExpandedMode(event, entry, { title }) as window.parent.postMessage({ type: 'devvit:requestExpandedMode', entry, title }, '*'), and forward exitExpandedMode(event) as window.parent.postMessage({ type: 'devvit:exitExpandedMode' }, '*'). When the user asks to add a post type, add a preset to .farnsworth/config.json (or a real menu item if the app should create it).",
           "- Project FARNSWORTH.md files are optional, repository-specific context and may be stale. Farnsworth's built-in guide and live runtime tools are authoritative for IDE architecture.",
           '',
           '## Devvit emulator runtime rules',
