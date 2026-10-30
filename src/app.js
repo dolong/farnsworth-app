@@ -4918,6 +4918,16 @@ function startArtboardResize(e, wrap, corner, sizeLabel) {
 // read or write path: it is a debounced projection of the runner's in-memory
 // maps, so writing to it directly would be clobbered by the next flush.
 
+function resetEmulatorFeedForFolder() {
+  const f = state.emulatorFeed;
+  Object.assign(f, {
+    loading: false, loadedAt: null, error: null, hint: null,
+    posts: [], comments: [], currentUsername: null, activePostId: null,
+    busy: false, draft: '', refocusComposer: false, postTypes: null, typesFor: null, typesMenuOpen: false,
+    viewEntry: null, expanded: false, expandedTitle: null, backStack: [],
+  });
+}
+
 function emulatorFeedRerender() {
   // Only Post View consumes this state, so avoid rebuilding the canvas when
   // the user has already moved to another preview.
@@ -11531,6 +11541,10 @@ async function handleFolderPicked(folderPath) {
   // retargeting on an actual change.
   const previousFolder = state.folder;
   state.folder = folderPath;
+  // Oct 30: Post View's mock feed (posts, active post, expanded view) belonged
+  // to the previous project and leaked into a new window/folder. Re-read it
+  // for this project on every real folder load.
+  if (previousFolder !== folderPath) resetEmulatorFeedForFolder();
   // Health-daemon visibility (Aug 3 2026): main-process monitors can't read
   // renderer module-scope state directly; they poll this global via
   // executeJavaScript. See src/health-daemon.js ConfigWatcherGuard.

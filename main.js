@@ -1406,12 +1406,22 @@ async function resolveEmulatorAdminBase(event) {
   // shared file for launchers that don't write per-project metadata.
   const winId = event ? devWindowIdOf(event) : null;
   const rec = winId != null ? spawnedDevServers.get(`devvit:${winId}`) : null;
+  // Oct 30: a window with no server of its own (fresh window, project not
+  // live) used to fall through to the shared legacy file and show ANOTHER
+  // project's mock posts. Only accept metadata that belongs to this window's
+  // folder; an unverifiable legacy file is rejected when the folder is known.
+  const owner = rec?.repoRoot || (event ? folderForEvent(event) : null);
+  const ownerAbs = owner ? path.resolve(owner) : null;
   const candidates = [];
-  if (rec?.metaPath) candidates.push(rec.metaPath);
-  candidates.push(path.join(cacheDir, 'farnsworth-devvit.json'));
-  for (const mp of candidates) {
+  if (rec?.metaPath) candidates.push({ mp: rec.metaPath, own: true });
+  if (ownerAbs) candidates.push({ mp: devMetaPathFor('devvit', ownerAbs), own: true });
+  candidates.push({ mp: path.join(cacheDir, 'farnsworth-devvit.json'), own: false });
+  for (const { mp, own } of candidates) {
     try { meta = JSON.parse(await fs.readFile(mp, 'utf8')); } catch { meta = null; }
-    if (meta && (!rec || !meta.repoRoot || meta.repoRoot === rec.repoRoot)) break;
+    if (meta) {
+      if (!ownerAbs) break;
+      if (meta.repoRoot ? path.resolve(meta.repoRoot) === ownerAbs : own) break;
+    }
     meta = null;
   }
   if (!meta) return { ok: false, error: 'no_dev_metadata' };
