@@ -829,6 +829,15 @@ function buildChatWindowNotice(hiddenCount, thread) {
 }
 
 function renderChat(opts = {}) {
+  // Oct 31 2026: hidden Express lanes never paint (body is display:none,
+  // the window is never shown), yet streaming rebuilt this whole thread every
+  // 40ms. Measured on Citadel's identical lane: millions of dead DOM nodes and
+  // ~100 MB/min renderer growth until Blink heap OOM ~11 min into a turn.
+  // A lane only needs the state saved, so skip the DOM entirely there.
+  if (document.documentElement.dataset.expressAgent === 'true') {
+    scheduleChatHistorySave();
+    return;
+  }
   const thread = $('#chat-thread');
   initChatAutoScrollToggle();
   // Capture BEFORE the wipe — innerHTML='' resets scrollTop to 0.
