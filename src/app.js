@@ -1618,10 +1618,39 @@ function openTerminalModal(run) {
   document.body.appendChild(modal);
 }
 
+// Oct 31: per-message timestamps. Replies store doneAt when they finish;
+// everything else (and history saved before this) falls back to the send
+// time encoded in the 'm<epoch ms>' message id.
+function msgTimestamp(m) {
+  if (!m) return null;
+  if (m.role === 'agent' && m.doneAt) return m.doneAt;
+  if (m.at) return m.at;
+  const hit = /^m(\d{12,14})$/.exec(String(m.id || ''));
+  return hit ? Number(hit[1]) : null;
+}
+function formatMsgTime(ts) {
+  const d = new Date(ts);
+  const time = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  const now = new Date();
+  if (d.toDateString() === now.toDateString()) return time;
+  const y = new Date(now); y.setDate(now.getDate() - 1);
+  if (d.toDateString() === y.toDateString()) return `Yesterday ${time}`;
+  const opts = { month: 'short', day: 'numeric' };
+  if (d.getFullYear() !== now.getFullYear()) opts.year = 'numeric';
+  return `${d.toLocaleDateString([], opts)}, ${time}`;
+}
+function msgTimeEl(m, extraClass) {
+  const ts = msgTimestamp(m);
+  if (!ts) return null;
+  return el('span', { class: 'msg__time' + (extraClass ? ' ' + extraClass : ''), title: new Date(ts).toLocaleString() }, formatMsgTime(ts));
+}
+
 function renderMessage(m) {
   if (m.role === 'user') {
     const row = el('div', { class: 'msg msg--user', dataset: { msgId: m.id } });
     if ((m.text || '').trim()) row.appendChild(makeMsgCopyBtn(() => m.text, 'msg__copy msg__copy--user'));
+    const userTime = msgTimeEl(m, 'msg__time--user');
+    if (userTime) row.appendChild(userTime);
     row.appendChild(el('div', { class: 'msg__bubble' }, m.text));
     return row;
   }
@@ -1644,6 +1673,7 @@ function renderMessage(m) {
     // creation (see sendChatMessage ~line 9247); fall back to the
     // current default for legacy bubbles from before this fix.
     head.appendChild(el('span', { class: 'msg__model' }, m.model || state.settings?.defaultModel || 'Opus 4.8'));
+    if (!m.working) { const t = msgTimeEl(m); if (t) head.appendChild(t); }
 
     // Status dot — replaces the old "Verified against check" chip. Hover-revealed,
     // tiny. Green = ok, red = fail. Only renders if verification info exists.
@@ -14792,6 +14822,7 @@ async function sendChatMessage(opts) {
     tl.push({ type: 'surface', surfaceId });
   };
   const updateAgentMsg = (patch) => {
+    if (patch && patch.working === false && agentMsg.working && !agentMsg.doneAt) patch = { ...patch, doneAt: Date.now() };
     agentMsg = { ...agentMsg, ...patch };
     const idx = state.chatMessages.findIndex(m => m.id === agentMsgId);
     if (idx >= 0) {
@@ -15401,7 +15432,7 @@ async function sendChatMessage(opts) {
   } catch (e) {
     const idx = state.chatMessages.findIndex(m => m.id === agentMsgId);
     if (idx >= 0) {
-      state.chatMessages[idx] = { id: agentMsgId, role: 'agent', text: `Error: ${e.message}`, error: true };
+      state.chatMessages[idx] = { id: agentMsgId, role: 'agent', text: `Error: ${e.message}`, error: true, doneAt: Date.now() };
       renderChat();
     }
   } finally {
