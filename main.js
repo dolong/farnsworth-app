@@ -950,6 +950,7 @@ function buildMenu() {
 // Closing windows one at a time still ends with just the last one restored,
 // because the final close is what triggers the quit.
 const RESTORE_WINDOWS_KEY = 'restoreWindowFolders';
+let restoreWindowsSaved = false;
 function openProjectFolders() {
   const out = [];
   for (const w of openWindows) {
@@ -6726,9 +6727,13 @@ app.on('before-quit', () => { try { stopProdSessionSync('before-quit'); } catch 
 // the first place.
 app.on('before-quit', () => {
   // Synchronous on purpose: windows are still open here, they close after.
+  // First save per process wins: a window's close handler cancels the quit,
+  // so a second before-quit (pkill, a later Cmd+Q) arrives with windows
+  // already gone and used to overwrite the list (Nov 1, Dice Fight dropped).
+  if (restoreWindowsSaved) return;
   try {
     const folders = openProjectFolders();
-    if (folders.length) db.setSetting(scopedSettingKey(RESTORE_WINDOWS_KEY), JSON.stringify(folders));
+    if (folders.length) { db.setSetting(scopedSettingKey(RESTORE_WINDOWS_KEY), JSON.stringify(folders)); restoreWindowsSaved = true; }
   } catch (e) { console.warn('[restore] save window folders failed:', e.message); }
 });
 app.on('before-quit', () => {
