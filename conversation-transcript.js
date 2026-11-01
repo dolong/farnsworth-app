@@ -172,6 +172,11 @@ function buildTranscript({ conversation, run = null, options = {} } = {}) {
         toolCalls: Array.isArray(message?.chips) ? message.chips.length : 0,
       };
       if (message?.model) shaped.model = message.model;
+      // Oct 31: message time for Express. Replies carry doneAt (finish time);
+      // otherwise use an explicit at, else the send time in the 'm<epoch ms>' id.
+      const at = (message?.role === 'agent' && message?.doneAt) || message?.at
+        || (/^m(\d{12,14})$/.exec(String(message?.id || '')) || [])[1];
+      if (at) shaped.at = new Date(Number(at)).toISOString();
       if (message?.error) shaped.error = true;
       if (message?.stopped) shaped.stopped = true;
       return shaped;
