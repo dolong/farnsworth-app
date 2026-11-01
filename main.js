@@ -79,7 +79,7 @@ if (!IS_DEFAULT_INSTANCE) {
 // every instance the same SQLite file, so an unscoped key means a named dev
 // instance silently reassigns the default app's open folder / active chat.
 // (Aug 5: a test instance clobbered chat.activeId for exactly this reason.)
-const PER_INSTANCE_SETTING_KEYS = new Set(['currentFolder', 'chat.activeId']);
+const PER_INSTANCE_SETTING_KEYS = new Set(['currentFolder', 'chat.activeId', 'restoreWindowFolders']);
 
 // Runtime view state that lives in the settings table but is NOT a user
 // preference. These must never ride the bulk settings:get/settings:set path.
