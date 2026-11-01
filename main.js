@@ -994,7 +994,12 @@ function createWindow({ fresh = false, folder = null } = {}) {
     },
   });
 
-  mainWindow.once('ready-to-show', () => {
+  // Capture THIS window: createWindow() reassigns the global, so when the
+  // restore opens several windows at once, every ready-to-show used to show
+  // the LAST one and the others stayed hidden (Nov 1, Breach window).
+  const shownWin = mainWindow;
+  shownWin.once('ready-to-show', () => {
+    const mainWindow = shownWin;
     mainWindow.show();
     // Force focus on macOS so the menu bar reflects Farnsworth's menus
     // immediately on launch. Without this, the window appears but stays
