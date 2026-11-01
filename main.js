@@ -940,7 +940,37 @@ function buildMenu() {
 // project you were already in, canvas and all -- there was no way to open a
 // window FOR a different folder. The flag rides in as a query param because the
 // renderer needs it during init(), before any IPC round-trip would resolve.
-function createWindow({ fresh = false } = {}) {
+// ------------------------------------------------------------
+// Reopen every project window after a quit (Nov 1 2026)
+// ------------------------------------------------------------
+// Quitting (Cmd+Q, an update install, swap.sh) closed every project window
+// and relaunch brought back only one, on recent[0]. Long had to reopen the
+// Breach window by hand after the 0.1.96 install. before-quit records the
+// folder of each open project window; launch reopens one window per folder.
+// Closing windows one at a time still ends with just the last one restored,
+// because the final close is what triggers the quit.
+const RESTORE_WINDOWS_KEY = 'restoreWindowFolders';
+function openProjectFolders() {
+  const out = [];
+  for (const w of openWindows) {
+    try {
+      if (!w || w.isDestroyed() || isExpressLaneWindow(w)) continue;
+      const f = windowWorkspaces.get(w.webContents.id);
+      if (f && !out.includes(f)) out.push(f);
+    } catch { /* window mid-teardown */ }
+  }
+  return out;
+}
+function foldersToRestore() {
+  try {
+    const raw = db.getSetting(scopedSettingKey(RESTORE_WINDOWS_KEY));
+    const list = JSON.parse(raw || '[]');
+    if (!Array.isArray(list)) return [];
+    return list.filter((f) => typeof f === 'string' && f && require('fs').existsSync(f));
+  } catch { return []; }
+}
+
+function createWindow({ fresh = false, folder = null } = {}) {
   mainWindow = new BrowserWindow({
     width: 1512,
     height: 1320,
@@ -978,7 +1008,7 @@ function createWindow({ fresh = false } = {}) {
   });
   mainWindow.loadFile(
     path.join(__dirname, 'index.html'),
-    fresh ? { query: { fresh: '1' } } : undefined,
+    fresh ? { query: { fresh: '1' } } : folder ? { query: { folder } } : undefined,
   );
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
@@ -6690,6 +6720,13 @@ app.on('before-quit', () => { try { stopProdSessionSync('before-quit'); } catch 
 // kill would lose the race with process exit -- which is how these leaked in
 // the first place.
 app.on('before-quit', () => {
+  // Synchronous on purpose: windows are still open here, they close after.
+  try {
+    const folders = openProjectFolders();
+    if (folders.length) db.setSetting(scopedSettingKey(RESTORE_WINDOWS_KEY), JSON.stringify(folders));
+  } catch (e) { console.warn('[restore] save window folders failed:', e.message); }
+});
+app.on('before-quit', () => {
   try { killTrackedDevServers('before-quit'); } catch (e) {
     console.warn('[dev:farnsworth] quit cleanup failed:', e.message);
   }
@@ -10570,7 +10607,11 @@ app.whenReady().then(async () => {
   // Install the native macOS menu bar before createWindow() so the
   // first paint already has File / Edit / View / Window / Help menus.
   Menu.setApplicationMenu(buildMenu());
-  createWindow();
+  {
+    const restore = foldersToRestore();
+    if (restore.length) for (const folder of restore) createWindow({ folder });
+    else createWindow();
+  }
   createCanvasCaptureWindow();
   installCanvasDisplayMediaHandler();
   startTerminalServer();

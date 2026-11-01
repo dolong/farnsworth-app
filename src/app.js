@@ -18237,10 +18237,15 @@ async function init() {
   // window meant "New Window" duplicated the project you were already in
   // (canvas live, files loaded) with no way to point it at a different folder.
   // A fresh window lands in the same unopened state as a first-ever launch.
-  const freshWindow = new URLSearchParams(location.search).get('fresh') === '1';
+  const launchParams = new URLSearchParams(location.search);
+  const freshWindow = launchParams.get('fresh') === '1';
+  // Reopened after a quit: main passes the folder this window had open.
+  const restoreFolder = launchParams.get('folder');
   let recent = [];
   if (window.farnsworth) recent = await window.farnsworth.getRecent();
-  if (!freshWindow && recent.length > 0) {
+  if (!freshWindow && restoreFolder) {
+    await handleFolderPicked(restoreFolder);
+  } else if (!freshWindow && recent.length > 0) {
     await handleFolderPicked(recent[0].path);
   } else {
     showWelcome();
