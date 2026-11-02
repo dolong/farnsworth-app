@@ -127,6 +127,12 @@ const expressTurns = createChatTurnRegistry({ maxConcurrent: 2, uuid: () => cryp
 function isExpressLaneWindow(win) { return !!win && !!expressLanes.byWindow(win); }
 
 const windowWorkspaces = new Map(); // webContents.id -> folder path
+// Folder a window was CREATED for (restore ?folder=), before its renderer has
+// announced it via workspace:setActive. Nov 2: Express asked for CringeBattles
+// right after launch, the restored window hadn't announced yet, and a second
+// CringeBattles window opened.
+const pendingWindowFolders = new Map(); // webContents.id -> folder path
+const openFolderWindowInflight = new Map(); // folder -> Promise
 
 // The folder for the window that made THIS request. Falls back to the global
 // setting for callers with no event (timers, relay, companion bridges).
@@ -139,6 +145,7 @@ function folderForEvent(event) {
 ipcMain.handle('workspace:setActive', async (event, folder) => {
   const id = event && event.sender ? event.sender.id : null;
   if (id == null) return { ok: false, error: 'no_sender' };
+  pendingWindowFolders.delete(id);
   if (folder) windowWorkspaces.set(id, folder);
   else if (expressLanes.byWebContents(id) || expressLanes.byWindow(BrowserWindow.fromWebContents(event.sender))) windowWorkspaces.set(id, null);
   else windowWorkspaces.delete(id);
@@ -149,6 +156,7 @@ app.on('web-contents-created', (_e, contents) => {
   const ownerId = contents.id;
   contents.on('destroyed', () => {
     windowWorkspaces.delete(ownerId);
+    pendingWindowFolders.delete(ownerId);
     // A closed window's previews must not linger as orphans in the map.
     try {
       for (const k of [...canvasWebContentsViews.keys()]) if (k.startsWith(`${ownerId}:`)) destroyCanvasViewKey(k);
@@ -1012,6 +1020,7 @@ function createWindow({ fresh = false, folder = null } = {}) {
       app.focus({ steal: true });
     }
   });
+  if (!fresh && folder) pendingWindowFolders.set(mainWindow.webContents.id, folder);
   mainWindow.loadFile(
     path.join(__dirname, 'index.html'),
     fresh ? { query: { fresh: '1' } } : folder ? { query: { folder } } : undefined,
@@ -12631,17 +12640,29 @@ function startExpressControl() {
       // a folder_switch turned the BreachReddit window into CringeBattles).
       openFolderWindow: async (folder) => {
         const norm = (f) => String(f || '').replace(/\/+$/, '');
-        for (const [id, f] of windowWorkspaces) {
-          if (!f || norm(f) !== norm(folder)) continue;
-          const w = BrowserWindow.getAllWindows().find((x) => !x.isDestroyed() && x.webContents.id === id && !isExpressLaneWindow(x));
-          if (w) { try { if (w.isMinimized()) w.restore(); w.show(); w.focus(); } catch {} return { folder, window: 'existing' }; }
+        const key = norm(folder);
+        // Match windows that announced the folder AND restored windows still
+        // loading it, so a launch-time request reuses instead of duplicating.
+        for (const map of [windowWorkspaces, pendingWindowFolders]) {
+          for (const [id, f] of map) {
+            if (!f || norm(f) !== key) continue;
+            const w = BrowserWindow.getAllWindows().find((x) => !x.isDestroyed() && x.webContents.id === id && !isExpressLaneWindow(x));
+            if (w) { try { if (w.isMinimized()) w.restore(); w.show(); w.focus(); } catch {} return { folder, window: 'existing' }; }
+          }
         }
-        createWindow({ fresh: true });
-        const win = mainWindow;
-        await new Promise((r) => win.webContents.once('did-finish-load', r));
-        await new Promise((r) => setTimeout(r, 800));
-        await expressRenderer.call(win, 'switchFolder', { path: folder });
-        return { folder, window: 'new' };
+        // Two requests for the same folder in quick succession share one window.
+        if (openFolderWindowInflight.has(key)) return openFolderWindowInflight.get(key);
+        const job = (async () => {
+          createWindow({ fresh: true });
+          const win = mainWindow;
+          pendingWindowFolders.set(win.webContents.id, folder);
+          await new Promise((r) => win.webContents.once('did-finish-load', r));
+          await new Promise((r) => setTimeout(r, 800));
+          await expressRenderer.call(win, 'switchFolder', { path: folder });
+          return { folder, window: 'new' };
+        })();
+        openFolderWindowInflight.set(key, job);
+        try { return await job; } finally { openFolderWindowInflight.delete(key); }
       },
       emit: (topic, data) => {
         if (expressControl) expressControl.emit(topic, data);
