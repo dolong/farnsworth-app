@@ -99,11 +99,19 @@ Picking a preset is a real viewport change (breakpoints fire), clears any manual
 
 `testviewDevice()` honours the explicit dropdown choice only while the picked dimensions still match the on-screen frame. After a corner drag or a restart it falls back to orientation: width ≥ height means desktop. A Custom W × H has no optgroup to read, so it always uses that fallback.
 
-::: warning A test cannot declare its own frame
-The runner reads only `name` and `steps` (see [§4](#_4-creating-tests)), so the frame is **ambient operator state**, not part of the test file. **Mobile 390 × 844 is what you get by omission**, which means a test authored against a desktop layout will silently run in a phone. Two consequences worth designing around:
+::: tip A test can declare its own frame
+Since **v0.1.89** a test file may carry a top-level `"frame"` next to `name` and `steps`, and `test_run` (and the Run button) apply it before the steps run — so a test always gets the layout it was written for. `test_run` also takes a `frame` argument for a one-off override, and the `set_test_frame` agent tool changes the frame without running anything.
 
-- An agent authoring tests has no way to see or set the frame. If a test assumes desktop, say so in the test `name` and make the first step after `reload` a `waitFor` on `.fw-stage--desktop`, so a wrong preset fails loudly on step 2 instead of producing confusing failures deeper in the run.
-- Switching the frame is a human action in the canvas header. Pick the Desktop preset **before** running a desktop test.
+Accepted values: `"mobile"` (390 × 844), `"desktop"` (1280 × 800), `"desktop-default"` (724 × 596), a size string like `"1512x1320"`, or `{"width":1280,"height":800,"device":"desktop"}`. An unknown value fails the run with `bad_frame` rather than silently using the wrong layout.
+
+```json
+{ "name": "admin-schedule-battle", "frame": "desktop", "steps": [ { "action": "reload" }, { "action": "waitFor", "selector": ".fw-stage--desktop" } ] }
+```
+
+**Without a `"frame"`, the frame is ambient operator state**, and **Mobile 390 × 844 is what you get by omission** — a test authored against a desktop layout will silently run in a phone. Two consequences worth designing around:
+
+- Declare `"frame"` whenever the layout differs between phone and desktop; an undeclared desktop test is exactly the failure above.
+- Keep the first step after `reload` a `waitFor` on `.fw-stage--desktop` or `.fw-stage--mobile` anyway, so a wrong frame fails loudly on step 2 instead of producing confusing failures deeper in the run.
 :::
 
 ---
@@ -122,7 +130,7 @@ Ask the chat panel directly:
 
 > "Create a test called play-and-screenshot-lobby that loads the game, clicks PLAY, and screenshots the lobby."
 
-The agent has five test tools:
+The agent has these test tools:
 
 | Tool | What it does |
 |---|---|
@@ -130,7 +138,8 @@ The agent has five test tools:
 | `test_list` | Lists the active project's tests |
 | `test_read` | Loads a test's JSON |
 | `test_save` | Validates + writes a test (name is normalized) |
-| `test_run` | Executes a test by absolute path, returns pass/fail + output |
+| `test_run` | Executes a test by absolute path, returns pass/fail + output. Takes an optional `frame` |
+| `set_test_frame` | Sets the Test View frame (the resolution dropdown) without running anything |
 
 The agent reads `DEVVIT-TESTS.md` (app root) for the format before authoring, then saves into the active project. It can also edit existing tests ("make the lobby test wait 2 seconds after PLAY") and run them, reporting results back in chat.
 

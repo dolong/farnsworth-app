@@ -15,7 +15,7 @@ When the user asks any of:
 
 ## The test format
 
-A test is one JSON file. The runner reads exactly two top-level keys; anything else is ignored metadata.
+A test is one JSON file. The runner (`farnsworth-test.py`) reads exactly two keys, `name` and `steps`. Farnsworth itself also reads an optional top-level `frame` and applies it before the run (see below). Anything else is ignored metadata.
 
 ```json
 {
@@ -33,17 +33,28 @@ A test is one JSON file. The runner reads exactly two top-level keys; anything e
 
 The filename (normalized to lowercase-dashes by `test_save`) is the test's identity; the JSON `name` is a free-form description.
 
-Step fields: `action` (required) + action-specific fields. `_comment` and `name` on a step are annotation only (use `_comment` generously). `timeout` defaults to **5000ms**. There is NO `label`, `frame`, or `waitAfter` field; for a pause after an action, add a `sleep` step.
+Step fields: `action` (required) + action-specific fields. `_comment` and `name` on a step are annotation only (use `_comment` generously). `timeout` defaults to **5000ms**. There is NO step-level `label`, `frame`, or `waitAfter` field; for a pause after an action, add a `sleep` step. (`frame` is a TOP-LEVEL key, not a step field - see "The canvas frame" below.)
 
 ## The canvas frame - mobile vs desktop (read this before authoring)
 
-**A test cannot declare its own frame.** The runner reads only `name` and `steps`, so
-the viewport a test executes against is ambient UI state: whatever the **resolution
-dropdown** in the canvas header is set to while Test View is the active preview.
+**A test declares the frame it needs with a top-level `"frame"` key**, next to `name` and
+`steps`. `test_run` (and the Run button) set the Test View frame from it before the steps
+run, so the test always gets the layout it was written for. You can also pass `frame` to
+`test_run` for a one-off override, or call `set_test_frame` to change the frame without
+running anything.
 
-**The default is Mobile, 390 x 844.** If nobody has picked a preset, that is the frame
-you get - so a test authored for a desktop layout will silently run in a phone and fail
-in confusing ways. Desktop is fully supported; it just has to be selected.
+```json
+{ "name": "admin-schedule-battle", "frame": "desktop", "steps": [ { "action": "reload" }, { "action": "waitFor", "selector": ".fw-stage--desktop" } ] }
+```
+
+Accepted values: `"mobile"` (390x844), `"desktop"` (1280x800), `"desktop-default"`
+(724x596), a size string like `"1512x1320"`, or `{"width":1280,"height":800,"device":"desktop"}`.
+An unknown value fails the run with `bad_frame` rather than silently using the wrong layout.
+
+**Without a `"frame"`, the viewport is ambient UI state**: whatever the **resolution
+dropdown** in the canvas header shows while Test View is the active preview. **That
+default is Mobile, 390 x 844** - so a desktop test with no `"frame"` silently runs in a
+phone and fails in confusing ways. Desktop is fully supported; it just has to be asked for.
 
 | Group | Presets |
 |---|---|
@@ -59,17 +70,19 @@ viewport, so selectors, clicks and screenshots behave identically at any zoom le
 
 Rules for authoring:
 
-1. **Do not default to mobile silently.** If the layout differs between phone and
-   desktop, ask which frame the test is for, or state which one you assumed.
-2. **Make the assumption self-checking.** Right after `reload`, `waitFor` on
-   `.fw-stage--desktop` or `.fw-stage--mobile`. If the operator has the wrong preset
-   selected, the test then fails on step 2 with an obvious message instead of dying on
-   a selector that only exists in the other layout.
-3. **Device classification** follows the picked preset while its dimensions still match
-   the on-screen frame. After a corner-drag resize or a restart it falls back to
+1. **Set `"frame"` whenever the layout differs between phone and desktop.** Do not leave
+   it to the dropdown. If you are unsure which layout the user wants, ask - or pick one
+   and say which you assumed.
+2. **Make it self-checking anyway.** Right after `reload`, `waitFor` on
+   `.fw-stage--desktop` or `.fw-stage--mobile`. If the frame ever ends up wrong (a hand
+   run with the dropdown moved), the test then fails on step 2 with an obvious message
+   instead of dying on a selector that only exists in the other layout.
+3. **Device classification** follows the requested preset while its dimensions still
+   match the on-screen frame. After a corner-drag resize or a restart it falls back to
    orientation: width >= height means desktop.
-4. **Switching the frame is the operator's job, not yours.** There is no test action and
-   no tool parameter that sets it. Say which preset the user needs to pick.
+4. **`set_test_frame` is for the user's own runs.** When someone says "put Test View in
+   desktop" or "run the tests at 1512x1320", call it. Tests themselves should carry
+   `"frame"` so they never depend on ambient state.
 
 ## Available actions (complete list - do not invent others)
 
@@ -99,7 +112,7 @@ There is NO `scroll`, `wait`, or `hover` action.
 - **CSS** (preferred): anything `document.querySelector` takes. Comma alternatives OK: `".dh-btn.primary, .draft-start-btn"`.
 - **`text=` prefix**: `"text=CONFIRM"` matches visible elements whose text contains the fragment, walks up to the clickable ancestor. Use for SVG-based buttons that CSS cannot reach.
 - **NO XPath.** `xpath:` is not supported and will fail.
-- **NO `frame` field.** The runner attaches directly to the game page; the game DOM is the top-level document.
+- **NO `frame` step field.** The runner attaches directly to the game page; the game DOM is the top-level document.
 
 ## Variables and control flow
 
@@ -166,9 +179,9 @@ Read the project source for anything not listed - do not guess selectors.
 4. **Generous timeouts around animations** (7-30s in the-last-draft draft sequence); `waitForNotVisible` to wait out transitions.
 5. **`screenshot` needs an absolute `path`** (`/tmp/...`). There is no auto screenshots dir.
 6. **Failed steps do not stop the run** at the top level (you get full output); nested steps abort their `if`/`while` block.
-7. **The frame is not part of the test.** Mobile 390 x 844 is the default, so a desktop
-   test needs a Desktop preset picked in the resolution dropdown first. Guard the
-   assumption with a `waitFor` on `.fw-stage--desktop` / `.fw-stage--mobile`.
+7. **Give a desktop test `"frame": "desktop"`.** Mobile 390 x 844 is the default when a
+   test declares nothing, so an undeclared desktop test silently runs in a phone. Guard
+   the assumption too with a `waitFor` on `.fw-stage--desktop` / `.fw-stage--mobile`.
 
 ## The tools you'll call
 
@@ -178,7 +191,8 @@ Read the project source for anything not listed - do not guess selectors.
 | `test_list` | (uses active workspace folder) | `{ ok, tests: [{name, path, size, modified}], dir }` |
 | `test_read` | `name` | `{ ok, name, path, json }` (raw JSON string) |
 | `test_save` | `name`, `json` | `{ ok, path, name }` after JSON validation |
-| `test_run` | `path` (ABSOLUTE, from test_list/test_save) | `{ ok, code, failed, stdout, stderr }` |
+| `test_run` | `path` (ABSOLUTE, from test_list/test_save), optional `frame` | `{ ok, code, failed, stdout, stderr, frame? }` |
+| `set_test_frame` | `preset` OR `width`+`height`+`device` | Sets the Test View frame without running. `"mobile"`, `"desktop"`, `"desktop-default"`, `"1512x1320"` |
 
 ## Example agent flows
 
@@ -200,16 +214,4 @@ User: "make the lobby screenshot test wait 2 seconds after PLAY"
 2. Change the sleep step's ms from 1500 → 2000
 3. test_save with the edited JSON
 4. Report the change
-```
-
-## Test View frame
-
-A test can declare the frame it needs with a top-level `"frame"` next to `name` and `steps`:
-`"mobile"` (390x844), `"desktop"` (1280x800), `"desktop-default"` (724x596), a size like `"1512x1320"`,
-or `{"width":1280,"height":800,"device":"desktop"}`. `test_run` and the Run button set the Test View
-frame (the resolution dropdown) before the steps run. `test_run` also takes a `frame` arg, and
-`set_test_frame` changes it without running. Without `"frame"`, the run uses whatever the dropdown shows.
-
-```json
-{ "name": "admin-schedule-battle", "frame": "desktop", "steps": [ { "action": "reload" }, { "action": "waitFor", "selector": ".fw-stage--desktop" } ] }
 ```
