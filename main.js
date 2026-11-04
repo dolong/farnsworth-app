@@ -127,6 +127,23 @@ const expressTurns = createChatTurnRegistry({ maxConcurrent: 2, uuid: () => cryp
 function isExpressLaneWindow(win) { return !!win && !!expressLanes.byWindow(win); }
 
 const windowWorkspaces = new Map(); // webContents.id -> folder path
+// Window title = project name, so the Dock right-click menu and Mission
+// Control list "Breach", "CringeBattles"... instead of "Farnsworth" three times.
+// The page's <title> would overwrite it on every reload, so a window carrying
+// a project title ignores page-title-updated.
+const APP_WINDOW_TITLE = 'Farnsworth';
+function applyWorkspaceTitle(contents, folder) {
+  try {
+    const win = contents && !contents.isDestroyed() ? BrowserWindow.fromWebContents(contents) : null;
+    if (!win || win.isDestroyed()) return;
+    const name = folder ? path.basename(String(folder).replace(/[\\/]+$/, '')) : '';
+    win.__projectTitle = name || null;
+    win.setTitle(name || APP_WINDOW_TITLE);
+  } catch {}
+}
+app.on('browser-window-created', (_e, win) => {
+  win.on('page-title-updated', (e) => { if (win.__projectTitle) e.preventDefault(); });
+});
 // Folder a window was CREATED for (restore ?folder=), before its renderer has
 // announced it via workspace:setActive. Nov 2: Express asked for CringeBattles
 // right after launch, the restored window hadn't announced yet, and a second
@@ -149,6 +166,7 @@ ipcMain.handle('workspace:setActive', async (event, folder) => {
   if (folder) windowWorkspaces.set(id, folder);
   else if (expressLanes.byWebContents(id) || expressLanes.byWindow(BrowserWindow.fromWebContents(event.sender))) windowWorkspaces.set(id, null);
   else windowWorkspaces.delete(id);
+  applyWorkspaceTitle(event.sender, folder);
   return { ok: true };
 });
 
