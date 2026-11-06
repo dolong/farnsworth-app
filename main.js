@@ -1578,6 +1578,10 @@ ipcMain.handle('devvit:postTypes', async (_event, repoRoot) => {
   const devvitJson = await readJsonSafe(path.join(repoRoot, 'devvit.json'));
   const fwConfig = await readJsonSafe(path.join(repoRoot, '.farnsworth', 'config.json'));
   const entrypoints = Object.keys(devvitJson?.post?.entrypoints || {});
+  // inline:true entries render inside the feed post; the rest open as Reddit's
+  // expanded web view. Post View's entry tabs use this to pick the frame.
+  const entrypointInline = {};
+  for (const [k, v] of Object.entries(devvitJson?.post?.entrypoints || {})) entrypointInline[k] = !!(v && v.inline);
   const menuItems = (Array.isArray(devvitJson?.menu?.items) ? devvitJson.menu.items : [])
     .filter((m) => m && typeof m.endpoint === 'string' && m.endpoint.startsWith('/internal/'))
     .filter((m) => {
@@ -1607,6 +1611,7 @@ ipcMain.handle('devvit:postTypes', async (_event, repoRoot) => {
   return {
     ok: true,
     entrypoints,
+    entrypointInline,
     menuItems,
     presets,
     configPath: path.join(repoRoot, '.farnsworth', 'config.json'),

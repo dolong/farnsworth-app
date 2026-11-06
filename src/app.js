@@ -5581,7 +5581,11 @@ function renderPostView() {
             onclick: () => {
               const f = state.emulatorFeed;
               f.viewEntry = name === ownEntry ? null : name;
-              f.expanded = name !== ownEntry;
+              // Inline entrypoints (devvit.json inline:true) render in the feed
+              // post at 700x512, like on Reddit; only non-inline ones (e.g. the
+              // full game) open the tall expanded view.
+              const inl = (pt && pt.entrypointInline) || {};
+              f.expanded = name !== ownEntry && !inl[name];
               f.expandedTitle = null;
               emulatorFeedRerender();
             },
