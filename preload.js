@@ -7,6 +7,17 @@ contextBridge.exposeInMainWorld('farnsworth', {
   // Settings
   getSettings: () => ipcRenderer.invoke('settings:get'),
   setSettings: (s) => ipcRenderer.invoke('settings:set', s),
+  // Sibling-window settings sync (Nov 5). Main fires this when ANOTHER window
+  // writes settings, so this window can re-read them and pick up a new custom
+  // endpoint or provider model without a reload. The window that wrote is not
+  // notified — it already has the new state.
+  onSettingsChanged: (cb) => {
+    const handler = () => {
+      try { cb(); } catch (err) { console.error('[settings-sync] handler error:', err); }
+    };
+    ipcRenderer.on('settings:changed', handler);
+    return () => ipcRenderer.removeListener('settings:changed', handler);
+  },
   getSetting: (key) => ipcRenderer.invoke('setting:get', key),
   // Tell main which folder THIS window is in. Main keys it by webContents id
   // so agent tools resolve the asking window's workspace instead of a single

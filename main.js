@@ -1189,6 +1189,24 @@ ipcMain.handle('settings:set', async (_event, settings) => {
   // ["key",value] pair values, silently breaking bulk settings persistence
   // for every key (found Jul 12 while wiring testingModel).
   db.setAllSettings(settings || {});
+  // Settings are shared across windows (see the header note: "the SQLite DB,
+  // memory and settings stay shared"), but a renderer only reads them once, in
+  // loadSettings() at boot. So a write in one window used to leave every
+  // sibling window on its stale boot copy until a reload: adding a custom
+  // endpoint (Venice, Nov 5) showed the new model in the picker of the window
+  // that added it and nowhere else, and the send path in the other windows
+  // could not resolve the endpoint at all. Tell the OTHER windows to re-read.
+  // The sender already holds the new state; skipping it avoids a pointless
+  // round trip and keeps this from looking like a change it didn't make.
+  try {
+    const senderId = _event.sender.id;
+    for (const w of BrowserWindow.getAllWindows()) {
+      if (w.isDestroyed() || w.webContents.id === senderId) continue;
+      w.webContents.send('settings:changed');
+    }
+  } catch (e) {
+    console.warn('[settings-sync] broadcast failed:', e.message);
+  }
   return true;
 });
 // Single-key getters/setters — preferred for new code. The bulk

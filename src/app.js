@@ -17945,11 +17945,38 @@ function initLeftPanelResize() {
   }
 }
 
+// Sibling-window settings sync (Nov 5). Settings are shared across windows,
+// but a renderer reads them only once, in loadSettings() at boot — so a change
+// made in another window (most visibly a custom endpoint / provider model)
+// stayed invisible here until a reload, and resolveEndpointForModel() could
+// not resolve it either. Main fires 'settings:changed' on every write from a
+// DIFFERENT window; this re-derives the model-facing state only. Deliberately
+// narrow: re-running loadSettings() wholesale would re-apply boot migrations
+// and could clobber this window's local view state, and nothing outside the
+// model list needs to change live (a sibling's canvas or appearance write must
+// not repaint this window).
+async function refreshSharedSettings() {
+  if (!window.farnsworth?.getSettings) return;
+  try {
+    const s = await window.farnsworth.getSettings();
+    if (!s) return;
+    state.settings.customEndpoints = Array.isArray(s.customEndpoints) ? s.customEndpoints : [];
+    state.settings.providerModels = Array.isArray(s.providerModels) ? s.providerModels : [];
+    if (typeof s.defaultModel === 'string' && s.defaultModel) state.settings.defaultModel = s.defaultModel;
+    updateChatInputModelButton();
+    sendModelsListToCompanions();
+  } catch (e) {
+    console.warn('[settings-sync] refresh failed:', e.message);
+  }
+}
+
 async function init() {
   // Before anything renders: keeps WebContentsViews under every DOM overlay
   // without each overlay having to know WebContentsViews exist.
   installCanvasVisibilityObserver();
   await loadSettings();
+  // Pick up settings written by a sibling window after this one booted.
+  window.farnsworth?.onSettingsChanged?.(() => { refreshSharedSettings(); });
   // Appearance -> CSS vars/body class; canvas network policy -> main
   // (main defaults to allowed, so only an explicit OFF needs pushing).
   applyAppearanceSettings();
