@@ -1018,6 +1018,14 @@ function createWindow({ fresh = false, folder = null } = {}) {
       // attach automation (agent-browser) directly to the preview frame
       // instead of fighting cross-origin barriers from the parent renderer.
       webviewTag: true,
+      // Keep rAF and timers running when this window is behind another one.
+      // The canvas rebuilds its preview view in a requestAnimationFrame after
+      // every re-render (frame size, preview mode, Go Live). With throttling
+      // on, an occluded project window never ran that rAF, so an Express job
+      // driving a background window lost its preview for good: "No active
+      // canvas view" / "The game preview is not running" until someone
+      // brought the window to the front (Nov 7, Dice Fight behind Breach).
+      backgroundThrottling: false,
     },
   });
 
