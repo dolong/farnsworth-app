@@ -6845,6 +6845,29 @@ async function readDirRecursive(dir, depth, base = dir) {
   return out;
 }
 
+// Resolve an agent-supplied path against the workspace folder.
+//
+// path.join(folder, '/tmp/x') does NOT honour the absolute path. It yields
+// '<folder>/tmp/x', so an agent asking for a scratch file outside the project
+// silently wrote it *into* the user's checkout instead (three times by
+// Nov 11 2026, e.g. /tmp/df-infernal -> DiceFightReddit/tmp/df-infernal, with
+// a {ok:true} the agent had no reason to doubt). path.resolve anchors
+// correctly, and the containment check below is what stops write_file from
+// becoming a way around the nono workdir boundary that run_command already
+// enforces. Absolute paths that land inside the workspace stay allowed.
+function resolveAgentPath(folder, p) {
+  const root = path.resolve(String(folder));
+  const full = path.resolve(root, String(p));
+  const rel = path.relative(root, full);
+  if (rel === '') return { ok: true, full, rel: '.' };
+  if (rel.startsWith('..') || path.isAbsolute(rel)) return { ok: false, full, rel: null };
+  return { ok: true, full, rel: rel.split(path.sep).join('/') };
+}
+
+function outsideWorkspaceMessage(p) {
+  return `"${p}" is outside the workspace folder. The agent only reads and writes inside the workspace, so nothing was written. Pass a workspace-relative path instead (e.g. "tmp/notes.md").`;
+}
+
 ipcMain.handle('fs:readFile', async (_event, folderPath, filePath) => {
   try {
     const full = path.join(folderPath, filePath);
@@ -8577,18 +8600,19 @@ async function executeAgentTool(name, input, folderOverride) {
   }
   if (name === 'read_file') {
     if (!input?.path || typeof input.path !== 'string') return { ok: false, error: 'bad_input', message: 'path required' };
-    if (input.path.includes('..')) return { ok: false, error: 'bad_input', message: 'path cannot contain ..' };
-    const res = await fs.readFile(path.join(folder, input.path), 'utf8');
-    return { ok: true, content: res.toString(), path: input.path };
+    const target = resolveAgentPath(folder, input.path);
+    if (!target.ok) return { ok: false, error: 'outside_workspace', message: outsideWorkspaceMessage(input.path) };
+    const res = await fs.readFile(target.full, 'utf8');
+    return { ok: true, content: res.toString(), path: target.rel };
   }
   if (name === 'write_file') {
     if (!input?.path || typeof input.path !== 'string') return { ok: false, error: 'bad_input', message: 'path required' };
-    if (input.path.includes('..')) return { ok: false, error: 'bad_input', message: 'path cannot contain ..' };
     if (typeof input.content !== 'string') return { ok: false, error: 'bad_input', message: 'content required' };
-    const full = path.join(folder, input.path);
-    await fs.mkdir(path.dirname(full), { recursive: true });
-    await fs.writeFile(full, input.content, 'utf8');
-    return { ok: true, message: `Wrote ${input.path} (${input.content.length} chars)`, path: input.path };
+    const target = resolveAgentPath(folder, input.path);
+    if (!target.ok) return { ok: false, error: 'outside_workspace', message: outsideWorkspaceMessage(input.path) };
+    await fs.mkdir(path.dirname(target.full), { recursive: true });
+    await fs.writeFile(target.full, input.content, 'utf8');
+    return { ok: true, message: `Wrote ${target.rel} (${input.content.length} chars)`, path: target.rel };
   }
   if (name === 'list_files') {
     const entries = await readDirRecursive(folder, 4);

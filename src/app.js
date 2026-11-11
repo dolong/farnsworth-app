@@ -15415,7 +15415,11 @@ async function sendChatMessage(opts) {
         // editor tab stay exactly where they are. Code navigation remains an
         // explicit file click or set_canvas_view("code") action.
         if (tu.name === 'write_file' && toolRes.ok && state.folder && tu.input?.path) {
-          const absPath = state.folder + '/' + tu.input.path;
+          // Prefer the path the tool reports back: it is already resolved and
+          // workspace-relative, so an absolute input path cannot be re-anchored
+          // into the project here. The main process refuses outside-workspace
+          // writes outright, so toolRes.ok is false for those.
+          const absPath = state.folder + '/' + (toolRes.path || tu.input.path);
           stageAgentWrittenFile(absPath);
         }
       }
