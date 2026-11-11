@@ -11175,6 +11175,7 @@ function startTerminalServer() {
         send({ type: 'data', data });
       });
       term.onExit(({ exitCode, signal }) => {
+        scheduleDevWatcherReap();
         send({ type: 'exit', exitCode, signal });
         ws.close();
       });
@@ -11495,6 +11496,7 @@ function startClaudeCodeServer() {
         }
       });
       term.onExit(({ exitCode, signal }) => {
+        scheduleDevWatcherReap();
         send({ type: 'exit', exitCode, signal });
         claudeCodePtys.delete(tabId); // companion bridge cleanup
         try {
@@ -11848,6 +11850,7 @@ function startCodexServer() {
       }
       term.onData((data) => send({ type: 'data', data }));
       term.onExit(({ exitCode, signal }) => {
+        scheduleDevWatcherReap();
         send({ type: 'exit', exitCode, signal });
         ws.close();
       });
@@ -12308,13 +12311,26 @@ async function runShellCommand(command, opts = {}) {
 const commandLeftoverGroups = new Set();
 function killCommandTree(pid, signal = 'SIGTERM') {
   if (!pid) return;
+  // Nov 11 2026: one ps snapshot, then every member of the group plus every
+  // descendant of those, in ANY group. `devvit playtest` spawns its dev script
+  // (`vite build --watch`) with detached:true, i.e. in its own group, and by
+  // the time a leftover group is reaped the `sh` leader is gone, so the old
+  // `pgrep -P <leader>` walk found nothing and the watcher survived, orphaned,
+  // rebuilding into dist/ (27 of them in BreachReddit by Nov 11).
   const kids = new Set();
-  const walk = (parent) => {
-    let out = '';
-    try { out = require('child_process').execFileSync('/usr/bin/pgrep', ['-P', String(parent)], { encoding: 'utf8' }); } catch {}
-    for (const k of out.split('\n').map(Number).filter(Boolean)) if (!kids.has(k)) { kids.add(k); walk(k); }
-  };
-  walk(pid);
+  const table = workspaceProcessTable();
+  const children = new Map();
+  for (const p of table.values()) {
+    if (!children.has(p.ppid)) children.set(p.ppid, []);
+    children.get(p.ppid).push(p.pid);
+  }
+  const queue = [pid];
+  for (const p of table.values()) if (p.pgid === pid && p.pid !== process.pid) queue.push(p.pid);
+  while (queue.length) {
+    const cur = queue.shift();
+    for (const k of children.get(cur) || []) if (k !== process.pid && !kids.has(k)) { kids.add(k); queue.push(k); }
+    if (cur !== pid && !kids.has(cur)) kids.add(cur);
+  }
   try { process.kill(-pid, signal); } catch {}
   for (const k of [pid, ...kids]) { try { process.kill(k, signal); } catch {} }
 }
@@ -12334,6 +12350,7 @@ function reapCommandLeftovers(pid, startedAt) {
   commandLeftoverGroups.add(pid);
   const t = setTimeout(() => {
     if (commandGroupAlive(pid)) killCommandTreeHard(pid); else commandLeftoverGroups.delete(pid);
+    scheduleDevWatcherReap(5000);
   }, Math.max(1000, startedAt + MAX_COMMAND_TIMEOUT_MS - Date.now()));
   if (t.unref) t.unref();
 }
@@ -12422,8 +12439,60 @@ async function stopWorkspaceProcesses(folder, pids) {
     await new Promise((r) => setTimeout(r, 300));
   }
   const still = stopped.filter((pid) => { try { process.kill(pid, 0); return true; } catch { return false; } });
+  if (stopped.length) scheduleDevWatcherReap();
   return { ok: refused.length === 0 && still.length === 0, stopped: stopped.filter((p) => !still.includes(p)), stillRunning: still, refused, notRunning };
 }
+
+// Nov 11 2026: orphaned dev-script watchers. When `devvit playtest` dies
+// without running its exit hook (terminal tab closed -> SIGHUP, SIGKILL on
+// timeout or quit, killed from another shell), its detached `vite build
+// --watch` is reparented to launchd and keeps rebuilding into dist/, racing
+// every later build ("Directory not empty: dist/client/assets"). A live
+// playtest's watcher still has devvit as its parent, so only true orphans
+// (ppid 1) running a project-local watcher inside an open workspace are
+// stopped. Swept on a timer, after commands/terminals end, and on quit.
+const DEV_WATCHER_RE = /\/node_modules\/\.bin\/\S+(?:\s.*)?\s--watch(?:[\s=]|$)/;
+function findOrphanDevWatchers(folders, table, cwdsFor) {
+  const roots = [...folders].filter(Boolean).map((f) => path.resolve(f));
+  if (!roots.length) return [];
+  const cand = [...table.values()].filter((p) => p.ppid === 1 && p.pid !== process.pid && DEV_WATCHER_RE.test(p.command));
+  if (!cand.length) return [];
+  const cwds = cwdsFor(cand.map((p) => p.pid));
+  return cand.filter((p) => {
+    const cwd = cwds.get(p.pid);
+    return cwd && roots.some((r) => cwd === r || cwd.startsWith(r + path.sep));
+  });
+}
+function allWorkspaceFolders() {
+  const folders = new Set();
+  try { for (const f of windowWorkspaces.values()) if (f) folders.add(f); } catch {}
+  try { const cur = currentFolderSetting(); if (cur) folders.add(cur); } catch {}
+  return folders;
+}
+function reapOrphanDevWatchers(folders = allWorkspaceFolders(), signal = 'SIGTERM') {
+  let found = [];
+  try { found = findOrphanDevWatchers(folders, workspaceProcessTable(), processCwds); } catch { return []; }
+  for (const p of found) {
+    console.log(`[farnsworth] stopping orphaned dev watcher ${p.pid}: ${p.command}`);
+    killCommandTree(p.pid, signal);
+  }
+  if (found.length && signal !== 'SIGKILL') {
+    const t = setTimeout(() => { for (const p of found) { try { process.kill(p.pid, 0); killCommandTree(p.pid, 'SIGKILL'); } catch {} } }, 2000);
+    if (t.unref) t.unref();
+  }
+  return found.map((p) => p.pid);
+}
+let devWatcherReapTimer = null;
+function scheduleDevWatcherReap(delayMs = 3000) {
+  if (devWatcherReapTimer) clearTimeout(devWatcherReapTimer);
+  devWatcherReapTimer = setTimeout(() => { devWatcherReapTimer = null; reapOrphanDevWatchers(); }, delayMs);
+  if (devWatcherReapTimer.unref) devWatcherReapTimer.unref();
+}
+{
+  const t = setInterval(() => reapOrphanDevWatchers(), 60 * 1000);
+  if (t.unref) t.unref();
+}
+app.on('will-quit', () => { reapOrphanDevWatchers(allWorkspaceFolders(), 'SIGKILL'); });
 
 async function runSandboxedCommand(nonoBin, profileName, command, folder, timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS) {
   const { spawn } = require('child_process');
@@ -12474,6 +12543,7 @@ async function runSandboxedCommand(nonoBin, profileName, command, folder, timeou
     child.on('close', code => {
       clearTimeout(timer);
       if (!timedOut) reapCommandLeftovers(child.pid, startedAt);
+      scheduleDevWatcherReap();
       resolve({
         ok: code === 0 && !timedOut,
         stdout,

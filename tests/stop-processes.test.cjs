@@ -22,8 +22,9 @@ function extract(name) {
   return main.slice(asyncStart, ends.length ? Math.min(...ends) : undefined);
 }
 const src = ['killCommandTree', 'workspaceProcessTable', 'processCwds', 'classifyWorkspaceProcess', 'stopWorkspaceProcesses'].map(extract).join('\n');
-const make = new Function('require', 'path', 'process', 'commandLeftoverGroups',
+const make0 = new Function('require', 'path', 'process', 'commandLeftoverGroups', 'scheduleDevWatcherReap',
   src + '\nreturn { stopWorkspaceProcesses, classifyWorkspaceProcess };');
+const make = (...a) => make0(...a, () => {});
 
 function alive(pid) { try { process.kill(pid, 0); return true; } catch { return false; } }
 function orphanIn(dir) {
