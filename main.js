@@ -12467,6 +12467,11 @@ function allWorkspaceFolders() {
   const folders = new Set();
   try { for (const f of windowWorkspaces.values()) if (f) folders.add(f); } catch {}
   try { const cur = currentFolderSetting(); if (cur) folders.add(cur); } catch {}
+  // Nov 11 2026: a project the user has opened before but has no window for right
+  // now still holds orphan watchers. The sweep only looked at open workspaces, so
+  // 6 TennisAnalysis watchers (5-6 days old, ppid 1) survived the first sweep and
+  // were only found by hand. The remembered projects are workspaces too.
+  try { for (const r of (db.getRecentFolders(25) || [])) if (r && r.path) folders.add(r.path); } catch {}
   return folders;
 }
 function reapOrphanDevWatchers(folders = allWorkspaceFolders(), signal = 'SIGTERM') {

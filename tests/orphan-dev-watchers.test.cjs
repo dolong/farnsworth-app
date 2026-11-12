@@ -104,3 +104,31 @@ test('finds only orphaned watchers inside an open workspace', async () => {
     for (const s of ['-in', '-out', '-live']) for (const p of pidsMatching(tag + s)) { try { process.kill(p, 'SIGKILL'); } catch {} }
   }
 });
+
+test('remembered projects are swept, not only folders with an open window', async () => {
+  // Nov 11 2026: the first sweep only looked at open windows + the current
+  // folder, so 6 TennisAnalysis orphans (5-6 days old) survived it and had to
+  // be killed by hand. A project the user has opened before is a workspace.
+  const ws = project();
+  const tag = 'fwtest-recent-' + process.pid;
+  spawn('/bin/sh', ['-c', `./node_modules/.bin/vite build --watch ${tag} &`], { cwd: ws, detached: true, stdio: 'ignore' }).unref();
+  const folderSrc = extract('allWorkspaceFolders');
+  const foldersFor = (recents) => new Function('windowWorkspaces', 'currentFolderSetting', 'db',
+    folderSrc + '\nreturn allWorkspaceFolders();')(
+    new Map([['1', '/tmp/not-the-project']]), () => '/tmp/not-the-project',
+    { getRecentFolders: () => recents });
+  await sleep(800);
+  try {
+    const pids = pidsMatching(tag);
+    assert.equal(pids.length, 1);
+    assert.equal(ppidOf(pids[0]), 1, 'watcher is an orphan');
+    // open windows alone cannot see it (the negative control for the bug)
+    assert.deepEqual(h.findOrphanDevWatchers(foldersFor([]), h.workspaceProcessTable(), h.processCwds), [],
+      'no remembered projects -> invisible');
+    // with the project remembered it is found
+    const found = h.findOrphanDevWatchers(foldersFor([{ path: ws }]), h.workspaceProcessTable(), h.processCwds).map((p) => p.pid);
+    assert.deepEqual(found, pids, 'orphan in a remembered project is swept');
+  } finally {
+    for (const p of pidsMatching(tag)) { try { process.kill(p, 'SIGKILL'); } catch {} }
+  }
+});
