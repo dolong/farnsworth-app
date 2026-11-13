@@ -18354,6 +18354,17 @@ function expressUsageFrom(messages) {
   return null;
 }
 
+const EXPRESS_OUTAGE_MODEL = 'Kimi K3.1 Pro (OpenRouter)';
+
+function isTransientExpressModelError(text) {
+  const s = String(text || '');
+  return /(?:HTTP\s*)?(?:408|409|429|5\d\d)\b|credential validation failed|overloaded|temporarily unavailable|fetch failed|networkerror|econnreset|etimedout/i.test(s);
+}
+
+function expressOutagePrompt() {
+  return 'The previous turn ended on a temporary provider error. Continue the same task from the existing conversation and tool history. Do not restart the investigation or repeat work that already succeeded. Finish the task and report the result.';
+}
+
 async function runExpressOffer(offer) {
   const api = window.farnsworth;
   const accepted = await api.expressAgentAccept(offer?.id);
@@ -18382,7 +18393,7 @@ async function runExpressOffer(offer) {
     state.memoryLoadedForConv = null;
     state.memoryInjectedSlugs = new Set();
     await api.expressAgentStarted({ taskId: task.id, conversationId: state.chatActiveId });
-    progressTimer = setInterval(() => {
+    const reportProgress = () => {
       try {
         const last = [...(state.chatMessages || [])].reverse().find((m) => m.role === 'agent');
         if (!last) return;
@@ -18392,14 +18403,30 @@ async function runExpressOffer(offer) {
         lastSig = sig;
         api.expressAgentProgress({ taskId: task.id, text: last.text || '', working: last.working ? (last.workingLabel || 'Working') : null, tools }).catch(() => {});
       } catch {}
-    }, 1500);
+    };
+    const startProgress = () => {
+      if (!progressTimer) progressTimer = setInterval(reportProgress, 1500);
+    };
+    startProgress();
     await sendChatMessage({ text: task.text });
     clearInterval(progressTimer); progressTimer = null;
     await saveActiveConversation();
-    const persisted = await api.chatConvLoad(state.chatActiveId);
-    const messages = Array.isArray(persisted?.messages) ? persisted.messages : [];
+    let persisted = await api.chatConvLoad(state.chatActiveId);
+    let messages = Array.isArray(persisted?.messages) ? persisted.messages : [];
     if (!persisted || messages.length < 2) throw new Error('Express conversation did not persist');
-    const finalAgent = [...messages].reverse().find((m) => m.role === 'agent' && !m.working);
+    let finalAgent = [...messages].reverse().find((m) => m.role === 'agent' && !m.working);
+    // Anthropic 503s used to fail the whole delegated investigation. Resume
+    // the SAME conversation once on Kimi K3.1 so its tool history is kept.
+    if (finalAgent?.error && isTransientExpressModelError(finalAgent.text) && state.settings?.defaultModel !== EXPRESS_OUTAGE_MODEL) {
+      state.settings.defaultModel = EXPRESS_OUTAGE_MODEL;
+      startProgress();
+      await sendChatMessage({ text: expressOutagePrompt() });
+      clearInterval(progressTimer); progressTimer = null;
+      await saveActiveConversation();
+      persisted = await api.chatConvLoad(state.chatActiveId);
+      messages = Array.isArray(persisted?.messages) ? persisted.messages : [];
+      finalAgent = [...messages].reverse().find((m) => m.role === 'agent' && !m.working);
+    }
     const status = finalAgent?.stopped ? 'stopped' : (!!finalAgent && !finalAgent.error ? 'succeeded' : 'failed');
     await api.expressAgentComplete({
       taskId: task.id,
