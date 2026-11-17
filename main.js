@@ -5450,6 +5450,20 @@ function windowForFolder(folder) {
   return t && !t.isDestroyed() ? t : null;
 }
 
+// Long, Nov 17: preview tools (go_live, open_testview, set_preview, set_canvas_view) aim at the
+// job's own folder window. They used the window in front, so a Dice Fight job started and
+// recorded the Breach preview while Breach was focused.
+function agentTargetWindow(folder) {
+  if (folder) return windowForFolder(folder);
+  const t = BrowserWindow.getFocusedWindow() || mainWindow || openWindows[0];
+  return t && !t.isDestroyed() ? t : null;
+}
+async function waitForWindowCanvas(win, ms) {
+  const end = Date.now() + ms;
+  while (!(win && canvasViewsOfWindow(win).length) && Date.now() < end) await new Promise((r) => setTimeout(r, 300));
+  return !!(win && canvasViewsOfWindow(win).length);
+}
+
 async function applyTestFrame(win, frame) {
   if (!win || win.isDestroyed()) return { ok: false, error: 'no_window' };
   win.webContents.send('canvas:setTestFrame', frame);
@@ -8735,7 +8749,7 @@ async function executeAgentTool(name, input, folderOverride) {
   if (name === 'test_run') {
     if (!input?.path || typeof input.path !== 'string') return { ok: false, error: 'missing_path' };
     if (!fsSync.existsSync(input.path)) return { ok: false, error: 'not_found', path: input.path };
-    if (!canvasWebContentsViews.size) return { ok: false, error: 'no_preview', message: 'The game preview is not running. Call go_live (or open_testview, which starts it), then run the test again.' };
+    if (!(folder ? canvasViewsOfWindow(windowForFolder(folder)).length : canvasWebContentsViews.size)) return { ok: false, error: 'no_preview', message: 'The game preview is not running. Call go_live (or open_testview, which starts it), then run the test again.' };
     // Shares runTestByPath with the test:run IPC so an agent-driven run gets
     // the Node runner, the companion test:state broadcasts and the video
     // recording. `record` is a per-run override of the Test View toggle.
@@ -8779,21 +8793,21 @@ async function executeAgentTool(name, input, folderOverride) {
     // Switch canvas to Test View. Auto-switches the canvas mode to live
     // if needed (so the preview actually renders). No-op if already on
     // testview but we still send the IPC so the renderer can refresh.
-    const target = BrowserWindow.getFocusedWindow() || mainWindow || openWindows[0];
+    const target = agentTargetWindow(folder);
     if (!target || target.isDestroyed()) return { ok: false, error: 'no_window' };
     // Tests need a live preview; start it like Go Live if it is not running.
     const live = await agentGoLive(target);
     target.webContents.send('canvas:setPreview', { preview: 'testview' });
     if (!live.ok) return { ok: false, preview: 'testview', error: live.error || 'go_live_failed', message: `Test View is open but the game preview did not start: ${live.message || live.error}` };
-    await waitForCanvasView(20000);
+    await waitForWindowCanvas(target, 20000);
     return { ok: true, preview: 'testview', live: true, url: live.url || null, started: !!live.started };
   }
   if (name === 'go_live') {
-    const target = BrowserWindow.getFocusedWindow() || mainWindow || openWindows[0];
+    const target = agentTargetWindow(folder);
     if (!target || target.isDestroyed()) return { ok: false, error: 'no_window' };
     const live = await agentGoLive(target);
-    if (live.ok) await waitForCanvasView(20000);
-    return { ...live, canvasReady: canvasWebContentsViews.size > 0 };
+    if (live.ok) await waitForWindowCanvas(target, 20000);
+    return { ...live, canvasReady: canvasViewsOfWindow(target).length > 0 };
   }
   if (name === 'test_format_spec') {
     try {
@@ -8805,7 +8819,7 @@ async function executeAgentTool(name, input, folderOverride) {
     if (!['live', 'storybook', 'code', 'prod'].includes(view)) {
       return { ok: false, error: 'bad_view', message: 'view must be one of: live, storybook, code, prod' };
     }
-    const target = BrowserWindow.getFocusedWindow() || mainWindow || openWindows[0];
+    const target = agentTargetWindow(folder);
     if (!target || target.isDestroyed()) return { ok: false, error: 'no_window' };
     target.webContents.send('canvas:setMode', { mode: view });
     return { ok: true, view };
@@ -8822,7 +8836,7 @@ async function executeAgentTool(name, input, folderOverride) {
     if (!['post', 'mobile', 'desktop', 'fullscreen', 'testview'].includes(preview)) {
       return { ok: false, error: 'bad_preview', message: 'preview must be one of: post, mobile, desktop, fullscreen, testview' };
     }
-    const target = BrowserWindow.getFocusedWindow() || mainWindow || openWindows[0];
+    const target = agentTargetWindow(folder);
     if (!target || target.isDestroyed()) return { ok: false, error: 'no_window' };
     // Reuse the existing canvas:setPreview channel (also auto-switches to live).
     target.webContents.send('canvas:setPreview', { preview });

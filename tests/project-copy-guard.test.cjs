@@ -34,3 +34,14 @@ test('normal work in the project is untouched', () => {
     'git clone https://github.com/foo/bar ../bar',
   ]) assert.equal(projectCopyViolation(c, F), null, c);
 });
+
+// Long, Nov 17: preview tools aim at the job's folder window, never the focused one.
+test('preview tools target the job folder window, not the focused window', () => {
+  const src = require('fs').readFileSync(require('path').join(__dirname, '..', 'main.js'), 'utf8');
+  for (const tool of ['open_testview', 'go_live', 'set_canvas_view', 'set_preview']) {
+    const i = src.indexOf(`if (name === '${tool}')`);
+    const body = src.slice(i, i + 700);
+    assert.ok(body.includes('agentTargetWindow(folder)'), `${tool} must use agentTargetWindow(folder)`);
+    assert.ok(!body.includes('BrowserWindow.getFocusedWindow()'), `${tool} must not use the focused window`);
+  }
+});
