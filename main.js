@@ -5443,6 +5443,9 @@ function windowForFolder(folder) {
       if (w) return w;
     }
   }
+  // Long, Nov 17: a named folder with no window gets NO window, never the one in front.
+  // Falling back here let a /tmp job drive the Breach window's preview.
+  if (folder && windowWorkspaces.size) return null;
   const t = BrowserWindow.getFocusedWindow() || mainWindow || openWindows[0];
   return t && !t.isDestroyed() ? t : null;
 }
@@ -8409,6 +8412,30 @@ function globToRegex(glob) {
   return new RegExp('^' + re + '$');
 }
 
+// Long, Nov 17: Farnsworth always works in the project folder Long has open. A job once
+// exported Dice Fight to /tmp/df-ph, booted its own emulator there and took over the Breach
+// window's preview. If the folder is behind, update it in place. Copies are not an option.
+function projectCopyViolation(command, folder) {
+  const c = String(command || '');
+  const scratch = /(^|[\s'"=:(])(\/private)?\/tmp\/|\/var\/folders\/|\$TMPDIR|\$\{TMPDIR|\bmktemp\b/;
+  const esc = (x) => String(x || '').replace(/\/+$/, '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const root = folder ? `(\\.|\\./|${esc(folder)}/?)` : '(\\.|\\./)';
+  const why = [
+    [/\bgit\s+archive\b/, 'exports the project (git archive)'],
+    [/\bgit\s+worktree\s+add\b/, 'makes a second checkout (git worktree add)'],
+    [new RegExp(`\\bgit\\s+clone\\b[^;&|]*(${scratch.source})`), 'clones the project into a scratch folder'],
+    [new RegExp(`\\b(cp\\s+-\\S*[rR]\\S*\\s+|rsync\\s+(-\\S+\\s+)*|ditto\\s+)${root}(\\s|$)`), 'copies the project folder'],
+    [/devvit-emulator\/server-runner\.mjs|DEVVIT_EMULATOR_(CONFIG|STATE)=/, 'boots its own preview emulator'],
+  ];
+  for (const [re, what] of why) {
+    if (re.test(c)) return `Blocked: this command ${what}. Studio rule (Long, Nov 17): work only in the open project folder${folder ? ` (${folder})` : ''}. If it is behind origin or missing a fix, update it in place (git fetch, then git pull keeping local changes) and use Farnsworth's own preview and Test View. Never copy the project or start a preview for a copy.`;
+  }
+  if (scratch.test(c) && /\b(vite|devvit\s+playtest|npm\s+(run\s+)?dev)\b/.test(c)) {
+    return 'Blocked: this command starts a dev server outside the open project folder. Studio rule (Long, Nov 17): use the open project folder and Farnsworth\'s own preview.';
+  }
+  return null;
+}
+
 async function executeAgentTool(name, input, folderOverride) {
   // Farnsworth's architecture contract belongs to the app, not to whichever
   // project happens to be open. Keep this above the workspace-folder gate so
@@ -8632,6 +8659,8 @@ async function executeAgentTool(name, input, folderOverride) {
     // profile so a prompt-injected agent can't read ~/.aws/credentials
     // or write outside the workspace folder. Falls back to plain exec
     // (with a console warning) if nono isn't installed.
+    const copyBlock = projectCopyViolation(input.command, folder);
+    if (copyBlock) return { ok: false, error: 'project_copy_blocked', message: copyBlock };
     return await runShellCommand(input.command, {
       folder,
       pipeToActiveTerminal: false,

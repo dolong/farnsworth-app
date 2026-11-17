@@ -241,6 +241,16 @@ function createExpressBridge(deps) {
     }
     const folder = str(args.folder) || null;
     if (folder && !fs.existsSync(folder)) throw err('bad_input', `Folder does not exist: ${folder}`);
+    // Long, Nov 17: delegated work runs in a project folder that is open in a window, never a
+    // scratch copy. Without a window, canvas tools fell back to whatever window was in front.
+    if (folder && app === 'farnsworth') {
+      const norm = (f) => String(f || '').replace(/\/+$/, '');
+      const open = [...(openFolders() || [])].map(norm);
+      const scratch = /^\/(private\/)?(tmp|var\/folders)\//.test(norm(folder));
+      if (scratch || (open.length && !open.includes(norm(folder)))) {
+        throw err('folder_not_open', `${folder} is ${scratch ? 'a scratch copy' : 'not open in any window'}. Send the job to an open project folder (${open.join(', ') || 'none'}); if it is behind, the job updates it in place.`);
+      }
+    }
     const id = `xt-${crypto.randomUUID()}`;
     const t = {
       id,
